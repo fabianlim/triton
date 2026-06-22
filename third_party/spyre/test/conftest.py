@@ -562,41 +562,33 @@ class SinglePassTester(StructuralAssertions):
 # ---------------------------------------------------------------------------
 
 
-def _find_triton_obj_path() -> Path | None:
-    """Locate the directory holding the ``FileCheck`` binary.
+def _find_filecheck_path() -> Path | None:
+    """Locate the ``FileCheck`` binary.
 
-    Reads ``triton_obj_root`` from a generated ``lit.site.cfg.py`` if present;
-    otherwise falls back to ``python/build/cmake*`` or ``python/triton``.
+    For Spyre builds, ``LLVM_SYSPATH`` is always set (by setup.py or the user),
+    so check there first. Falls back to the cmake build tree.
     """
+    if llvm := os.environ.get("LLVM_SYSPATH"):
+        fc = Path(llvm) / "bin" / "FileCheck"
+        if fc.exists():
+            return fc
     repo = Path(__file__).resolve().parents[3]
-    # 1. look for generated lit.site.cfg.py
-    for site_cfg in repo.rglob("lit.site.cfg.py"):
-        text = site_cfg.read_text()
-        m = re.search(r'triton_obj_root\s*=\s*["\']([^"\']+)["\']', text)
-        if m:
-            return Path(m.group(1)) / "bin"
-    # 2. look under the build directory
     for cand in (repo / "python" / "build").glob("cmake*"):
-        if (cand / "bin" / "FileCheck").exists():
-            return cand / "bin"
-    if (repo / "python" / "triton" / "FileCheck").exists():
-        return repo / "python" / "triton"
+        fc = cand / "bin" / "FileCheck"
+        if fc.exists():
+            return fc
     return None
 
 
 @pytest.fixture(scope="session")
 def filecheck() -> str:
-    # env var has the first priority
     if p := os.environ.get("FILECHECK_PATH"):
         return p
-    obj_path = _find_triton_obj_path()
-    if obj_path:
-        fc = obj_path / "FileCheck"
-        if fc.exists():
-            return str(fc)
+    if fc := _find_filecheck_path():
+        return str(fc)
     if p := shutil.which("FileCheck"):
         return p
-    pytest.skip("FileCheck not found; set FILECHECK_PATH")
+    pytest.skip("FileCheck not found; set FILECHECK_PATH or LLVM_SYSPATH")
 
 
 @pytest.fixture
