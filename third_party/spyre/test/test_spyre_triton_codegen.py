@@ -21,8 +21,14 @@ Each test case:
   3. Parses out the Triton kernel source strings and the call() body.
   4. Runs structural assertions on the generated code.
 
-Run with:
-    .venv/bin/python -m pytest test_spyre_triton_codegen.py -v
+Run with (must use torch-spyre's venv, which has torch + the torch_spyre package):
+    cd /path/to/torch-spyre
+    .venv/bin/python -m pytest /path/to/triton/third_party/spyre/test/test_spyre_triton_codegen.py -v
+
+Or with an explicit TORCH_SPYRE_PATH (if torch is already in the active venv):
+    TORCH_SPYRE_PATH=/path/to/torch-spyre pytest third_party/spyre/test/test_spyre_triton_codegen.py -v
+
+Tests skip automatically if torch or torch_spyre are not found.
 """
 
 import importlib.util
