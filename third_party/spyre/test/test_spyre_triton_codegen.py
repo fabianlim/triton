@@ -158,29 +158,61 @@ get_scheduling_for_device("cpu")
 register_backend_for_device("cpu", SpyreTritonScheduling, PythonWrapperCodegen)
 
 # ---------------------------------------------------------------------------
-# Stub triton compilation and kernel execution so the compile pipeline runs
-# cleanly to completion (output_code.py written, debug log files closed) without
-# needing an actual Spyre or GPU backend.
+# Intercept triton compilation to capture KTIR and stub execution.
 #
-# Two stubs:
-#   1. CachingAutotuner.precompile — skip triton.compile (no CPU backend).
-#      Instead install a single no-op launcher so .run() doesn't loop.
-#   2. CachingAutotuner.run — skip kernel execution entirely.
-#      We only care about the generated source, not execution results.
+# CachingAutotuner.precompile runs triton.compile for real (producing KTIR
+# via the Spyre backend's two-stage pipeline: TTIR → KTIR), then captures
+# the KTIR text from binary.asm["ktir"] into a module-level list that
+# compile_and_parse drains into each CompiledOutput.
 #
-# This prevents the "Triton compilation failed" error log and the ResourceWarning
-# from unclosed debug log file handles (which happen when an exception aborts
-# Inductor's context manager cleanup).
+# CachingAutotuner.run is still stubbed — we only need the generated KTIR,
+# not actual kernel execution.
 # ---------------------------------------------------------------------------
 
 import logging as _logging
 import triton as _triton
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner as _CachingAutotuner
 
-_triton_heuristics_logger = _logging.getLogger("torch._inductor.runtime.triton_heuristics")
-_triton_heuristics_logger.addFilter(
-    lambda r: "Triton compilation failed" not in r.getMessage()
-)
+# Buffer that the compilation hooks append KTIR strings to; drained by
+# compile_and_parse into the CompiledOutput for the current compilation.
+_captured_ktir: list[str] = []
+
+# --- Bundle kernels: SpyreTritonAsyncCompile.triton() ---
+# These are emitted by SpyreTritonScheduling for bundles (multi-function blocks).
+# The original already calls triton.compile with the spyre target; we just
+# capture binary.asm["ktir"] before discarding the result.
+
+from torch_spyre._inductor_triton.async_compile import SpyreTritonAsyncCompile as _SpyreAsyncCompile
+from torch._inductor.runtime.triton_compat import ASTSource, GPUTarget, cc_warp_size
+from torch._inductor.runtime.triton_compat import triton as _triton_mod
+from torch._inductor.codecache import PyCodeCache as _PyCodeCache
+
+_orig_spyre_triton = _SpyreAsyncCompile.triton
+
+def _capturing_spyre_triton(self, kernel_name, source_code, device_str):
+    cat = getattr(_PyCodeCache.load(source_code), kernel_name)
+    cfg = cat.configs[0]
+    compile_meta = cat.triton_meta
+    compile_meta["device_type"] = cat.device_props.type
+    compile_meta["cc"] = cat.device_props.cc
+    compile_meta["constants"].update(cfg.kwargs)
+    compile_args = (ASTSource(cat.fn, compile_meta["signature"],
+                              compile_meta["constants"], compile_meta["configs"][0]),)
+    target = GPUTarget(compile_meta["device_type"], compile_meta["cc"],
+                       cc_warp_size(compile_meta["cc"]))
+    spyre_grid = compile_meta.get("spyre_grid", (32,))
+    binary = _triton_mod.compile(*compile_args, target=target, options={"grid": spyre_grid})
+    ktir = binary.asm.get("ktir")
+    if ktir:
+        _captured_ktir.append(ktir)
+
+_SpyreAsyncCompile.triton = _capturing_spyre_triton
+
+# --- Pointwise/reduction kernels: CachingAutotuner ---
+# Standard kernels (add, relu, etc.) go through CachingAutotuner with a cpu
+# GPUTarget. The Spyre backend doesn't support raw-pointer tt.load/tt.store
+# ops, so these can't be lowered to KTIR. Stub precompile to a no-op so the
+# Inductor pipeline completes (output_code.py written) without crashing.
 
 class _NoOpLauncher:
     config = type("cfg", (), {"found_by_coordesc": False, "kwargs": {}})()
@@ -192,8 +224,7 @@ def _stub_precompile(self, *args, **kwargs):
         self.launchers = [_NoOpLauncher()]
 
 def _stub_run(self, *args, stream=None, **kwargs):
-    if not self.launchers:
-        _stub_precompile(self)
+    pass
 
 _CachingAutotuner.precompile = _stub_precompile
 _CachingAutotuner.run = _stub_run
@@ -309,64 +340,23 @@ class CompiledOutput:
         return [b.strip() for b in m.group(1).split(",") if b.strip()]
 
     def to_ktir(self) -> list:
-        """Lower each kernel block to KTIR, returning one ir.module per block.
+        """Parse the captured KTIR texts into live ir.module objects.
 
-        Each async_compile.triton() block may contain multiple @triton.jit
-        functions (e.g. softmax bundles 4 noinline sub-kernels + 1 entry).
-        We exec the whole block source to get all the live JITFunction objects,
-        then compile the entry function (last @triton.jit def, which calls the
-        sub-kernels) via compile_to_ttir → make_ktir_mod.
-
-        triton_meta.constants uses positional integer keys ({4: 256}); we map
-        them to parameter names using the entry function's Python signature.
+        KTIR is produced by CachingAutotuner.precompile running triton.compile
+        with the Spyre backend (TTIR → KTIR pipeline). The text strings are
+        captured into self.ktir_texts by compile_and_parse and parsed here.
+        One ir.module per async_compile.triton() block (a block may contain
+        multiple @triton.jit functions, e.g. softmax bundles 4 sub-kernels).
         """
-        import triton
-        import triton.language as tl
-        from torch._inductor.runtime import triton_helpers, triton_heuristics
-
-        # Exec namespace mirrors the imports in the generated source preamble.
-        ns_base = {
-            "triton": triton,
-            "tl": tl,
-            "triton_helpers": triton_helpers,
-        }
-
-        ktir_modules = []
-        for ks, meta in zip(self.kernel_sources, self.kernel_metas):
-            ns = dict(ns_base)
-            # Use the original output_code.py path as the filename so
-            # inspect.getsourcelines can find the source — @triton.jit calls
-            # it at decoration time and raises OSError on anonymous exec strings.
-            ns["__file__"] = self.path
-            exec(compile(ks, self.path, "exec"), ns)  # noqa: S102
-
-            # The entry is the last defined @triton.jit function in the block.
-            # Sub-kernels are noinline helpers called from the entry; lowering
-            # the entry via compile_to_ttir produces TTIR covering all of them.
-            entry_name = re.findall(r"^def (\w+)\(", ks, re.MULTILINE)[-1]
-            entry_obj = ns[entry_name]
-            # The entry is wrapped by @triton_heuristics.fixed_config which
-            # produces a CachingAutotuner; unwrap to get the JITFunction.
-            entry_fn = getattr(entry_obj, "fn", entry_obj)
-
-            # Map positional-index constants ({4: 256}) to name-keyed constexprs.
-            import inspect
-            param_names = list(inspect.signature(entry_fn.fn).parameters)
-            constexprs = {
-                param_names[idx]: val
-                for idx, val in meta["constants"].items()
-                if idx < len(param_names)
-            }
-
-            ttir_text = compile_to_ttir(entry_fn, meta["signature"], constexprs)
+        modules = []
+        for ktir_text in getattr(self, "ktir_texts", []):
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".mlir", delete=False
             ) as f:
-                f.write(ttir_text)
+                f.write(ktir_text)
                 f.flush()
-                ktir_modules.append(make_ktir_mod(f.name))
-
-        return ktir_modules
+                modules.append(make_ktir_mod(f.name))
+        return modules
 
 
 _VERBOSE = os.environ.get("TRITON_CODEGEN_VERBOSE", "0") == "1"
@@ -374,10 +364,13 @@ _VERBOSE = os.environ.get("TRITON_CODEGEN_VERBOSE", "0") == "1"
 
 def compile_and_parse(fn, *inputs) -> CompiledOutput:
     """Compile fn through SpyreTritonScheduling and return a parsed CompiledOutput."""
+    _captured_ktir.clear()
     torch._dynamo.reset()
     compiled = torch.compile(fn, backend="inductor")
-    compiled(*inputs)  # runs cleanly; kernel execution is stubbed to a no-op
-    return CompiledOutput(_latest_output_code())
+    compiled(*inputs)
+    out = CompiledOutput(_latest_output_code())
+    out.ktir_texts = list(_captured_ktir)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +398,7 @@ class _OpTestBase(unittest.TestCase, KTIRStructuralTester):
     mod = None
     _def_map = None
 
-    def setup_method(self):
+    def setup_method(self, method=None):
         # See class docstring: KTIR is set up once in setUpClass; suppress the
         # per-test-method re-lowering that KTIRStructuralTester.setup_method
         # would otherwise trigger.
