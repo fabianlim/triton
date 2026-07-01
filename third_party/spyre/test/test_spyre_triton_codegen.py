@@ -29,10 +29,12 @@ import importlib.util
 import os
 import sys
 import re
+import ast
 import enum
 import glob
 import types
 import shutil
+import tempfile
 import unittest
 
 import pytest
@@ -54,6 +56,15 @@ if importlib.util.find_spec("torch_spyre") is None:
         "https://github.com/tnakaike/torch-spyre (dev/triton branch)",
         allow_module_level=True,
     )
+
+# conftest / utils live in third_party/spyre/test/ — add to path so imports
+# work regardless of where pytest is invoked from.
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TEST_DIR not in sys.path:
+    sys.path.insert(0, _TEST_DIR)
+
+from conftest import KTIRStructuralTester
+from utils import compile_to_ttir, make_ktir_mod, walk_module
 
 os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 os.environ["TORCH_COMPILE_DEBUG"] = "1"
@@ -205,6 +216,9 @@ _CALL_BODY_RE = re.compile(
     r"def call\(self, args\):(.*?)(?=\n    def |\nrunner|\Z)",
     re.DOTALL,
 )
+# Matches the triton_meta= dict in an async_compile.triton() call (outer file).
+# DeviceProperties(...) is not a literal so we strip it before ast.literal_eval.
+_TRITON_META_RE = re.compile(r"triton_meta=(\{.*?\}),\s*\n\s*inductor_meta=", re.DOTALL)
 
 
 def _latest_output_code() -> str:
@@ -212,6 +226,27 @@ def _latest_output_code() -> str:
     if not matches:
         raise FileNotFoundError("No output_code.py under torch_compile_debug/")
     return max(matches, key=os.path.getmtime)
+
+
+def _parse_triton_meta(source: str) -> list[dict]:
+    """Extract one {signature, constants} dict per async_compile.triton() block.
+
+    triton_meta contains DeviceProperties(...) which is not an ast literal, so
+    we replace it with None before parsing. Only 'signature' and 'constants'
+    are needed for compile_to_ttir.
+    """
+    metas = []
+    for m in _TRITON_META_RE.finditer(source):
+        raw = re.sub(r"DeviceProperties\([^)]*\)", "None", m.group(1))
+        try:
+            d = ast.literal_eval(raw)
+            metas.append({
+                "signature": d.get("signature", {}),
+                "constants": d.get("constants", {}),
+            })
+        except Exception:
+            metas.append({"signature": {}, "constants": {}})
+    return metas
 
 
 class CompiledOutput:
@@ -222,6 +257,7 @@ class CompiledOutput:
         source:         full file text
         kernel_sources: list of triton source strings (text inside async_compile.triton(..., '''...'''))
         jit_functions:  list of individual @triton.jit function texts extracted from kernel_sources
+        kernel_metas:   list of {signature, constants} dicts, one per kernel_sources entry
         call_body:      text of the Runner.call() method (buffer allocation, kernel launches, return)
     """
 
@@ -233,6 +269,7 @@ class CompiledOutput:
         self.jit_functions: list[str] = []
         for ks in self.kernel_sources:
             self.jit_functions.extend(_JIT_FUNC_RE.findall(ks))
+        self.kernel_metas: list[dict] = _parse_triton_meta(self.source)
         m = _CALL_BODY_RE.search(self.source)
         self.call_body: str = m.group(1) if m else ""
 
@@ -271,6 +308,66 @@ class CompiledOutput:
             return []
         return [b.strip() for b in m.group(1).split(",") if b.strip()]
 
+    def to_ktir(self) -> list:
+        """Lower each kernel block to KTIR, returning one ir.module per block.
+
+        Each async_compile.triton() block may contain multiple @triton.jit
+        functions (e.g. softmax bundles 4 noinline sub-kernels + 1 entry).
+        We exec the whole block source to get all the live JITFunction objects,
+        then compile the entry function (last @triton.jit def, which calls the
+        sub-kernels) via compile_to_ttir → make_ktir_mod.
+
+        triton_meta.constants uses positional integer keys ({4: 256}); we map
+        them to parameter names using the entry function's Python signature.
+        """
+        import triton
+        import triton.language as tl
+        from torch._inductor.runtime import triton_helpers, triton_heuristics
+
+        # Exec namespace mirrors the imports in the generated source preamble.
+        ns_base = {
+            "triton": triton,
+            "tl": tl,
+            "triton_helpers": triton_helpers,
+        }
+
+        ktir_modules = []
+        for ks, meta in zip(self.kernel_sources, self.kernel_metas):
+            ns = dict(ns_base)
+            # Use the original output_code.py path as the filename so
+            # inspect.getsourcelines can find the source — @triton.jit calls
+            # it at decoration time and raises OSError on anonymous exec strings.
+            ns["__file__"] = self.path
+            exec(compile(ks, self.path, "exec"), ns)  # noqa: S102
+
+            # The entry is the last defined @triton.jit function in the block.
+            # Sub-kernels are noinline helpers called from the entry; lowering
+            # the entry via compile_to_ttir produces TTIR covering all of them.
+            entry_name = re.findall(r"^def (\w+)\(", ks, re.MULTILINE)[-1]
+            entry_obj = ns[entry_name]
+            # The entry is wrapped by @triton_heuristics.fixed_config which
+            # produces a CachingAutotuner; unwrap to get the JITFunction.
+            entry_fn = getattr(entry_obj, "fn", entry_obj)
+
+            # Map positional-index constants ({4: 256}) to name-keyed constexprs.
+            import inspect
+            param_names = list(inspect.signature(entry_fn.fn).parameters)
+            constexprs = {
+                param_names[idx]: val
+                for idx, val in meta["constants"].items()
+                if idx < len(param_names)
+            }
+
+            ttir_text = compile_to_ttir(entry_fn, meta["signature"], constexprs)
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete=False
+            ) as f:
+                f.write(ttir_text)
+                f.flush()
+                ktir_modules.append(make_ktir_mod(f.name))
+
+        return ktir_modules
+
 
 _VERBOSE = os.environ.get("TRITON_CODEGEN_VERBOSE", "0") == "1"
 
@@ -287,14 +384,43 @@ def compile_and_parse(fn, *inputs) -> CompiledOutput:
 # Tests — one class per op, compiled once in setUpClass.
 # ---------------------------------------------------------------------------
 
-class _OpTestBase(unittest.TestCase):
-    """Base class: compile once per class, print kernel source if TRITON_CODEGEN_VERBOSE=1."""
+class _OpTestBase(unittest.TestCase, KTIRStructuralTester):
+    """Base class: compile once per class, lower to KTIR, expose structural assertions.
+
+    Inherits KTIRStructuralTester for assert_present / assert_absent / etc.
+    Those helpers query self.ops / self.mod, which are populated once in
+    setUpClass rather than per-test — each subclass compiles and lowers one op.
+
+    We override setup_method (a pytest/KTIRStructuralTester instance hook that
+    normally re-runs the full TTIR→KTIR pipeline per test method) with a no-op
+    because the lowering already happened in setUpClass. Without this override,
+    pytest would call setup_method before every test_, wiping cls.ops and
+    cls.mod with a fresh (empty) run, breaking any KTIR assertions.
+    """
     out: "CompiledOutput"
+    # KTIR state — one module per async_compile.triton() block; tests that need
+    # KTIR assertions pick the relevant block (default: first / only block).
+    ktir_modules: list = []
+    ops: list = []
+    mod = None
+    _def_map = None
+
+    def setup_method(self):
+        # See class docstring: KTIR is set up once in setUpClass; suppress the
+        # per-test-method re-lowering that KTIRStructuralTester.setup_method
+        # would otherwise trigger.
+        pass
 
     @classmethod
     def setUpClass(cls):
         shutil.rmtree(_DEBUG_ROOT, ignore_errors=True)
         cls.out = cls._compile()
+        cls.ktir_modules = cls.out.to_ktir()
+        # Expose the first module as self.mod / self.ops for the inherited
+        # structural assertion helpers (assert_present, assert_absent, etc.).
+        if cls.ktir_modules:
+            cls.mod = cls.ktir_modules[0]
+            cls.ops = walk_module(cls.mod)
         if _VERBOSE:
             print(f"\n{'='*60}\n{cls.__name__}\n{'='*60}")
             for i, src in enumerate(cls.out.kernel_sources):
