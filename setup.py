@@ -801,6 +801,16 @@ setup(
             "pytest>=7,<9",
             "numpy>=1.24,<2",
         ],
+        # torch-spyre-test adds torch so the inductor codegen tests can run.
+        # torch_spyre itself cannot be pip-installed (its _C extension requires
+        # the Spyre hardware SDK); point TORCH_SPYRE_PATH at a local checkout of
+        # https://github.com/tnakaike/torch-spyre (dev/triton branch) instead.
+        # Tests skip automatically when torch or torch_spyre are absent.
+        "torch-spyre-test": [
+            "torch==2.11.0",
+            "regex",
+            "pytest>=7,<9",
+        ],
     },
     # --- END --- added for spyre
     packages=list(get_packages()),
