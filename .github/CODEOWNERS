@@ -1,5 +1,1 @@
-# CODEOWNERS is intentionally empty for the first public Triton-Spyre release.
-#
-# The inherited upstream Triton CODEOWNERS entries requested reviews from
-# upstream maintainers who do not own this fork. Add public GitHub users or
-# teams here after the public repository ownership model is finalized.
+* @fabianlim @lchu6 @Prasanth-Chatarasi @vswagath1989 @tkanaike @kiszk
