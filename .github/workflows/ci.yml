@@ -7,8 +7,8 @@ on:
         description: >
           ktir-cpu git ref to install instead of the pin in setup.py (commit SHA,
           branch, or tag). Use this to test against a known-good ref when the
-          pinned version has a regression. If the run passes, a success commit
-          status is posted so the PR can be merged. Leave blank for a normal run.
+          pinned version has a regression. If the run passes, a success check run
+          is posted so the PR can be merged. Leave blank for a normal run.
         required: false
         default: ""
   pull_request:
@@ -21,7 +21,6 @@ concurrency:
 
 permissions:
   contents: read
-  statuses: write
   checks: write
 
 jobs:
@@ -68,10 +67,12 @@ jobs:
 
       - name: Override ktir-cpu ref
         if: ${{ inputs.ktir_cpu_ref != '' }}
+        env:
+          KTIR_CPU_REF: ${{ inputs.ktir_cpu_ref }}
         run: |
-          echo "::warning::ktir-cpu pin overridden — installing ref '${{ inputs.ktir_cpu_ref }}' instead of the version pinned in setup.py. If tests pass, a success commit status will be posted to unblock the PR."
+          echo "::warning::ktir-cpu pin overridden — installing ref '$KTIR_CPU_REF' instead of the version pinned in setup.py. If tests pass, a success check run will be posted to unblock the PR."
           uv pip install --no-deps \
-            "ktir-cpu @ git+https://github.com/torch-spyre/ktir-cpu@${{ inputs.ktir_cpu_ref }}"
+            "ktir-cpu @ git+https://github.com/torch-spyre/ktir-cpu@$KTIR_CPU_REF"
 
       - name: Install KTDP MLIR bindings
         run: |
@@ -100,6 +101,7 @@ jobs:
         if: ${{ success() && inputs.ktir_cpu_ref != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KTIR_CPU_REF: ${{ inputs.ktir_cpu_ref }}
         run: |
           # GitHub tokens are scoped to the run that created them — we cannot
           # PATCH a check run owned by a different run (403). Instead we create
@@ -119,8 +121,8 @@ jobs:
               \"conclusion\": \"success\",
               \"details_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
               \"output\": {
-                \"title\": \"Passed with ktir-cpu override: ${{ inputs.ktir_cpu_ref }}\",
-                \"summary\": \"Tests passed using ktir-cpu ref '${{ inputs.ktir_cpu_ref }}' instead of the pinned version. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                \"title\": \"Passed with ktir-cpu override: $KTIR_CPU_REF\",
+                \"summary\": \"Tests passed using ktir-cpu ref '$KTIR_CPU_REF' instead of the pinned version. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
               }
             }"
 
