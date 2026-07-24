@@ -2236,9 +2236,14 @@ struct RewriteDescriptorLayoutPass
         // Short-circuit: replace transpose result with its input operand.
         Value physInput = tr.getInput(); // operand(0), now equals newVal (or an
                                          // intermediate after elementwise chain)
+        // Collect former consumers of the transpose result before the RAUW —
+        // after RAUW these are users of physInput, but physInput's user list
+        // also includes the transpose itself (as its input operand).  Snapshot
+        // here to avoid adding the about-to-be-erased transpose to the worklist.
+        SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
+                                              tr.getResult()[0].getUsers().end());
         tr.getResult()[0].replaceAllUsesWith(physInput);
-        // Add former consumers to worklist before erasing.
-        worklist.append(physInput.getUsers().begin(), physInput.getUsers().end());
+        worklist.append(fmrConsumers.begin(), fmrConsumers.end());
         tr.erase();
         continue;
       }
