@@ -833,6 +833,32 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])  # writes tensor<BLOCKxf16>
 
 _+ 17 more variants_
 
+## half-annotated-contraction
+
+### Rejected
+
+#### ❌ `test_unannotated_operand_on_shared_contraction_axis_rejected`
+
+_Both operands of a dot must be annotated when they share a stickified contraction axis_
+
+The pass cannot window an unannotated operand per stick — it has no physical coordinate information for it — so it passes it through whole. When the annotated operand has stickFactor > 1, the per-stick slice and the full logical unannotated operand have mismatched contraction dims and the pass rejects.
+
+This is distinct from the P·V pattern (T21) where P is a descriptor-less
+logical intermediate on the non-contraction (output) axis — there, P
+never needs to be windowed per stick, so no marker is required.
+
+```python
+# ❌ wrong: A annotated, B not — shared K axis, stickFactor=2
+tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+acc = tl.dot(a, b)  # fails: A sliced to K=64/stick, B whole K=128
+# ✅ fix: annotate both with the same stick size
+tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])
+tl.spyre_tensor_layout(b_desc, [(0,'floordiv',64), 1, (0,'mod',64)])
+acc = tl.dot(a, b)  # both sliced to K=64/stick — contraction dims match
+```
+
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:1235` (`TestRejectedInputs.test_unannotated_operand_on_shared_contraction_axis_rejected`)</sup>
+
 ## physical-layout-double-rescale-guard
 
 ### Supported
@@ -965,7 +991,7 @@ tl.spyre_tensor_layout(desc, lay)        # ❌ raises CompilationError
 tl.spyre_tensor_layout(desc, [(1, 'floordiv', 64), 0, (1, 'mod', 64)])  # ✅
 ```
 
-<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:1504` (`TestInlineOnly.test_layout_via_local_fails`)</sup>
+<sup>Source: `third_party/spyre/test/test_rewrite_descriptor_layout.py:1561` (`TestInlineOnly.test_layout_via_local_fails`)</sup>
 
 ## physical-layout-store-annotated-output
 

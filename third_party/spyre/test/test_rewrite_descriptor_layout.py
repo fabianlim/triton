@@ -1232,26 +1232,29 @@ class TestRejectedInputs(RewriteLayoutTester):
         # B (unannotated) is treated as a logical (scratchpad) operand.
         self.assert_absent("tt.spyre_tensor_layout")
 
-    def test_r6_shared_stickified_contraction_axis_requires_both_annotated(self):
-        # R6: two operands share a stickified contraction axis but only one is
-        # annotated. The pass cannot window an unannotated (scratchpad) operand
-        # per reduction stick — it has no physical coordinate information for it
-        # — so it passes the scratchpad through whole. When the physical operand
-        # has stickFactor > 1 on the contraction axis, the per-stick slice and
-        # the full logical scratchpad have mismatched contraction dims.
-        #
-        # Rule: any two operands that share a stickified contraction axis must
-        # both carry a tt.spyre_tensor_layout marker with the same stick size.
-        #
-        # This is distinct from the legitimate P·V scratchpad pattern (T21):
-        # in P·V, P is a logical intermediate on a non-contraction (output) axis
-        # and V is stickified on the output/parallel axis — no shared contraction
-        # axis, so the scratchpad passes through whole correctly.
-        #
-        # Concretely: matmul A[M,K] @ B[K,N] where A is stick-on-K with
-        # physBlock=2 (K=128, STICK=64 → stickFactor=2) but B is unannotated.
-        # Phase 2 slices A to [64, 64] per K-stick but passes B through as the
-        # full [128, 64] — contraction dim 64 ≠ 128, verifier rejects.
+    @pattern("half-annotated-contraction", category="memory", negative=True, example=[
+        "# ❌ wrong: A annotated, B not — shared K axis, stickFactor=2",
+        "tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])",
+        "acc = tl.dot(a, b)  # fails: A sliced to K=64/stick, B whole K=128",
+        "# ✅ fix: annotate both with the same stick size",
+        "tl.spyre_tensor_layout(a_desc, [(1,'floordiv',64), 0, (1,'mod',64)])",
+        "tl.spyre_tensor_layout(b_desc, [(0,'floordiv',64), 1, (0,'mod',64)])",
+        "acc = tl.dot(a, b)  # both sliced to K=64/stick — contraction dims match",
+    ])
+    def test_unannotated_operand_on_shared_contraction_axis_rejected(self):
+        """Both operands of a dot must be annotated when they share a stickified
+        contraction axis. The pass cannot window an unannotated operand per stick
+        — it has no physical coordinate information for it — so it passes it
+        through whole. When the annotated operand has stickFactor > 1, the
+        per-stick slice and the full logical unannotated operand have mismatched
+        contraction dims and the pass rejects.
+
+        This is distinct from the P·V pattern (T21) where P is a descriptor-less
+        logical intermediate on the non-contraction (output) axis — there, P
+        never needs to be windowed per stick, so no marker is required.
+        """
+        # A[M,K] stick-on-K with stickFactor=2 (K=128, STICK=64), B unannotated.
+        # Phase 2 slices A to [64,64] per K-stick but passes B whole [128,64].
         a_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
         with pytest.raises(Exception):
             self.run(f"""
