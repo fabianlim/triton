@@ -2091,23 +2091,94 @@ class TestScatterIterArgMismatch(RewriteLayoutTester):
         }}
         """
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "BUG: emitSourceStage RAUWs the linalg.batch_matmul result with a "
-        "physical scatter container tensor<2x1x64x64xf32>, but the enclosing "
-        "scf.for's iter_arg and result type remain tensor<1x64x128xf32>. "
-        "The scf.for verifier rejects the mismatch. "
-        "Fix: update the scf.for iter_arg type, result type, and init value "
-        "to the physical shape after emitting the scatter result."
-    ))
     def test_scatter_iter_arg_type_mismatch(self):
-        # This test documents the known failure: when the parallel scatter path
-        # (parallelFactor=2) fires inside an outer scf.for that carries the
-        # accumulator as an iter_arg, emitSourceStage leaves the iter_arg type
-        # inconsistent with the yielded scatter result type.
-        #
-        # Expected failure:
-        #   'scf.for' op 2-th region iter_arg and 2-th yielded value have
-        #   different type: 'tensor<1x64x128xf32>' != 'tensor<2x1x64x64xf32>'
+        # emitSourceStage now returns a canonical LOGICAL result: the parallel
+        # scatter path (parallelFactor=2) accumulates into a zero logical tensor
+        # of shape tensor<1x64x128xf32> and scatters each stickSize-wide slab on
+        # the logical N axis.  The result type therefore matches the enclosing
+        # scf.for's iter_arg type, so the verifier accepts the module.
         self.run(self._kernel())
-        # If the pass were correct, the marker would be erased.
+        # The marker is consumed by the pass (module verifies — no scf.for
+        # iter_arg mismatch).
         self.assert_absent("tt.spyre_tensor_layout")
+        # The enclosing scf.for stays logical: its result type is the canonical
+        # logical accumulator shape, NOT the physical scatter shape.
+        self.assert_result_type("scf.for", "tensor<1x64x128xf32>")
+
+
+# =========================================================================
+# U8 parallel scatter: source stage returns a LOGICAL result (T21/C9/Q15)
+# =========================================================================
+
+class TestParallelScatterLogical(RewriteLayoutTester):
+    """Source stage with parallelFactor > 1 must return a canonical LOGICAL
+    result, never a physical scatter container.
+
+    batch_matmul P @ V where V is stick-on-N with physBlock=2:
+      logical [1,64,128], stick-on-dim2 (S=64) -> physical [1,2,64,64].
+    The parallel floor dim has physBlock=2 -> parallelFactor=2.
+
+    After the pass:
+      * no tt.spyre_tensor_layout markers remain,
+      * the source result is the LOGICAL accumulator tensor<1x64x128xf32>
+        (NOT a physical tensor<2x1x64x64xf32> container),
+      * the sink physicalizes the annotated output store to a rank-4 access
+        tile [1,2,64,64] (N split into 2 sticks).
+    """
+
+    # V[B,K,N] stick-on-N (dim 2): physical [B, N//64, K, N%64] = [1,2,64,64].
+    _V_LAYOUT = layout_attr([0, (2, "floordiv", 64), 1, (2, "mod", 64)])
+    # OUT[B,M,N] stick-on-N (dim 2): physical [B, N//64, M, N%64] = [1,2,64,64].
+    _OUT_LAYOUT = layout_attr([0, (2, "floordiv", 64), 1, (2, "mod", 64)])
+
+    def _kernel(self):
+        return f"""
+        module {{
+          tt.func @pv(%p_ptr: !tt.ptr<f16>, %v_ptr: !tt.ptr<f16>,
+                      %out_ptr: !tt.ptr<f32>) {{
+            %B   = arith.constant 1   : i32
+            %SEQ = arith.constant 64  : i32
+            %DIM = arith.constant 128 : i32
+            %c0  = arith.constant 0 : i32
+            %sB  = arith.constant 8192 : i64
+            %sS  = arith.constant 64   : i64
+            %sD  = arith.constant 128  : i64
+            %s1  = arith.constant 1    : i64
+            %p_desc = tt.make_tensor_descriptor %p_ptr,
+                [%B, %SEQ, %SEQ], [%sB, %sS, %s1]
+                : <f16>, <1x64x64xf16>
+            %v_desc = tt.make_tensor_descriptor %v_ptr,
+                [%B, %SEQ, %DIM], [%sB, %sD, %s1]
+                : <f16>, <1x64x128xf16>
+            tt.spyre_tensor_layout %v_desc {self._V_LAYOUT} : <1x64x128xf16>
+            %out_desc = tt.make_tensor_descriptor %out_ptr,
+                [%B, %SEQ, %DIM], [%sB, %sD, %s1]
+                : <f32>, <1x64x128xf32>
+            tt.spyre_tensor_layout %out_desc {self._OUT_LAYOUT} : <1x64x128xf32>
+            %p_tile = tt.descriptor_load %p_desc[%c0, %c0, %c0]
+                : !tt.tensordesc<1x64x64xf16> -> tensor<1x64x64xf16>
+            %v_tile = tt.descriptor_load %v_desc[%c0, %c0, %c0]
+                : !tt.tensordesc<1x64x128xf16> -> tensor<1x64x128xf16>
+            %acc = arith.constant dense<0.0> : tensor<1x64x128xf32>
+            %d = tt.dot %p_tile, %v_tile, %acc
+                : tensor<1x64x64xf16> * tensor<1x64x128xf16> -> tensor<1x64x128xf32>
+            tt.descriptor_store %out_desc[%c0, %c0, %c0], %d
+                : !tt.tensordesc<1x64x128xf32>, tensor<1x64x128xf32>
+            tt.return
+          }}
+        }}
+        """
+
+    def test_source_result_is_logical(self):
+        self.run(self._kernel())
+        # Markers are consumed by the pass.
+        self.assert_absent("tt.spyre_tensor_layout")
+        # The parallel-scatter source result is the LOGICAL accumulator built
+        # by tensor.insert_slice into a zero tensor<1x64x128xf32> — NOT a
+        # physical scatter container tensor<2x1x64x64xf32>.
+        self.assert_present("tensor.insert_slice")
+        self.assert_result_type("scf.for", "tensor<1x64x128xf32>")
+        # The sink physicalizes the annotated output store: N split into 2
+        # sticks -> rank-4 access tile [1,2,64,64].
+        self.assert_result_type("ktdp.construct_access_tile",
+                                "access_tile<1x2x64x64xindex>")

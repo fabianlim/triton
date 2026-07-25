@@ -778,6 +778,38 @@ struct RewriteDescriptorLayoutPass
 
     resolveAndReconcile(plans, spec);
 
+    // R6: any operand with a stickified axis (loopDims or floorDims non-empty)
+    // requires all sibling operands that share that axis to also be annotated.
+    // A scratchpad operand is passed through whole — its full logical size on the
+    // shared axis does not match the per-stick slice of the physical operand,
+    // producing a shape mismatch. Detect this early and emit a clear diagnostic.
+    // R6: a scratchpad (unannotated) operand is passed through whole — its full
+    // logical size on the shared contraction axis does not match the per-stick
+    // slice of a physical operand when the reduction stickFactor > 1.
+    // Only check loopDims (reduction stick loops): parallel floor dims (floorDims)
+    // are on the output axis and do not involve the scratchpad's shape.
+    // physBlock=1 on a loopDim means one stick == full logical extent, so the
+    // scratchpad size matches trivially (the legitimate triple-chain case).
+    for (unsigned i = 0; i < nOps; ++i) {
+      if (plans[i].coords.src.empty()) // scratchpad — not the physical side
+        continue;
+      bool multiStickReduction = false;
+      for (int p : plans[i].loopDims)
+        if (plans[i].coords.physBlock[p] > 1) { multiStickReduction = true; break; }
+      if (!multiStickReduction)
+        continue;
+      for (unsigned j = 0; j < nOps; ++j) {
+        if (i == j) continue;
+        if (plans[j].coords.src.empty()) // j is a scratchpad on the contraction axis
+          return op.emitError(
+              "spyre_tensor_layout: operands share a stickified contraction "
+              "axis but not all are annotated — any two operands sharing a "
+              "stickified contraction axis must both carry a "
+              "tt.spyre_tensor_layout marker with the same stick size on that "
+              "axis (R6)");
+      }
+    }
+
     return emitSourceStage(op, spec.emitOp, plans);
   }
 
@@ -1159,7 +1191,11 @@ struct RewriteDescriptorLayoutPass
     }
 
     // Detect parallel floor dims with physBlock > 1 (U8 parallel scatter path).
+    // parallelLogDim = the logical output axis the parallel floor dim maps to
+    // (dimRoles[p]); stickSize = the innermost/lane physical extent of that plan.
     int64_t parallelFactor = 1;
+    int64_t parallelLogDim = -1;
+    int64_t parallelStickSize = 1;
     for (auto &plan : plans) {
       for (int p : plan.floorDims) {
         int64_t role = plan.dimRoles[p];
@@ -1168,6 +1204,8 @@ struct RewriteDescriptorLayoutPass
           if (parallelFactor != 1 && parallelFactor != f)
             llvm_unreachable("emitSourceStage: plans disagree on parallelFactor");
           parallelFactor = f;
+          parallelLogDim = role;
+          parallelStickSize = plan.coords.physBlock[plan.lane];
         }
       }
     }
@@ -1177,23 +1215,32 @@ struct RewriteDescriptorLayoutPass
 
     Value result;
     if (parallelFactor > 1) {
-      // Parallel scatter path: outer loop over parallel sticks, inner over reduction.
-      // Build a physical output container sized by the full parallel output shape.
-      // accTy has the canonical logical shape; the physical shape adds the parallelFactor
-      // floor dim. For now build it as tensor.empty of (parallelFactor, ...accDims).
-      SmallVector<int64_t> physOutShape;
-      physOutShape.push_back(parallelFactor);
-      for (int64_t d : accDims)
-        physOutShape.push_back(d);
-      auto physOutTy = RankedTensorType::get(physOutShape, accElemTy);
-      Value container = tensor::EmptyOp::create(b, loc, physOutTy.getShape(), accElemTy);
+      // Parallel scatter path: outer loop over parallel sticks, inner over
+      // reduction. emitSourceStage must always return a canonical LOGICAL
+      // result (C9/Q15/D3), so accumulate into a zero logical tensor of the
+      // FULL logical output shape. After Phase 1 physicalization, accDims holds
+      // the per-STICK op-tile extents (parallelLogDim extent = stickSize), so
+      // the full logical extent on that axis is stickSize * parallelFactor
+      // (e.g. 64*2 = 128). Each parallel iteration computes a stickSize-wide
+      // slab (shape accTy) and scatters it into fullLogAcc at pIV*stickSize.
+      auto stickAccTy = accTy; // per-stick result shape (accDims as-is).
 
-      result = emitParallelScatterLoop(b, loc, parallelFactor, container,
+      SmallVector<int64_t> fullLogDims(accDims.begin(), accDims.end());
+      fullLogDims[parallelLogDim] = parallelStickSize * parallelFactor;
+      auto fullLogTy = RankedTensorType::get(fullLogDims, accElemTy);
+      Value logAcc = arith::ConstantOp::create(b, loc, fullLogTy,
+          mlir::cast<mlir::DenseElementsAttr>(
+              mlir::DenseElementsAttr::get(fullLogTy,
+                  llvm::APFloat::getZero(
+                      mlir::cast<mlir::FloatType>(accElemTy)
+                          .getFloatSemantics())))).getResult();
+
+      result = emitParallelScatterLoop(b, loc, parallelFactor, logAcc,
           [&](OpBuilder &bb, Value pIV, Value cont) -> Value {
             Value innerResult = emitStickLoop(bb, loc, stickFactor,
-                arith::ConstantOp::create(bb, loc, accTy,
+                arith::ConstantOp::create(bb, loc, stickAccTy,
                     mlir::cast<mlir::DenseElementsAttr>(
-                        mlir::DenseElementsAttr::get(accTy,
+                        mlir::DenseElementsAttr::get(stickAccTy,
                             llvm::APFloat::getZero(
                                 mlir::cast<mlir::FloatType>(accElemTy)
                                     .getFloatSemantics())))).getResult(),
@@ -1209,21 +1256,26 @@ struct RewriteDescriptorLayoutPass
                         ? emitTranspose(slicePhys, plans[i].transposePerm)
                         : slicePhys);
                   }
-                  Value r = emitOp(b, loc, slices, acc, accTy);
+                  Value r = emitOp(b, loc, slices, acc, stickAccTy);
                   b = saved;
                   return r;
                 });
-            // Insert innerResult at pIV position in the container.
-            // innerResult shape = accTy shape (e.g. [64, 64]).
-            // container shape = physOutShape (e.g. [2, 64, 64]).
-            // Insert at offsets [pIV, 0, 0...], sizes [1, accDims...].
-            SmallVector<OpFoldResult> offsets(physOutShape.size(), bb.getIndexAttr(0));
-            offsets[0] = pIV;
+            // Scatter innerResult (shape accTy) into the logical accumulator on
+            // the parallelLogDim axis. innerResult covers a stickSize-wide slab;
+            // offset = pIV * stickSize on that axis, all other axes full.
+            // offsets: all 0 except offsets[parallelLogDim] = pIV * stickSize.
+            // sizes:   accTy shape except sizes[parallelLogDim] = stickSize.
+            // strides: all 1.
+            Value stickSizeV =
+                arith::ConstantIndexOp::create(bb, loc, parallelStickSize);
+            Value off = arith::MulIOp::create(bb, loc, pIV, stickSizeV);
+            SmallVector<OpFoldResult> offsets(accDims.size(), bb.getIndexAttr(0));
+            offsets[parallelLogDim] = off;
             SmallVector<OpFoldResult> sizes;
-            sizes.push_back(bb.getIndexAttr(1));
             for (int64_t d : accDims)
               sizes.push_back(bb.getIndexAttr(d));
-            SmallVector<OpFoldResult> strides(physOutShape.size(), bb.getIndexAttr(1));
+            sizes[parallelLogDim] = bb.getIndexAttr(parallelStickSize);
+            SmallVector<OpFoldResult> strides(accDims.size(), bb.getIndexAttr(1));
             return tensor::InsertSliceOp::create(bb, loc, innerResult, cont,
                                                   offsets, sizes, strides);
           });
