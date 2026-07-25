@@ -1232,6 +1232,60 @@ class TestRejectedInputs(RewriteLayoutTester):
         # B (unannotated) is treated as a logical (scratchpad) operand.
         self.assert_absent("tt.spyre_tensor_layout")
 
+    def test_r6_shared_stickified_contraction_axis_requires_both_annotated(self):
+        # R6: two operands share a stickified contraction axis but only one is
+        # annotated. The pass cannot window an unannotated (scratchpad) operand
+        # per reduction stick — it has no physical coordinate information for it
+        # — so it passes the scratchpad through whole. When the physical operand
+        # has stickFactor > 1 on the contraction axis, the per-stick slice and
+        # the full logical scratchpad have mismatched contraction dims.
+        #
+        # Rule: any two operands that share a stickified contraction axis must
+        # both carry a tt.spyre_tensor_layout marker with the same stick size.
+        #
+        # This is distinct from the legitimate P·V scratchpad pattern (T21):
+        # in P·V, P is a logical intermediate on a non-contraction (output) axis
+        # and V is stickified on the output/parallel axis — no shared contraction
+        # axis, so the scratchpad passes through whole correctly.
+        #
+        # Concretely: matmul A[M,K] @ B[K,N] where A is stick-on-K with
+        # physBlock=2 (K=128, STICK=64 → stickFactor=2) but B is unannotated.
+        # Phase 2 slices A to [64, 64] per K-stick but passes B through as the
+        # full [128, 64] — contraction dim 64 ≠ 128, verifier rejects.
+        a_layout = layout_attr([(1, "floordiv", 64), 0, (1, "mod", 64)])
+        with pytest.raises(Exception):
+            self.run(f"""
+            module {{
+              tt.func @mm(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f32>,
+                          %m: i32, %n: i32) {{
+                %M  = arith.constant 64  : i32
+                %K  = arith.constant 128 : i32
+                %N  = arith.constant 64  : i32
+                %sM = arith.constant 128 : i64
+                %sK = arith.constant 64  : i64
+                %sN = arith.constant 64  : i64
+                %s1 = arith.constant 1   : i64
+                %adesc = tt.make_tensor_descriptor %a, [%M, %K], [%sM, %s1]
+                    : <f16>, <64x128xf16>
+                %bdesc = tt.make_tensor_descriptor %b, [%K, %N], [%sK, %s1]
+                    : <f16>, <128x64xf16>
+                %cdesc = tt.make_tensor_descriptor %c, [%M, %N], [%sN, %s1]
+                    : <f32>, <64x64xf32>
+                tt.spyre_tensor_layout %adesc {a_layout} : <64x128xf16>
+                %at = tt.descriptor_load %adesc[%m, %n]
+                    : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
+                %bt = tt.descriptor_load %bdesc[%m, %n]
+                    : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
+                %acc = arith.constant dense<0.0> : tensor<64x64xf32>
+                %r = tt.dot %at, %bt, %acc
+                    : tensor<64x128xf16> * tensor<128x64xf16> -> tensor<64x64xf32>
+                tt.descriptor_store %cdesc[%m, %n], %r
+                    : !tt.tensordesc<64x64xf32>, tensor<64x64xf32>
+                tt.return
+              }}
+            }}
+            """)
+
     # TODO R4 (test_r4_physical_operand_at_fixpoint): constructing a matmul
     # where an operand is physically typed but can't be reduced to canonical
     # form is difficult to express in inline MLIR without full pipeline context.
