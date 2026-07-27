@@ -303,7 +303,7 @@ class KTIRStructuralTester(StructuralAssertions):
 # KTIRCpuTester — adds numerical CPU execution on top of structural checks
 # ---------------------------------------------------------------------------
 
-# --- START --- added for spyre: two interchangeable KTIR parsers.
+# Two interchangeable KTIR parsers.
 # Both take MLIR text and return a ktir_cpu ``IRModule``. See each helper.
 
 def _parse_mlir_frontend(mlir_text: str):
@@ -380,7 +380,6 @@ def _parse_regex(mlir_text: str):
         line for line in text.split("\n") if not line.strip().startswith("#loc")
     )
     return KTIRParser().parse_module(text)
-# --- END --- added for spyre
 
 
 class KTIRCpuTester:
@@ -432,16 +431,12 @@ class KTIRCpuTester:
         except ImportError:
             pytest.skip("ktir_cpu not installed — skipping numerical check")
 
-        # --- START --- added for spyre: parse MLIR, then execute in-process.
-        # Uses the out-of-process MLIRFrontendParser (see class docstring).
-        # _parse_regex is the available backup; not wired up here yet.
         try:
             module = _parse_mlir_frontend(str(self.mod))
         except RuntimeError as e:
             pytest.fail(str(e))
         interp = KTIRInterpreter()
         interp.module = module
-        # --- END --- added for spyre
 
         # Name → argN index, based on @triton.jit's Python arg order.
         raw_fn = getattr(kernel_fn, "fn", kernel_fn)
