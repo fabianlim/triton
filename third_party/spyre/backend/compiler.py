@@ -131,9 +131,10 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes, spyre
 
         grid = list(options.grid)
+        data_layout: str = options.data_layout
 
         pm = ir.pass_manager(mod.context)
-        spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm, options.data_layout)
+        spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm, data_layout)
         spyre.passes.ttir_to_ktdp.add_distribute_work(pm, grid)
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
