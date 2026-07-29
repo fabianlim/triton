@@ -5,11 +5,23 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IntegerSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <optional>
 
 namespace mlir::triton::ktdp {
+
+/// True iff `desc` is a memref-backed lowered descriptor (the
+/// UnrealizedConversionCast bridge left by LowerDescriptorMemory).
+bool isLoweredDescriptor(Value desc);
+
+/// Unwrap the bridge cast to recover the ktdp.construct_memory_view result.
+Value getDescriptorMemView(Value desc);
+
+/// Build a range-set constraint for an N-D coordinate space.
+/// Static dims use arith constants; dynamic dims use IntegerSet symbols.
+IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape);
 
 /// Erase trivially dead ops in reverse walk order.
 /// An op is erased only if BOTH conditions hold:

@@ -2,7 +2,10 @@
 
 #include "Dialect/KTDP/Transforms/Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace mlir::triton::ktdp {
@@ -31,6 +34,50 @@ std::optional<int64_t> getConstantInt(Value v) {
     if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
       return attr.getInt();
   return std::nullopt;
+}
+
+/// True iff `desc` is a memref-backed lowered descriptor (the
+/// UnrealizedConversionCast bridge left by LowerDescriptorMemory Walk 1).
+bool isLoweredDescriptor(Value desc) {
+  auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
+  return castOp && !castOp.getInputs().empty() &&
+         isa<MemRefType>(castOp.getInputs()[0].getType());
+}
+
+/// Unwrap the bridge cast to recover the ktdp.construct_memory_view result.
+Value getDescriptorMemView(Value desc) {
+  assert(isLoweredDescriptor(desc) &&
+         "descriptor operand was not lowered — "
+         "precondition check should have caught this");
+  auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
+  return castOp.getInputs()[0];
+}
+
+/// Build a range-set constraint for an N-D coordinate space.
+/// Static dims use arith constants; dynamic dims use IntegerSet symbols.
+IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
+  unsigned rank = shape.size();
+  unsigned symCount = 0;
+  for (auto s : shape)
+    if (s == ShapedType::kDynamic)
+      ++symCount;
+
+  SmallVector<AffineExpr> constraints;
+  SmallVector<bool> eqFlags;
+  unsigned symIdx = 0;
+  for (unsigned i = 0; i < rank; ++i) {
+    auto di = getAffineDimExpr(i, ctx);
+    AffineExpr upper;
+    if (shape[i] == ShapedType::kDynamic)
+      upper = getAffineSymbolExpr(symIdx++, ctx) - 1;
+    else
+      upper = getAffineConstantExpr(shape[i] - 1, ctx);
+    constraints.push_back(di);
+    eqFlags.push_back(false);
+    constraints.push_back(upper - di);
+    eqFlags.push_back(false);
+  }
+  return IntegerSet::get(rank, symCount, constraints, eqFlags);
 }
 
 } // namespace mlir::triton::ktdp

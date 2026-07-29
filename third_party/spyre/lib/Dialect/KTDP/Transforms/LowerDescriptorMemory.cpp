@@ -38,71 +38,9 @@ namespace mlir::triton::ktdp {
 
 namespace {
 
-//===----------------------------------------------------------------------===//
-// Helpers
-//===----------------------------------------------------------------------===//
-
-/// True iff `desc` is a memref-backed descriptor produced by walk 1
-/// of `runOnOperation`.  Walk 1 attaches a memref to every
-/// `tt.make_tensor_descriptor` it rewrites, and walk 2's access-op
-/// patterns rely on that memref to lower the load/store/gather/scatter.
-/// The precondition walk in `runOnOperation` uses this same predicate
-/// so the diagnostics and the pattern call sites stay in sync.
-static bool isLoweredDescriptor(Value desc) {
-  auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
-  return castOp && !castOp.getInputs().empty() &&
-         isa<MemRefType>(castOp.getInputs()[0].getType());
-}
-
-/// Recover the memref that backs an access op's `desc` operand.
-///
-/// Walk 1 of `runOnOperation` replaces every `tt.make_tensor_descriptor`
-/// with a memref view of the underlying buffer; this helper hands that
-/// memref back to each access-op pattern, which consumes it directly.
-/// The pre-condition walk in `runOnOperation` validates that every
-/// legal access op has its descriptor lowered, so on the success path
-/// the predicate is guaranteed to hold.  The assert keeps the invariant
-/// *local* to the helper so a future caller bypassing `runOnOperation`
-/// (e.g. a stand-alone unit test of the patterns) still trips a clear
-/// failure rather than indexing into an empty operand list.
-static Value getDescriptorMemView(Value desc) {
-  assert(isLoweredDescriptor(desc) &&
-         "descriptor operand was not lowered by walk 1 — "
-         "precondition check should have caught this");
-  auto castOp = desc.getDefiningOp<UnrealizedConversionCastOp>();
-  return castOp.getInputs()[0];
-}
-
-/// Build a range-set constraint for an N-D coordinate space.
-/// Static dims use arith constants; dynamic dims use IntegerSet symbols,
-/// which are bound positionally to the op's dynamic sizes operands.
-static IntegerSet buildRangeSetND(MLIRContext *ctx, ArrayRef<int64_t> shape) {
-  unsigned rank = shape.size();
-  unsigned symCount = 0;
-  for (auto s : shape)
-    if (s == ShapedType::kDynamic)
-      ++symCount;
-
-  SmallVector<AffineExpr> constraints;
-  SmallVector<bool> eqFlags;
-  unsigned symIdx = 0;
-  for (unsigned i = 0; i < rank; ++i) {
-    auto di = getAffineDimExpr(i, ctx);
-    AffineExpr upper;
-    if (shape[i] == ShapedType::kDynamic) {
-      // Symbol s_j is bound to dynSizes[j] by the op (positional binding).
-      // Constraint: d_i <= s_j - 1  =>  s_j - 1 - d_i >= 0
-      upper = getAffineSymbolExpr(symIdx++, ctx) - 1;
-    } else {
-      upper = getAffineConstantExpr(shape[i] - 1, ctx);
-    }
-    constraints.push_back(di);           // d_i >= 0
-    eqFlags.push_back(false);
-    constraints.push_back(upper - di);   // upper - d_i >= 0
-    eqFlags.push_back(false);
-  }
-  return IntegerSet::get(rank, symCount, constraints, eqFlags);
-}
+using mlir::triton::ktdp::buildRangeSetND;
+using mlir::triton::ktdp::getDescriptorMemView;
+using mlir::triton::ktdp::isLoweredDescriptor;
 
 //===----------------------------------------------------------------------===//
 // Shared memory view construction
