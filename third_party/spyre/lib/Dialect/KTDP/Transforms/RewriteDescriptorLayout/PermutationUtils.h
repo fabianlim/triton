@@ -51,6 +51,54 @@ inline bool applyCoordMap(llvm::ArrayRef<int64_t> logSizes,
   return true;
 }
 
+/// Compute the permutation that reorders opTileDims from physical to canonical
+/// axis order. Returns empty vector if already identity (no transpose needed).
+inline llvm::SmallVector<int64_t> computeTransposePerm(
+    llvm::ArrayRef<int> opTileDims,
+    llvm::ArrayRef<int64_t> dimRoles,
+    llvm::ArrayRef<int64_t> canonicalAxes) {
+  unsigned nTile = opTileDims.size();
+  llvm::SmallVector<int64_t> perm(nTile, -1);
+  llvm::SmallVector<bool> used(nTile, false);
+
+  // First pass: match parallel dims (role >= 0) — unique role values.
+  for (unsigned c = 0; c < nTile; ++c) {
+    int64_t canonRole = canonicalAxes[c];
+    if (canonRole == -1) continue;
+    for (unsigned j = 0; j < nTile; ++j) {
+      if (!used[j] && dimRoles[opTileDims[j]] == canonRole) {
+        perm[j] = (int64_t)c;
+        used[j] = true;
+        break;
+      }
+    }
+  }
+  // Second pass: match reduction dims (role == -1) left-to-right.
+  for (unsigned c = 0; c < nTile; ++c) {
+    if (canonicalAxes[c] != -1) continue;
+    for (unsigned j = 0; j < nTile; ++j) {
+      if (!used[j] && dimRoles[opTileDims[j]] == -1) {
+        perm[j] = (int64_t)c;
+        used[j] = true;
+        break;
+      }
+    }
+  }
+  // Check if identity.
+  bool isIdentity = true;
+  for (unsigned j = 0; j < nTile; ++j)
+    if (perm[j] != (int64_t)j) { isIdentity = false; break; }
+  return isIdentity ? llvm::SmallVector<int64_t>{} : perm;
+}
+
+/// Invert a permutation vector.
+inline llvm::SmallVector<int64_t> invertPerm(llvm::ArrayRef<int64_t> perm) {
+  llvm::SmallVector<int64_t> inv(perm.size());
+  for (unsigned i = 0; i < perm.size(); ++i)
+    inv[perm[i]] = i;
+  return inv;
+}
+
 } // namespace mlir::triton::ktdp
 
 #endif // KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_PERMUTATIONUTILS_H
