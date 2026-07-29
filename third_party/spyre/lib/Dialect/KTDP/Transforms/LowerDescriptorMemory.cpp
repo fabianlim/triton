@@ -731,7 +731,8 @@ struct LowerDescriptorMemoryPass
     //
     // Marking it legal here prevents `applyPartialConversion` from
     // treating either cast as an unconverted op and failing the pass.
-    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
+    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
+                      triton::SpyreTensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertDescriptorLoad, ConvertDescriptorStore,

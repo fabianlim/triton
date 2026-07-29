@@ -524,7 +524,8 @@ struct LowerComputeOpsPass
     //   arith/math (constants, index casts, cloned combiner body ops)
     target.addLegalDialect<linalg::LinalgDialect, tensor::TensorDialect,
                            arith::ArithDialect, math::MathDialect>();
-    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
+    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
+                      triton::SpyreTensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertTTSplat, ConvertTTReshape,          // Group A
