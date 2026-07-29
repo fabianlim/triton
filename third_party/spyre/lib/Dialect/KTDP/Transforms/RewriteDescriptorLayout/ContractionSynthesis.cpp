@@ -19,6 +19,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace mlir::triton::ktdp {
 
@@ -32,6 +33,22 @@ static bool isSingleTensorElementwiseOp(Operation *op) {
     if (isa<RankedTensorType>(operand.getType()))
       ++tensorOps;
   return tensorOps == 1;
+}
+
+// Emit linalg.transpose with the given permutation (input->output form).
+// linalg.transpose uses "output<-input" form, so we invert here.
+static Value emitTranspose(OpBuilder &b, Location loc, Value src,
+                           llvm::ArrayRef<int64_t> perm) {
+  auto srcTy = cast<RankedTensorType>(src.getType());
+  auto mlirPerm = invertPerm(perm);
+  llvm::SmallVector<int64_t> outShape(mlirPerm.size());
+  for (unsigned i = 0; i < mlirPerm.size(); ++i)
+    outShape[i] = srcTy.getDimSize(mlirPerm[i]);
+  auto outTy = RankedTensorType::get(outShape, srcTy.getElementType());
+  Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(),
+                                        srcTy.getElementType());
+  return linalg::TransposeOp::create(b, loc, src, empty,
+      b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
 }
 
 // Walk backward from `val` through single-tensor elementwise ops to the
@@ -173,18 +190,9 @@ static LogicalResult emitSourceStage(
     }
   auto accTy = RankedTensorType::get(accDims, accElemTy);
 
-  // Transpose helper.
-  auto emitTranspose = [&](Value src, llvm::ArrayRef<int64_t> perm) -> Value {
-    auto srcTy = cast<RankedTensorType>(src.getType());
-    auto mlirPerm = invertPerm(perm);
-    llvm::SmallVector<int64_t> outShape(mlirPerm.size());
-    for (unsigned i = 0; i < mlirPerm.size(); ++i)
-      outShape[i] = srcTy.getDimSize(mlirPerm[i]);
-    auto outTy = RankedTensorType::get(outShape, srcTy.getElementType());
-    Value empty = tensor::EmptyOp::create(b, loc, outTy.getShape(),
-                                          srcTy.getElementType());
-    return linalg::TransposeOp::create(b, loc, src, empty,
-        b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
+  // Transpose helper (delegates to free function).
+  auto doTranspose = [&](Value src, llvm::ArrayRef<int64_t> perm) -> Value {
+    return emitTranspose(b, loc, src, perm);
   };
 
   // Determine the stick loop trip count (stickFactor).
@@ -220,7 +228,7 @@ static LogicalResult emitSourceStage(
     for (unsigned i = 0; i < plans.size(); ++i) {
       Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
       slices.push_back(!plans[i].transposePerm.empty()
-                           ? emitTranspose(slicePhys, plans[i].transposePerm)
+                           ? doTranspose(slicePhys, plans[i].transposePerm)
                            : slicePhys);
     }
     Value r = emitOp(b, loc, slices, acc, accTy);
@@ -312,6 +320,221 @@ static LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec,
   return emitSourceStage(op, spec.emitOp, plans);
 }
 
+// Walk the forward use chain from value through elementwise ops to a
+// ktdp.store, then look up the store's access tile base in physMemViewToMarker.
+static triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
+                                                       PassContext &ctx) {
+  llvm::SmallVector<Value> worklist = {value};
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    for (auto *user : v.getUsers()) {
+      if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
+        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
+            st.getAccessTile().getDefiningOp());
+        if (!tile)
+          continue;
+        auto it = ctx.physMemViewToMarker.find(tile.getBase());
+        if (it != ctx.physMemViewToMarker.end())
+          return it->second;
+      }
+      if (!isSingleTensorElementwiseOp(user))
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return {};
+}
+
+// Sink stage: scatter a logical data tile into the physical D tensor shape.
+static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
+                                   const OperandPlan &dPlan) {
+  Value inputTile = st.getDataTile();
+  OpBuilder b(st);
+  Location loc = st.getLoc();
+
+  Type elemTy = cast<RankedTensorType>(inputTile.getType()).getElementType();
+
+  llvm::ArrayRef<int64_t> physBlock = dPlan.coords.physBlock;
+  int physRank = (int)physBlock.size();
+  int64_t stickSize = physBlock[dPlan.lane];
+
+  if (dPlan.floorDims.empty())
+    return st.emitError(
+        "spyre_tensor_layout: store sink stage requires at least one "
+        "parallel floor dim in the output layout");
+  if (!dPlan.loopDims.empty())
+    return st.emitError(
+        "spyre_tensor_layout: store sink stage: unexpected reduction dim");
+
+  unsigned logRank = dPlan.coords.logicalRank;
+  llvm::SmallVector<int64_t> sinkPerm;
+  {
+    llvm::SmallVector<int64_t> canonicalAxesD(logRank);
+    std::iota(canonicalAxesD.begin(), canonicalAxesD.end(), 0);
+    auto fwdPerm = computeTransposePerm(dPlan.opTileDims, dPlan.dimRoles,
+                                        canonicalAxesD);
+    if (!fwdPerm.empty()) {
+      auto inv = invertPerm(fwdPerm);
+      bool isIdentity = true;
+      for (unsigned d = 0; d < logRank; ++d)
+        if (inv[d] != (int64_t)d) { isIdentity = false; break; }
+      if (!isIdentity)
+        sinkPerm = std::move(inv);
+    }
+  }
+
+  auto logDimToPos = [&](int64_t d) -> unsigned {
+    return sinkPerm.empty() ? (unsigned)d : (unsigned)sinkPerm[d];
+  };
+
+  if (!sinkPerm.empty())
+    inputTile = emitTranspose(b, loc, inputTile, sinkPerm);
+
+  auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
+
+  llvm::SmallVector<int64_t> sinkShape(physBlock.begin(), physBlock.end());
+  Value physicalSink = tensor::EmptyOp::create(b, loc, sinkShape, elemTy);
+
+  llvm::SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
+  llvm::SmallVector<OpFoldResult> inputSizesBase(logRank);
+  llvm::SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
+  for (int p : dPlan.opTileDims) {
+    int64_t logDim = dPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      inputSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
+  }
+  for (int p : dPlan.floorDims) {
+    int64_t logDim = dPlan.dimRoles[p];
+    if (logDim >= 0 && (unsigned)logDim < logRank)
+      inputSizesBase[logDimToPos(logDim)] = idx(stickSize);
+  }
+
+  llvm::SmallVector<OpFoldResult> sinkOffsetsBase(physRank, idx(0));
+  llvm::SmallVector<OpFoldResult> sinkSizes(physRank);
+  llvm::SmallVector<OpFoldResult> sinkStrides(physRank, idx(1));
+  for (int p = 0; p < physRank; ++p)
+    sinkSizes[p] = llvm::is_contained(dPlan.floorDims, p)
+                       ? idx(1) : idx(physBlock[p]);
+
+  Value acc = physicalSink;
+  for (int p : dPlan.floorDims) {
+    int64_t logDim = dPlan.dimRoles[p];
+    if (logDim < 0 || (unsigned)logDim >= logRank) continue;
+
+    unsigned tileDim = logDimToPos(logDim);
+    int64_t tripCount = physBlock[p];
+    Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
+
+    llvm::SmallVector<int64_t> slShape(logRank);
+    for (int p2 : dPlan.opTileDims) {
+      int64_t ld = dPlan.dimRoles[p2];
+      if (ld >= 0 && (unsigned)ld < logRank)
+        slShape[logDimToPos(ld)] = physBlock[p2];
+    }
+    slShape[tileDim] = stickSize;
+    auto slTy = RankedTensorType::get(slShape, elemTy);
+
+    acc = emitStickLoop(b, loc, tripCount, acc,
+        [&](OpBuilder &bb, Value s, Value sinkAccumulator) -> Value {
+          llvm::SmallVector<OpFoldResult> inOff = inputOffsetsBase;
+          inOff[tileDim] =
+              arith::MulIOp::create(bb, loc, s, stickSizeVal).getResult();
+          Value inputSlice = tensor::ExtractSliceOp::create(
+              bb, loc, slTy, inputTile, inOff, inputSizesBase, inputStrides);
+
+          llvm::SmallVector<OpFoldResult> sinkOff = sinkOffsetsBase;
+          sinkOff[p] = s;
+          return tensor::InsertSliceOp::create(
+              bb, loc, inputSlice, sinkAccumulator, sinkOff, sinkSizes, sinkStrides);
+        });
+  }
+
+  st.getDataTileMutable().set(acc);
+  return success();
+}
+
+// Dispatch a store with an annotated output descriptor.
+static LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
+                                  triton::SpyreTensorLayoutOp marker,
+                                  PassContext &ctx) {
+  auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
+  llvm::ArrayRef<int64_t> physBlock = tileTy.getShape();
+
+  unsigned logRank =
+      cast<RankedTensorType>(st.getDataTile().getType()).getRank();
+  OperandCoords dC = OperandCoords::fromMarker(marker, logRank, physBlock);
+
+  int physRank = (int)physBlock.size();
+  llvm::SmallVector<int64_t> dimRoleD(physRank);
+  for (int p = 0; p < physRank; ++p)
+    dimRoleD[p] = marker.getPhysSrc()[p];
+
+  OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
+  return emitSinkStage(st, dPlan);
+}
+
+// Dispatch a linalg.reduce whose input has a layout marker.
+static LogicalResult dispatchReduce(linalg::ReduceOp rd, PassContext &ctx) {
+  auto marker = findMarkerForOperand(rd.getInputs()[0], ctx);
+  if (!marker)
+    return rd.emitError(
+        "spyre_tensor_layout: dispatchReduce called but no marker on input");
+  unsigned logicalRank = 0;
+  for (int64_t src : marker.getPhysSrc())
+    if ((unsigned)(src + 1) > logicalRank)
+      logicalRank = (unsigned)(src + 1);
+  auto reductionDims = rd.getDimensions();
+  (void)reductionDims;
+
+  llvm::SmallVector<int64_t> canonicalAxes(logicalRank, -1);
+  unsigned outAxis = 0;
+  for (unsigned d = 0; d < logicalRank; ++d)
+    if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
+      canonicalAxes[d] = outAxis++;
+
+  Block &combinerBlock = rd.getOperation()->getRegion(0).front();
+  llvm::SmallVector<Operation *> combinerOps;
+  for (Operation &op : combinerBlock.without_terminator())
+    combinerOps.push_back(&op);
+  auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
+  llvm::SmallVector<Value> yieldVals(combinerYield.getValues().begin(),
+                                     combinerYield.getValues().end());
+  llvm::SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
+                                         combinerBlock.getArguments().end());
+
+  unsigned outputRank = logicalRank - (unsigned)rd.getDimensions().size();
+  auto emitReduceOp = [outputRank,
+                       combinerOps = std::move(combinerOps),
+                       yieldVals = std::move(yieldVals),
+                       origBlockArgs = std::move(origBlockArgs)](
+                          OpBuilder &b, Location loc,
+                          llvm::ArrayRef<Value> slices, Value acc,
+                          RankedTensorType accTy) -> Value {
+    auto sliceTy = cast<RankedTensorType>(slices[0].getType());
+    llvm::SmallVector<int64_t> dims;
+    for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
+      dims.push_back((int64_t)d);
+    return linalg::ReduceOp::create(
+        b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
+        [&](OpBuilder &inner, Location iloc, ValueRange args) {
+          IRMapping mapping;
+          for (unsigned i = 0; i < origBlockArgs.size(); ++i)
+            mapping.map(origBlockArgs[i], args[i]);
+          for (Operation *op : combinerOps)
+            inner.clone(*op, mapping);
+          llvm::SmallVector<Value> mapped;
+          for (Value v : yieldVals)
+            mapped.push_back(mapping.lookupOrDefault(v));
+          linalg::YieldOp::create(inner, iloc, mapped);
+        }).getResult(0);
+  };
+  SourceOpSpec spec;
+  spec.operands = {SourceOperandSpec{canonicalAxes}};
+  spec.logicalRank = logicalRank;
+  spec.emitOp = emitReduceOp;
+  return dispatchSource(rd, spec, ctx);
+}
+
 // linalg.matmul instantiation.
 static LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
   SourceOpSpec spec;
@@ -341,6 +564,33 @@ static LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx)
   if (auto mm = dyn_cast<linalg::MatmulOp>(op))
     return sourceNeedsDispatch(mm, 2) ? (changed = true, dispatchMatmul(mm, ctx)) : success();
 
+  if (auto rd = dyn_cast<linalg::ReduceOp>(op)) {
+    auto rdMarker = findMarkerForOperand(rd.getInputs()[0], ctx);
+    unsigned logicalInputRank = 2;
+    if (rdMarker) {
+      for (int64_t src : rdMarker.getPhysSrc())
+        if ((unsigned)(src + 1) > logicalInputRank)
+          logicalInputRank = (unsigned)(src + 1);
+    }
+    return sourceNeedsDispatch(rd, logicalInputRank)
+               ? (changed = true, dispatchReduce(rd, ctx))
+               : success();
+  }
+
+  if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
+    auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
+    auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
+        st.getAccessTile().getType());
+    if (!dataTy || !tileTy ||
+        dataTy.getRank() == (int)tileTy.getShape().size())
+      return success();
+    auto marker = findMarkerForStore(st.getDataTile(), ctx);
+    if (!marker)
+      return success();
+    changed = true;
+    return dispatchSink(st, marker, ctx);
+  }
+
   return success();
 }
 
@@ -351,7 +601,7 @@ bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
     changed = false;
     llvm::SmallVector<Operation *> candidates;
     module.walk([&](Operation *op) {
-      if (isa<linalg::MatmulOp>(op))
+      if (isa<linalg::MatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
         candidates.push_back(op);
     });
     for (auto *op : candidates) {
