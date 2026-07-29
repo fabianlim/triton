@@ -42,13 +42,8 @@ enum class SliceKind {
                     // size = physBlock[p] (taken whole as part of the 2D tile).
 };
 
-/// One operand classified by its Map(Op, X) roles and physical layout.
-struct OperandPlan {
-  Value               value;      // SSA tensor (physical on memory side)
-  OperandCoords       coords;     // coord map + shape
-  llvm::SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
-  llvm::SmallVector<int64_t> physBlockStorage;
-
+/// Pure output of classify(): per-physical-dim role assignments.
+struct ClassifiedDims {
   int                lane;        // innermost phys dim = rank-1
   int64_t            stickSize;   // stick/lane width = physBlock[lane]
   llvm::SmallVector<int>   floorDims;   // parallel stick-index dims
@@ -57,6 +52,14 @@ struct OperandPlan {
   llvm::SmallVector<int>   loopDims;    // reduceDims minus opInnerDim
   llvm::SmallVector<int>   opTileDims;  // residual >= 0 non-floor dims
   llvm::SmallVector<SliceKind> sliceKind; // per-phys-dim slice behavior
+};
+
+/// One operand's full plan: classification + resolution results.
+struct OperandPlan {
+  Value               value;      // SSA tensor (physical on memory side)
+  OperandCoords       coords;     // coord map + shape
+  llvm::SmallVector<int64_t> dimRoles;  // per-phys-dim role (>= 0 | -1)
+  ClassifiedDims      dims;       // output of classify()
 
   // Resolved fields — filled by resolveAndReconcile() after classify().
   llvm::SmallVector<int64_t> transposePerm;

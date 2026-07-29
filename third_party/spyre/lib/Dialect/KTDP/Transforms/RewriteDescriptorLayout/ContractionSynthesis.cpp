@@ -1,3 +1,11 @@
+//===- ContractionSynthesis.cpp - Phase 2 contraction dispatch/emission ---===//
+//
+// Dispatches physicalized matmul / reduce / store ops to their stick-tiled
+// emission routines, slicing operands according to per-operand OperandPlans
+// derived from layout markers.
+//
+//===----------------------------------------------------------------------===//
+
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/Classify.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
@@ -21,11 +29,19 @@
 #include <algorithm>
 #include <numeric>
 
-namespace mlir::triton::ktdp {
+using namespace mlir;
+
+namespace {
+
+using namespace mlir::triton::ktdp;
+
+//===----------------------------------------------------------------------===//
+// Shared helpers
+//===----------------------------------------------------------------------===//
 
 // True iff op is a single-result elementwise op with exactly one
 // RankedTensor operand.
-static bool isSingleTensorElementwiseOp(Operation *op) {
+bool isSingleTensorElementwiseOp(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumOperands() == 0)
     return false;
   int tensorOps = 0;
@@ -37,8 +53,8 @@ static bool isSingleTensorElementwiseOp(Operation *op) {
 
 // Emit linalg.transpose with the given permutation (input->output form).
 // linalg.transpose uses "output<-input" form, so we invert here.
-static Value emitTranspose(OpBuilder &b, Location loc, Value src,
-                           llvm::ArrayRef<int64_t> perm) {
+Value emitTranspose(OpBuilder &b, Location loc, Value src,
+                    llvm::ArrayRef<int64_t> perm) {
   auto srcTy = cast<RankedTensorType>(src.getType());
   auto mlirPerm = invertPerm(perm);
   llvm::SmallVector<int64_t> outShape(mlirPerm.size());
@@ -53,7 +69,7 @@ static Value emitTranspose(OpBuilder &b, Location loc, Value src,
 
 // Walk backward from `val` through single-tensor elementwise ops to the
 // ktdp.load that produced it. Returns null if not found.
-static mlir::ktdp::LoadOp walkToLoad(Value val) {
+mlir::ktdp::LoadOp walkToLoad(Value val) {
   Value v = val;
   while (true) {
     auto *defOp = v.getDefiningOp();
@@ -68,26 +84,31 @@ static mlir::ktdp::LoadOp walkToLoad(Value val) {
   }
 }
 
-// Walk back from an operand through the elementwise chain to the
-// ktdp.load, then look up the physical memView -> marker map.
-static triton::SpyreTensorLayoutOp
-findMarkerForOperand(Value operand, PassContext &ctx) {
-  auto ld = walkToLoad(operand);
-  if (!ld)
+// Look up the marker for an access tile's base memView in the pass context.
+triton::SpyreTensorLayoutOp
+lookupMarkerFromTile(Value accessTile, PassContext &ctx) {
+  auto tileOp = accessTile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
+  if (!tileOp)
     return {};
-  auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-      ld.getAccessTile().getDefiningOp());
-  if (!tile)
-    return {};
-  auto it = ctx.physMemViewToMarker.find(tile.getBase());
+  auto it = ctx.physMemViewToMarker.find(tileOp.getBase());
   return it != ctx.physMemViewToMarker.end() ? it->second
                                              : triton::SpyreTensorLayoutOp{};
 }
 
+// Walk back from an operand through the elementwise chain to the
+// ktdp.load, then look up the physical memView -> marker map.
+triton::SpyreTensorLayoutOp
+findMarkerForOperand(Value operand, PassContext &ctx) {
+  auto ld = walkToLoad(operand);
+  if (!ld)
+    return {};
+  return lookupMarkerFromTile(ld.getAccessTile(), ctx);
+}
+
 // Emit a stick loop (scf.for) or inline for trip <= 1.
-static Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
-                           Value acc,
-                           llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
+Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
+                    Value acc,
+                    llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
   if (tripCount <= 1) {
     Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
     return body(b, s0, acc);
@@ -105,16 +126,16 @@ static Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
 }
 
 // Extract an op-tile stick slice from `plan`.
-static Value extractOpSlice(OpBuilder &b, Location loc,
-                            const OperandPlan &plan,
-                            RankedTensorType resultTy, Value stickIV,
-                            Value parallelIV = nullptr) {
+Value extractOpSlice(OpBuilder &b, Location loc,
+                     const OperandPlan &plan,
+                     RankedTensorType resultTy, Value stickIV,
+                     Value parallelIV = nullptr) {
   auto idx = [&](int64_t v) -> OpFoldResult { return b.getIndexAttr(v); };
   llvm::ArrayRef<int64_t> physBlock = plan.coords.physBlock;
   int rank = (int)physBlock.size();
   llvm::SmallVector<OpFoldResult> offsets(rank), sizes(rank), strides(rank, idx(1));
   for (int p = 0; p < rank; ++p) {
-    switch (plan.sliceKind[p]) {
+    switch (plan.dims.sliceKind[p]) {
     case SliceKind::StickIndex: {
       Value selectedIV = (plan.dimRoles[p] >= 0 && parallelIV) ? parallelIV : stickIV;
       Value iv = (physBlock[p] > 1) ? selectedIV : Value{};
@@ -134,9 +155,9 @@ static Value extractOpSlice(OpBuilder &b, Location loc,
                        ? stickIV
                        : arith::IndexCastOp::create(b, loc,
                              b.getIndexType(), stickIV).getResult();
-      Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.stickSize);
+      Value stickSz = arith::ConstantIndexOp::create(b, loc, plan.dims.stickSize);
       offsets[p] = arith::MulIOp::create(b, loc, sIdx, stickSz).getResult();
-      sizes[p]   = idx(plan.stickSize);
+      sizes[p]   = idx(plan.dims.stickSize);
       break;
     }
     case SliceKind::WholeBlock:
@@ -149,15 +170,18 @@ static Value extractOpSlice(OpBuilder &b, Location loc,
       b, loc, resultTy, plan.value, offsets, sizes, strides);
 }
 
+//===----------------------------------------------------------------------===//
+// Source stage (matmul / reduce operands)
+//===----------------------------------------------------------------------===//
+
 // Source stage emission: extract slices, optional transpose, call emitOp.
-template <typename OpT>
-static LogicalResult emitSourceStage(
-    OpT op,
+LogicalResult emitSourceStage(
+    linalg::LinalgOp op,
     llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
                              RankedTensorType)>
         emitOp,
     llvm::ArrayRef<OperandPlan> plans) {
-  OpBuilder b(op);
+  OpBuilder b(op.getOperation());
   Location loc = op.getLoc();
 
   Value cVal = op.getDpsInits()[0];
@@ -174,16 +198,16 @@ static LogicalResult emitSourceStage(
   // Derive acc shape from the union of all (outputAxis, extent) pairs.
   int64_t maxAxis = -1;
   for (auto &plan : plans)
-    for (unsigned j = 0; j < plan.opTileDims.size(); ++j) {
-      int p = plan.opTileDims[j];
+    for (unsigned j = 0; j < plan.dims.opTileDims.size(); ++j) {
+      int p = plan.dims.opTileDims[j];
       int64_t role = plan.dimRoles[p];
       if (role >= 0 && role > maxAxis)
         maxAxis = role;
     }
   llvm::SmallVector<int64_t> accDims(maxAxis + 1, 0);
   for (auto &plan : plans)
-    for (unsigned j = 0; j < plan.opTileDims.size(); ++j) {
-      int p = plan.opTileDims[j];
+    for (unsigned j = 0; j < plan.dims.opTileDims.size(); ++j) {
+      int p = plan.dims.opTileDims[j];
       int64_t role = plan.dimRoles[p];
       if (role >= 0)
         accDims[role] = plan.opExtents[j];
@@ -198,15 +222,15 @@ static LogicalResult emitSourceStage(
   // Determine the stick loop trip count (stickFactor).
   int64_t stickFactor = 1;
   for (auto &plan : plans) {
-    for (int p : plan.loopDims) {
+    for (int p : plan.dims.loopDims) {
       if (static_cast<CoordOp>(plan.coords.op[p]) != CoordOp::FloorDiv)
         continue;
       int64_t logDim = plan.dimRoles[p];
       if (logDim >= 0)
         continue;
       int64_t f;
-      if (plan.sliceKind[p] == SliceKind::StickifiedBlock)
-        f = plan.coords.physBlock[p] / plan.stickSize;
+      if (plan.dims.sliceKind[p] == SliceKind::StickifiedBlock)
+        f = plan.coords.physBlock[p] / plan.dims.stickSize;
       else
         f = plan.coords.physBlock[p];
       if (f <= 1)
@@ -236,20 +260,19 @@ static LogicalResult emitSourceStage(
     return r;
   });
 
-  op.getResult(0).replaceAllUsesWith(result);
-  op.erase();
+  op->getResult(0).replaceAllUsesWith(result);
+  op->erase();
   return success();
 }
 
 // Classify one operand and populate plans[i].
-template <typename OpT>
-static LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec,
-                                    PassContext &ctx) {
+LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
+                             PassContext &ctx) {
   unsigned nOps = spec.operands.size();
   llvm::SmallVector<OperandPlan, 2> plans(nOps);
 
   for (unsigned i = 0; i < nOps; ++i) {
-    Value operand = op.getInputs()[i];
+    Value operand = op.getDpsInputs()[i];
     auto ld = walkToLoad(operand);
 
     if (ld) {
@@ -301,7 +324,7 @@ static LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec,
     if (plans[i].coords.src.empty())
       continue;
     bool multiStickReduction = false;
-    for (int p : plans[i].loopDims)
+    for (int p : plans[i].dims.loopDims)
       if (plans[i].coords.physBlock[p] > 1) { multiStickReduction = true; break; }
     if (!multiStickReduction)
       continue;
@@ -320,22 +343,22 @@ static LogicalResult dispatchSource(OpT op, const SourceOpSpec &spec,
   return emitSourceStage(op, spec.emitOp, plans);
 }
 
+//===----------------------------------------------------------------------===//
+// Sink stage (store scatter)
+//===----------------------------------------------------------------------===//
+
 // Walk the forward use chain from value through elementwise ops to a
 // ktdp.store, then look up the store's access tile base in physMemViewToMarker.
-static triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
-                                                       PassContext &ctx) {
+triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
+                                               PassContext &ctx) {
   llvm::SmallVector<Value> worklist = {value};
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
     for (auto *user : v.getUsers()) {
       if (auto st = dyn_cast<mlir::ktdp::StoreOp>(user)) {
-        auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(
-            st.getAccessTile().getDefiningOp());
-        if (!tile)
-          continue;
-        auto it = ctx.physMemViewToMarker.find(tile.getBase());
-        if (it != ctx.physMemViewToMarker.end())
-          return it->second;
+        auto marker = lookupMarkerFromTile(st.getAccessTile(), ctx);
+        if (marker)
+          return marker;
       }
       if (!isSingleTensorElementwiseOp(user))
         continue;
@@ -346,8 +369,8 @@ static triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
 }
 
 // Sink stage: scatter a logical data tile into the physical D tensor shape.
-static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
-                                   const OperandPlan &dPlan) {
+LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
+                            const OperandPlan &dPlan) {
   Value inputTile = st.getDataTile();
   OpBuilder b(st);
   Location loc = st.getLoc();
@@ -356,13 +379,13 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
 
   llvm::ArrayRef<int64_t> physBlock = dPlan.coords.physBlock;
   int physRank = (int)physBlock.size();
-  int64_t stickSize = physBlock[dPlan.lane];
+  int64_t stickSize = physBlock[dPlan.dims.lane];
 
-  if (dPlan.floorDims.empty())
+  if (dPlan.dims.floorDims.empty())
     return st.emitError(
         "spyre_tensor_layout: store sink stage requires at least one "
         "parallel floor dim in the output layout");
-  if (!dPlan.loopDims.empty())
+  if (!dPlan.dims.loopDims.empty())
     return st.emitError(
         "spyre_tensor_layout: store sink stage: unexpected reduction dim");
 
@@ -371,7 +394,7 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   {
     llvm::SmallVector<int64_t> canonicalAxesD(logRank);
     std::iota(canonicalAxesD.begin(), canonicalAxesD.end(), 0);
-    auto fwdPerm = computeTransposePerm(dPlan.opTileDims, dPlan.dimRoles,
+    auto fwdPerm = computeTransposePerm(dPlan.dims.opTileDims, dPlan.dimRoles,
                                         canonicalAxesD);
     if (!fwdPerm.empty()) {
       auto inv = invertPerm(fwdPerm);
@@ -398,12 +421,12 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   llvm::SmallVector<OpFoldResult> inputOffsetsBase(logRank, idx(0));
   llvm::SmallVector<OpFoldResult> inputSizesBase(logRank);
   llvm::SmallVector<OpFoldResult> inputStrides(logRank, idx(1));
-  for (int p : dPlan.opTileDims) {
+  for (int p : dPlan.dims.opTileDims) {
     int64_t logDim = dPlan.dimRoles[p];
     if (logDim >= 0 && (unsigned)logDim < logRank)
       inputSizesBase[logDimToPos(logDim)] = idx(physBlock[p]);
   }
-  for (int p : dPlan.floorDims) {
+  for (int p : dPlan.dims.floorDims) {
     int64_t logDim = dPlan.dimRoles[p];
     if (logDim >= 0 && (unsigned)logDim < logRank)
       inputSizesBase[logDimToPos(logDim)] = idx(stickSize);
@@ -413,11 +436,11 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   llvm::SmallVector<OpFoldResult> sinkSizes(physRank);
   llvm::SmallVector<OpFoldResult> sinkStrides(physRank, idx(1));
   for (int p = 0; p < physRank; ++p)
-    sinkSizes[p] = llvm::is_contained(dPlan.floorDims, p)
+    sinkSizes[p] = llvm::is_contained(dPlan.dims.floorDims, p)
                        ? idx(1) : idx(physBlock[p]);
 
   Value acc = physicalSink;
-  for (int p : dPlan.floorDims) {
+  for (int p : dPlan.dims.floorDims) {
     int64_t logDim = dPlan.dimRoles[p];
     if (logDim < 0 || (unsigned)logDim >= logRank) continue;
 
@@ -426,7 +449,7 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
     Value stickSizeVal = arith::ConstantIndexOp::create(b, loc, stickSize);
 
     llvm::SmallVector<int64_t> slShape(logRank);
-    for (int p2 : dPlan.opTileDims) {
+    for (int p2 : dPlan.dims.opTileDims) {
       int64_t ld = dPlan.dimRoles[p2];
       if (ld >= 0 && (unsigned)ld < logRank)
         slShape[logDimToPos(ld)] = physBlock[p2];
@@ -454,9 +477,9 @@ static LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
 }
 
 // Dispatch a store with an annotated output descriptor.
-static LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
-                                  triton::SpyreTensorLayoutOp marker,
-                                  PassContext &ctx) {
+LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
+                           triton::SpyreTensorLayoutOp marker,
+                           PassContext &ctx) {
   auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
   llvm::ArrayRef<int64_t> physBlock = tileTy.getShape();
 
@@ -473,8 +496,12 @@ static LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
   return emitSinkStage(st, dPlan);
 }
 
+//===----------------------------------------------------------------------===//
+// Per-op dispatch
+//===----------------------------------------------------------------------===//
+
 // Dispatch a linalg.reduce whose input has a layout marker.
-static LogicalResult dispatchReduce(linalg::ReduceOp rd, PassContext &ctx) {
+LogicalResult dispatchReduce(linalg::ReduceOp rd, PassContext &ctx) {
   auto marker = findMarkerForOperand(rd.getInputs()[0], ctx);
   if (!marker)
     return rd.emitError(
@@ -536,7 +563,7 @@ static LogicalResult dispatchReduce(linalg::ReduceOp rd, PassContext &ctx) {
 }
 
 // linalg.matmul instantiation.
-static LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
+LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
   SourceOpSpec spec;
   spec.operands = {SourceOperandSpec{{0, -1}},   // A=(m,k)
                    SourceOperandSpec{{-1, 1}}};  // B=(k,n)
@@ -551,7 +578,7 @@ static LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
 }
 
 // Return true and dispatch if `op` needs Phase 2 processing, false if not.
-static LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
+LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
   auto sourceNeedsDispatch = [&](linalg::LinalgOp linalgOp, unsigned logicalRank) {
     return llvm::any_of(linalgOp.getDpsInputOperands(), [&](OpOperand *operand) {
       auto t = dyn_cast<RankedTensorType>(operand->get().getType());
@@ -593,6 +620,14 @@ static LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx)
 
   return success();
 }
+
+} // namespace
+
+namespace mlir::triton::ktdp {
+
+//===----------------------------------------------------------------------===//
+// Entry point
+//===----------------------------------------------------------------------===//
 
 bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
   bool anyChanged = false;
