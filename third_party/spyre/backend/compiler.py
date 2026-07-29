@@ -15,6 +15,9 @@ class SpyreOptions:
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
+    # HBM data layout: "device" (stickified row-major physical strides) or
+    # "host" (strides derived from logical strides via the coordinate map).
+    data_layout: str = "device"
     # Required by Triton code generator
     sanitize_overflow: bool = False
     debug: bool = False
@@ -130,7 +133,7 @@ class SpyreBackend(BaseBackend):
         grid = list(options.grid)
 
         pm = ir.pass_manager(mod.context)
-        spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm)
+        spyre.passes.ttir_to_ktdp.add_convert_ttir_to_ktdp(pm, options.data_layout)
         spyre.passes.ttir_to_ktdp.add_distribute_work(pm, grid)
         # Clean up redundant arithmetic (fold muli x,1; simplify cast chains)
         passes.common.add_canonicalizer(pm)
