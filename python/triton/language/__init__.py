@@ -80,6 +80,7 @@ from .core import (
     histogram,
     inline_asm_elementwise,
     inter_tile,  # --- added for spyre
+    spyre_tensor_layout,  # --- added for spyre
     wk_slice_coord,  # --- added for spyre
     int1,
     int16,
@@ -210,6 +211,7 @@ __all__ = [
     "inline_asm_elementwise",
     "interleave",
     "inter_tile",  # --- added for spyre
+    "spyre_tensor_layout",  # --- added for spyre
     "wk_slice_coord",  # --- added for spyre
     "int1",
     "int16",

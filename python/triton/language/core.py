@@ -3845,4 +3845,29 @@ def wk_slice_coord(work_slices, axis, _semantic=None):
     Only valid on the ``spyre`` backend — raises on any other target.
     """
     return _semantic.wk_slice_coord(work_slices, axis)
+
+
+@builtin
+def spyre_tensor_layout(desc, layout, _semantic=None):
+    """(Spyre only) Annotate a tensor descriptor with its physical device layout.
+
+    ``layout`` is a list of per-physical-dim coordinate entries giving the
+    OpSpec ``device_coordinates`` map:
+
+    - ``src`` (a bare int) — identity: ``phys_idx = logical_idx[src]``.
+    - ``(src, "floordiv", div)`` — ``phys_idx = logical_idx[src] // div``.
+    - ``(src, "mod", mod)`` — ``phys_idx = logical_idx[src] % mod``.
+
+    Example — ``[M, N]`` tensor stick-tiled on ``N``, physical layout
+    ``[ceil(N/64), M, 64]``, indices ``[N//64, M, N%64]``::
+
+        tl.spyre_tensor_layout(desc, [
+            (1, "floordiv", 64),   # phys dim 0: stick index = N // 64
+            0,                     # phys dim 1: row index   = M
+            (1, "mod", 64),        # phys dim 2: lane index  = N % 64
+        ])
+
+    Only valid on the ``spyre`` backend — raises on any other target.
+    """
+    return _semantic.spyre_tensor_layout(desc, layout)
 # --- END --- added for spyre
