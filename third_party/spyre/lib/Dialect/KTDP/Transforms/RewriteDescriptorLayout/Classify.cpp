@@ -8,8 +8,12 @@
 #include "RewriteDescriptorLayout/Classify.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+
+#define DEBUG_TYPE "rewrite-descriptor-layout"
 
 namespace mlir::triton::ktdp {
 
@@ -71,6 +75,16 @@ OperandPlan classify(Value val, const OperandCoords &coords,
   if (d.opInnerDim != -1 &&
       coords.physBlock[d.opInnerDim] > d.stickSize)
     d.sliceKind[d.opInnerDim] = SliceKind::StickifiedBlock;
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "    classify: lane=" << d.lane
+                 << " stickSize=" << d.stickSize
+                 << " opInner=" << d.opInnerDim
+                 << " floorDims=" << d.floorDims.size()
+                 << " loopDims=" << d.loopDims.size()
+                 << " reduceDims=" << d.reduceDims.size() << "\n";
+  });
+
   return plan;
 }
 
@@ -114,6 +128,8 @@ void resolveAndReconcile(llvm::SmallVectorImpl<OperandPlan> &plans,
   bool anyLoop = llvm::any_of(plans, [](const OperandPlan &p) {
     return !p.dims.loopDims.empty();
   });
+  LLVM_DEBUG(llvm::dbgs() << "    reconcile: anyLoop=" << anyLoop
+                          << (anyLoop ? " (no demotion)" : " (demoting StickifiedBlock)") << "\n");
   if (!anyLoop) {
     for (auto &plan : plans)
       for (auto &sk : plan.dims.sliceKind)

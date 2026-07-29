@@ -24,10 +24,14 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <numeric>
+
+#define DEBUG_TYPE "rewrite-descriptor-layout"
 
 using namespace mlir;
 
@@ -241,6 +245,9 @@ LogicalResult emitSourceStage(
     }
   }
 
+  LLVM_DEBUG(llvm::dbgs() << "  source stage: stickFactor=" << stickFactor
+                          << ", " << plans.size() << " operand plans\n");
+
   // Reduction-only path (no parallel scatter for Stage 4).
   Value stickIV;
   Value result = emitStickLoop(b, loc, stickFactor, cVal,
@@ -306,6 +313,13 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       llvm::SmallVector<int64_t> dimRoles;
       buildDimRoles(coords, effectiveCanonicalAxes, dimRoles);
       plans[i] = classify(operand, coords, dimRoles);
+      LLVM_DEBUG({
+        llvm::dbgs() << "  operand " << i << ": opTileDims=[";
+        llvm::interleaveComma(plans[i].dims.opTileDims, llvm::dbgs());
+        llvm::dbgs() << "] loopDims=[";
+        llvm::interleaveComma(plans[i].dims.loopDims, llvm::dbgs());
+        llvm::dbgs() << "]\n";
+      });
     } else {
       auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
       if (!tensorTy ||
@@ -371,6 +385,8 @@ triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
 // Sink stage: scatter a logical data tile into the physical D tensor shape.
 LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
                             const OperandPlan &dPlan) {
+  LLVM_DEBUG(llvm::dbgs() << "  sink stage: stickSize=" << dPlan.dims.stickSize
+                          << ", floorDims=" << dPlan.dims.floorDims.size() << "\n");
   Value inputTile = st.getDataTile();
   OpBuilder b(st);
   Location loc = st.getLoc();
@@ -588,8 +604,14 @@ LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
     });
   };
 
-  if (auto mm = dyn_cast<linalg::MatmulOp>(op))
-    return sourceNeedsDispatch(mm, 2) ? (changed = true, dispatchMatmul(mm, ctx)) : success();
+  if (auto mm = dyn_cast<linalg::MatmulOp>(op)) {
+    if (sourceNeedsDispatch(mm, 2)) {
+      LLVM_DEBUG(llvm::dbgs() << "  dispatching matmul at " << op->getLoc() << "\n");
+      changed = true;
+      return dispatchMatmul(mm, ctx);
+    }
+    return success();
+  }
 
   if (auto rd = dyn_cast<linalg::ReduceOp>(op)) {
     auto rdMarker = findMarkerForOperand(rd.getInputs()[0], ctx);
@@ -599,9 +621,12 @@ LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
         if ((unsigned)(src + 1) > logicalInputRank)
           logicalInputRank = (unsigned)(src + 1);
     }
-    return sourceNeedsDispatch(rd, logicalInputRank)
-               ? (changed = true, dispatchReduce(rd, ctx))
-               : success();
+    if (sourceNeedsDispatch(rd, logicalInputRank)) {
+      LLVM_DEBUG(llvm::dbgs() << "  dispatching reduce at " << op->getLoc() << "\n");
+      changed = true;
+      return dispatchReduce(rd, ctx);
+    }
+    return success();
   }
 
   if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
@@ -614,6 +639,7 @@ LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
     auto marker = findMarkerForStore(st.getDataTile(), ctx);
     if (!marker)
       return success();
+    LLVM_DEBUG(llvm::dbgs() << "  dispatching store sink at " << op->getLoc() << "\n");
     changed = true;
     return dispatchSink(st, marker, ctx);
   }
@@ -632,8 +658,12 @@ namespace mlir::triton::ktdp {
 bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
   bool anyChanged = false;
   bool changed = true;
+  int iterCount = 0;
   while (changed) {
     changed = false;
+    ++iterCount;
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] synthesis iteration "
+                            << iterCount << "\n");
     llvm::SmallVector<Operation *> candidates;
     module.walk([&](Operation *op) {
       if (isa<linalg::MatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
@@ -646,6 +676,8 @@ bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
     if (changed)
       anyChanged = true;
   }
+  LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] synthesis converged "
+                          << "after " << iterCount << " iterations\n");
   return anyChanged;
 }
 

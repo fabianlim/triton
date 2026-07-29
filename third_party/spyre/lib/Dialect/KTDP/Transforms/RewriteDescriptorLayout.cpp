@@ -43,10 +43,14 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <numeric>
 #include <optional>
+
+#define DEBUG_TYPE "rewrite-descriptor-layout"
 
 namespace mlir::triton::ktdp {
 
@@ -230,6 +234,7 @@ struct RewriteDescriptorLayoutPass
 
   // Rescale an scf.for loop to stick granularity.
   void rescaleEnclosingLoop(scf::ForOp forOp, int64_t factor) {
+    LLVM_DEBUG(llvm::dbgs() << "  rescaling loop by factor " << factor << "\n");
     Type ivTy = forOp.getInductionVar().getType();
     OpBuilder b(forOp);
     Location loc = forOp.getLoc();
@@ -272,6 +277,12 @@ struct RewriteDescriptorLayoutPass
     for (unsigned k = 0; k < physRank; ++k)
       if (physSrc[k] < 0 || physSrc[k] >= (int64_t)logRank)
         return tileOp.emitError("spyre_tensor_layout: phys_src out of range");
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "  access tile physBlock: ";
+      llvm::interleaveComma(physBlock, llvm::dbgs());
+      llvm::dbgs() << "\n";
+    });
 
     // Validate stick width.
     for (unsigned k = 0; k < physRank; ++k) {
@@ -580,6 +591,11 @@ struct RewriteDescriptorLayoutPass
         continue;
       if (auto tr = dyn_cast<linalg::TransposeOp>(op)) {
         auto perm = SmallVector<int64_t>(tr.getPermutation());
+        LLVM_DEBUG({
+          llvm::dbgs() << "  erasing transpose, perm: ";
+          llvm::interleaveComma(perm, llvm::dbgs());
+          llvm::dbgs() << "\n";
+        });
         physicalLoadToTransposePerm[physLoadResult] = perm;
         Value physInput = tr.getInput();
         SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
@@ -622,6 +638,14 @@ struct RewriteDescriptorLayoutPass
     ArrayRef<int64_t> physOp  = marker.getPhysOp();
     ArrayRef<int64_t> physArg = marker.getPhysArg();
     unsigned physRank = physSrc.size();
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "[rewrite-descriptor-layout] physicalizing: physRank="
+                   << physRank << "\n";
+      llvm::dbgs() << "  physSrc="; llvm::interleaveComma(physSrc, llvm::dbgs()); llvm::dbgs() << "\n";
+      llvm::dbgs() << "  physOp="; llvm::interleaveComma(physOp, llvm::dbgs()); llvm::dbgs() << "\n";
+      llvm::dbgs() << "  physArg="; llvm::interleaveComma(physArg, llvm::dbgs()); llvm::dbgs() << "\n";
+    });
 
     // --- 1. Build physical construct_memory_view ---
     Value newMemView;
@@ -685,6 +709,12 @@ struct RewriteDescriptorLayoutPass
           }
         }
       }
+
+      LLVM_DEBUG({
+        llvm::dbgs() << "  physical sizes: ";
+        llvm::interleaveComma(physStaticSizes, llvm::dbgs());
+        llvm::dbgs() << "\n";
+      });
 
       // Compute physical strides.
       SmallVector<int64_t> physStaticStrides;
@@ -770,16 +800,25 @@ struct RewriteDescriptorLayoutPass
     SmallVector<triton::SpyreTensorLayoutOp> markers;
     module.walk([&](triton::SpyreTensorLayoutOp op) { markers.push_back(op); });
 
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] found "
+                            << markers.size() << " layout markers\n");
+
     // Phase 1: physicalize each annotated descriptor.
     for (auto marker : markers)
       if (failed(rewriteOnePhysicalize(marker)))
         return signalPassFailure();
+
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
+                            << "entering Phase 2 (contraction synthesis)\n");
 
     // Phase 2: synthesize contractions.
     {
       PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
       synthesizeContractions(module, ctx);
     }
+
+    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "
+                            << "erasing " << markers.size() << " markers\n");
 
     // Phase 3: erase all markers (and their now-dead bridge casts).
     for (auto marker : markers)
