@@ -90,7 +90,8 @@ VARIANTS = {
         "kernel_fn":    kernel.softmax_single_tile,
         "constexpr":    ["BLOCK_SIZE"],
         "params":       {
-            "M":          [1024],
+            # M=[16,1000,1024]: absorbs few_rows (M=16) and nonaligned (M=1000).
+            "M":          [16, 1000, 1024],
             "N":          [1024],
             "BLOCK_SIZE": [1024],
         },
@@ -141,7 +142,11 @@ VARIANTS = {
             "BLOCK_N":    "i32",
         },
         "constexpr": ["BLOCK_N"],
-        "params":    {"M": [1024], "N": [1024], "BLOCK_N": [64]},
+        "params":    {
+            # M=[1000,1024]: absorbs multi_tile_nonaligned (M=1000).
+            # BLOCK_N=[32,64]: absorbs multi_tile_small_block (BLOCK_N=32).
+            "M": [1000, 1024], "N": [1024], "BLOCK_N": [32, 64],
+        },
         "extra_checks": lambda t: (
             # Three nested scf.for in the kernel body: outer rows-per-core,
             # three inner N-tile passes (max, denom, normalize).
