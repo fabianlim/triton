@@ -593,6 +593,21 @@ LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
   return dispatchSource(mm, spec, ctx);
 }
 
+// linalg.batch_matmul instantiation.
+LogicalResult dispatchBatchMatmul(linalg::BatchMatmulOp bmm, PassContext &ctx) {
+  SourceOpSpec spec;
+  spec.operands = {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
+                   SourceOperandSpec{{0, -1, 2}}};  // B=(b,k,n)
+  spec.logicalRank = 3;
+  spec.emitOp = [](OpBuilder &b, Location loc,
+                   llvm::ArrayRef<Value> slices, Value acc,
+                   RankedTensorType accTy) -> Value {
+    return linalg::BatchMatmulOp::create(b, loc, accTy,
+        ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+  };
+  return dispatchSource(bmm, spec, ctx);
+}
+
 // Return true and dispatch if `op` needs Phase 2 processing, false if not.
 LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
   auto sourceNeedsDispatch = [&](linalg::LinalgOp linalgOp, unsigned logicalRank) {
@@ -609,6 +624,15 @@ LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
       LLVM_DEBUG(llvm::dbgs() << "  dispatching matmul at " << op->getLoc() << "\n");
       changed = true;
       return dispatchMatmul(mm, ctx);
+    }
+    return success();
+  }
+
+  if (auto bmm = dyn_cast<linalg::BatchMatmulOp>(op)) {
+    if (sourceNeedsDispatch(bmm, 3)) {
+      LLVM_DEBUG(llvm::dbgs() << "  dispatching batch_matmul at " << op->getLoc() << "\n");
+      changed = true;
+      return dispatchBatchMatmul(bmm, ctx);
     }
     return success();
   }
@@ -666,7 +690,7 @@ bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
                             << iterCount << "\n");
     llvm::SmallVector<Operation *> candidates;
     module.walk([&](Operation *op) {
-      if (isa<linalg::MatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
+      if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
         candidates.push_back(op);
     });
     for (auto *op : candidates) {
