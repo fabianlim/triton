@@ -431,6 +431,7 @@ class KTIRStructuralTester(StructuralAssertions):
             return
         entry = EXAMPLES[self.EXAMPLE]
         grid = entry.get("grid")  # None → backend default
+        data_layout = entry.get("data_layout")  # None → backend default
 
         if "kernel_fn" in entry:
             ttir_text = compile_to_ttir(
@@ -442,9 +443,11 @@ class KTIRStructuralTester(StructuralAssertions):
                     mode="w", suffix=".mlir", delete_on_close=False) as f:
                 f.write(ttir_text)
                 f.flush()
-                self.mod = make_ktir_mod(f.name, grid=grid)
+                self.mod = make_ktir_mod(f.name, grid=grid,
+                                         data_layout=data_layout)
         else:
-            self.mod = make_ktir_mod(entry["path"], grid=grid)
+            self.mod = make_ktir_mod(entry["path"], grid=grid,
+                                     data_layout=data_layout)
 
         self.ops = walk_module(self.mod)
         self._def_map = None

@@ -141,12 +141,15 @@ def walk_module(mod) -> list:
 # make_ktir_mod — full TTIR → KTIR pipeline, returns live ir.module
 # ---------------------------------------------------------------------------
 
-def make_ktir_mod(ttir_path, *, grid=None):
+def make_ktir_mod(ttir_path, *, grid=None, data_layout=None):
     """Parse *ttir_path*, run TTIR and KTIR passes, return the live module.
 
     ``grid`` is an optional per-axis hardware partition forwarded to the
     DistributeWork pass via SpyreOptions. Defaults to the backend's
     default grid (currently ``(32,)``) when omitted.
+
+    ``data_layout`` overrides the HBM data layout mode (``"device"`` or
+    ``"host"``). Defaults to the backend's default when omitted.
     """
     from triton._C.libtriton import ir
     from triton.backends.compiler import GPUTarget
@@ -154,7 +157,11 @@ def make_ktir_mod(ttir_path, *, grid=None):
 
     target = GPUTarget(backend="spyre", arch=1, warp_size=1)
     backend = SpyreBackend(target)
-    opts = {"grid": tuple(grid)} if grid is not None else {}
+    opts = {}
+    if grid is not None:
+        opts["grid"] = tuple(grid)
+    if data_layout is not None:
+        opts["data_layout"] = data_layout
     options = backend.parse_options(opts)
 
     ctx = ir.context()
