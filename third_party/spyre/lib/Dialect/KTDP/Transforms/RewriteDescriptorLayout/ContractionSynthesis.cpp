@@ -514,6 +514,42 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
 }
 
 //===----------------------------------------------------------------------===//
+// Shared matmul-like pattern helper
+//===----------------------------------------------------------------------===//
+
+// Shared implementation for matmul-like contractions (matmul, batch_matmul).
+// Parameterized by the op type, logical rank, canonical axes, and op emitter.
+template <typename OpTy>
+static LogicalResult rewriteMatmulLike(
+    OpTy op, PatternRewriter &rewriter, const PassContext &ctx,
+    unsigned logicalRank,
+    llvm::ArrayRef<SourceOperandSpec> operandSpecs,
+    llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
+                             RankedTensorType)>
+        emitOp) {
+  // Only match when at least one input is physicalized.
+  bool needsDispatch = llvm::any_of(
+      cast<linalg::LinalgOp>(op.getOperation()).getDpsInputOperands(),
+      [&](OpOperand *operand) {
+        auto t = dyn_cast<RankedTensorType>(operand->get().getType());
+        if (!t || t.getRank() <= (int)logicalRank)
+          return false;
+        return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
+      });
+  if (!needsDispatch)
+    return failure();
+
+  LLVM_DEBUG(llvm::dbgs() << "  dispatching " << OpTy::getOperationName()
+                          << " at " << op.getLoc() << "\n");
+
+  SourceOpSpec spec;
+  spec.operands.assign(operandSpecs.begin(), operandSpecs.end());
+  spec.logicalRank = logicalRank;
+  spec.emitOp = emitOp;
+  return dispatchSource(op, spec, ctx, rewriter);
+}
+
+//===----------------------------------------------------------------------===//
 // Pattern: linalg.matmul
 //===----------------------------------------------------------------------===//
 
@@ -524,31 +560,15 @@ struct RewriteMatmulPattern : OpRewritePattern<linalg::MatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::MatmulOp mm,
                                 PatternRewriter &rewriter) const override {
-    // Only match when at least one input is physicalized.
-    bool needsDispatch = llvm::any_of(
-        cast<linalg::LinalgOp>(mm.getOperation()).getDpsInputOperands(),
-        [&](OpOperand *operand) {
-          auto t = dyn_cast<RankedTensorType>(operand->get().getType());
-          if (!t || t.getRank() <= 2)
-            return false;
-          return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
+    return rewriteMatmulLike<linalg::MatmulOp>(
+        mm, rewriter, ctx, /*logicalRank=*/2,
+        {SourceOperandSpec{{0, -1}},   // A=(m,k)
+         SourceOperandSpec{{-1, 1}}},  // B=(k,n)
+        [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
+           RankedTensorType accTy) -> Value {
+          return linalg::MatmulOp::create(b, loc, accTy,
+              ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
         });
-    if (!needsDispatch)
-      return failure();
-
-    LLVM_DEBUG(llvm::dbgs() << "  dispatching matmul at " << mm.getLoc() << "\n");
-
-    SourceOpSpec spec;
-    spec.operands = {SourceOperandSpec{{0, -1}},   // A=(m,k)
-                     SourceOperandSpec{{-1, 1}}};  // B=(k,n)
-    spec.logicalRank = 2;
-    spec.emitOp = [](OpBuilder &b, Location loc,
-                     llvm::ArrayRef<Value> slices, Value acc,
-                     RankedTensorType accTy) -> Value {
-      return linalg::MatmulOp::create(b, loc, accTy,
-          ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
-    };
-    return dispatchSource(mm, spec, ctx, rewriter);
   }
 };
 
@@ -563,30 +583,15 @@ struct RewriteBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::BatchMatmulOp bmm,
                                 PatternRewriter &rewriter) const override {
-    bool needsDispatch = llvm::any_of(
-        cast<linalg::LinalgOp>(bmm.getOperation()).getDpsInputOperands(),
-        [&](OpOperand *operand) {
-          auto t = dyn_cast<RankedTensorType>(operand->get().getType());
-          if (!t || t.getRank() <= 3)
-            return false;
-          return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
+    return rewriteMatmulLike<linalg::BatchMatmulOp>(
+        bmm, rewriter, ctx, /*logicalRank=*/3,
+        {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
+         SourceOperandSpec{{0, -1, 2}}},  // B=(b,k,n)
+        [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
+           RankedTensorType accTy) -> Value {
+          return linalg::BatchMatmulOp::create(b, loc, accTy,
+              ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
         });
-    if (!needsDispatch)
-      return failure();
-
-    LLVM_DEBUG(llvm::dbgs() << "  dispatching batch_matmul at " << bmm.getLoc() << "\n");
-
-    SourceOpSpec spec;
-    spec.operands = {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
-                     SourceOperandSpec{{0, -1, 2}}};  // B=(b,k,n)
-    spec.logicalRank = 3;
-    spec.emitOp = [](OpBuilder &b, Location loc,
-                     llvm::ArrayRef<Value> slices, Value acc,
-                     RankedTensorType accTy) -> Value {
-      return linalg::BatchMatmulOp::create(b, loc, accTy,
-          ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
-    };
-    return dispatchSource(bmm, spec, ctx, rewriter);
   }
 };
 
