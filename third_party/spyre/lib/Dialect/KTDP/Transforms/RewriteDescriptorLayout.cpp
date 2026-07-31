@@ -621,7 +621,47 @@ struct RewriteDescriptorLayoutPass
 
   // --- Phase 1: physicalize one descriptor ---
 
-  LogicalResult rewriteOnePhysicalize(triton::SpyreTensorLayoutOp marker) {
+  /// Captures all analysis decisions for physicalizing a single descriptor.
+  /// Pure data — no IR references that become stale during materialization
+  /// (memViewOp, basePtr, tiles are read before any mutation).
+  struct PhysicalViewPlan {
+    // Coord map from the marker.
+    ArrayRef<int64_t> physSrc, physOp, physArg;
+    unsigned physRank = 0;
+
+    // Logical sizes/strides from the original memory view.
+    SmallVector<int64_t> logStaticSizes;
+    SmallVector<int64_t> logStaticStrides;
+    SmallVector<Value> logDynSizes;
+    SmallVector<Value> logDynStrides;
+    SmallVector<int> logDynIdx;
+    SmallVector<int> logDynStrideIdx;
+
+    // Computed physical sizes.
+    SmallVector<int64_t> physStaticSizes;
+    // Indices into logDynSizes for dynamic physical dims (floordiv/identity).
+    // -1 means the physical dim is static. For floordiv dims, the materializer
+    // will emit a ceildiv; for identity dims it forwards the dynamic value.
+    SmallVector<int> physDynSizeSource;
+    SmallVector<CoordOp> physDynSizeOp;
+    SmallVector<int64_t> physDynSizeArg;
+
+    // Physical strides (fully static case only; empty if any stride is dynamic).
+    SmallVector<int64_t> physStaticStrides;
+    bool stridesAreAllStatic = false;
+
+    // Access tiles to rewrite.
+    SmallVector<mlir::ktdp::ConstructAccessTilesOp> directTiles;
+    SmallVector<mlir::ktdp::ConstructIndirectAccessTilesOp> indirectTiles;
+
+    // The original memory view op (loc is derived via memViewOp.getLoc()).
+    mlir::ktdp::ConstructMemoryViewOp memViewOp = nullptr;
+    Value memView; // result of the original construct_memory_view
+  };
+
+  /// Pure analysis: compute the plan from the marker. No IR mutation.
+  FailureOr<PhysicalViewPlan>
+  planPhysicalization(triton::SpyreTensorLayoutOp marker) {
     Value desc = marker.getDesc();
 
     if (!isLoweredDescriptor(desc))
@@ -635,145 +675,222 @@ struct RewriteDescriptorLayoutPass
       return marker.emitError(
           "spyre_tensor_layout: cannot locate construct_memory_view behind cast");
 
-    ArrayRef<int64_t> physSrc = marker.getPhysSrc();
-    ArrayRef<int64_t> physOp  = marker.getPhysOp();
-    ArrayRef<int64_t> physArg = marker.getPhysArg();
-    unsigned physRank = physSrc.size();
+    PhysicalViewPlan plan;
+    plan.physSrc = marker.getPhysSrc();
+    plan.physOp = marker.getPhysOp();
+    plan.physArg = marker.getPhysArg();
+    plan.physRank = plan.physSrc.size();
+    plan.memViewOp = memViewOp;
+    plan.memView = memView;
 
     LLVM_DEBUG({
       llvm::dbgs() << "[rewrite-descriptor-layout] physicalizing: physRank="
-                   << physRank << "\n";
-      llvm::dbgs() << "  physSrc="; llvm::interleaveComma(physSrc, llvm::dbgs()); llvm::dbgs() << "\n";
-      llvm::dbgs() << "  physOp="; llvm::interleaveComma(physOp, llvm::dbgs()); llvm::dbgs() << "\n";
-      llvm::dbgs() << "  physArg="; llvm::interleaveComma(physArg, llvm::dbgs()); llvm::dbgs() << "\n";
+                   << plan.physRank << "\n";
+      llvm::dbgs() << "  physSrc="; llvm::interleaveComma(plan.physSrc, llvm::dbgs()); llvm::dbgs() << "\n";
+      llvm::dbgs() << "  physOp="; llvm::interleaveComma(plan.physOp, llvm::dbgs()); llvm::dbgs() << "\n";
+      llvm::dbgs() << "  physArg="; llvm::interleaveComma(plan.physArg, llvm::dbgs()); llvm::dbgs() << "\n";
     });
 
-    // --- 1. Build physical construct_memory_view ---
-    Value newMemView;
+    // Read logical sizes and strides from the original memory view.
+    plan.logStaticSizes.assign(memViewOp.getStaticSizes().begin(),
+                               memViewOp.getStaticSizes().end());
+    plan.logStaticStrides.assign(memViewOp.getStaticStrides().begin(),
+                                 memViewOp.getStaticStrides().end());
+    plan.logDynSizes.assign(memViewOp.getSizes().begin(),
+                            memViewOp.getSizes().end());
+    plan.logDynStrides.assign(memViewOp.getStrides().begin(),
+                              memViewOp.getStrides().end());
+
+    // Build index maps for dynamic dims.
+    plan.logDynIdx.assign(plan.logStaticSizes.size(), -1);
     {
-      OpBuilder b(memViewOp);
-      Location loc = memViewOp.getLoc();
-      MLIRContext *ctx = b.getContext();
+      int dynPos = 0;
+      for (unsigned i = 0; i < plan.logStaticSizes.size(); ++i)
+        if (plan.logStaticSizes[i] == ShapedType::kDynamic)
+          plan.logDynIdx[i] = dynPos++;
+    }
+    plan.logDynStrideIdx.assign(plan.logStaticStrides.size(), -1);
+    {
+      int dynPos = 0;
+      for (unsigned i = 0; i < plan.logStaticStrides.size(); ++i)
+        if (plan.logStaticStrides[i] == ShapedType::kDynamic)
+          plan.logDynStrideIdx[i] = dynPos++;
+    }
 
-      ArrayRef<int64_t> logStaticSizes   = memViewOp.getStaticSizes();
-      ArrayRef<int64_t> logStaticStrides = memViewOp.getStaticStrides();
-      SmallVector<Value> logDynSizes(memViewOp.getSizes().begin(),
-                                     memViewOp.getSizes().end());
-      SmallVector<Value> logDynStrides(memViewOp.getStrides().begin(),
-                                       memViewOp.getStrides().end());
+    // Compute physical static sizes and note dynamic dim sources.
+    for (unsigned k = 0; k < plan.physRank; ++k) {
+      int64_t src = plan.physSrc[k];
+      auto op = static_cast<CoordOp>(plan.physOp[k]);
+      int64_t arg = plan.physArg[k];
+      if (src < 0 || src >= (int64_t)plan.logStaticSizes.size())
+        return marker.emitError("spyre_tensor_layout: phys_src out of range");
 
-      SmallVector<int> logDynIdx(logStaticSizes.size(), -1);
-      {
-        int dynPos = 0;
-        for (unsigned i = 0; i < logStaticSizes.size(); ++i)
-          if (logStaticSizes[i] == ShapedType::kDynamic)
-            logDynIdx[i] = dynPos++;
-      }
-      SmallVector<int> logDynStrideIdx(logStaticStrides.size(), -1);
-      {
-        int dynPos = 0;
-        for (unsigned i = 0; i < logStaticStrides.size(); ++i)
-          if (logStaticStrides[i] == ShapedType::kDynamic)
-            logDynStrideIdx[i] = dynPos++;
-      }
-
-      SmallVector<int64_t> physStaticSizes;
-      SmallVector<Value>   physDynSizes;
-
-      for (unsigned k = 0; k < physRank; ++k) {
-        int64_t src = physSrc[k];
-        auto op = static_cast<CoordOp>(physOp[k]);
-        int64_t arg = physArg[k];
-        if (src < 0 || src >= (int64_t)logStaticSizes.size())
-          return marker.emitError("spyre_tensor_layout: phys_src out of range");
-
-        int64_t logSz = logStaticSizes[src];
-        auto physSz = applyStatic(logSz, op, arg);
-        if (physSz) {
-          physStaticSizes.push_back(*physSz);
+      int64_t logSz = plan.logStaticSizes[src];
+      auto physSz = applyStatic(logSz, op, arg);
+      if (physSz) {
+        plan.physStaticSizes.push_back(*physSz);
+        plan.physDynSizeSource.push_back(-1);
+        plan.physDynSizeOp.push_back(CoordOp::Identity);
+        plan.physDynSizeArg.push_back(0);
+      } else {
+        plan.physStaticSizes.push_back(ShapedType::kDynamic);
+        if (op == CoordOp::FloorDiv) {
+          if (plan.logDynIdx[src] < 0)
+            return marker.emitError(
+                "spyre_tensor_layout: expected dynamic size for floordiv dim");
+          plan.physDynSizeSource.push_back(plan.logDynIdx[src]);
+          plan.physDynSizeOp.push_back(CoordOp::FloorDiv);
+          plan.physDynSizeArg.push_back(arg);
         } else {
-          physStaticSizes.push_back(ShapedType::kDynamic);
-          if (op == CoordOp::FloorDiv) {
-            if (logDynIdx[src] < 0)
-              return marker.emitError(
-                  "spyre_tensor_layout: expected dynamic size for floordiv dim");
-            Value logDynSize = logDynSizes[logDynIdx[src]];
-            Value argIdx = arith::ConstantOp::create(
-                b, loc, b.getIndexAttr(arg));
-            physDynSizes.push_back(
-                arith::CeilDivSIOp::create(b, loc, logDynSize, argIdx).getResult());
-          } else {
-            if (logDynIdx[src] < 0)
-              return marker.emitError(
-                  "spyre_tensor_layout: expected dynamic size for identity dim");
-            physDynSizes.push_back(logDynSizes[logDynIdx[src]]);
-          }
+          if (plan.logDynIdx[src] < 0)
+            return marker.emitError(
+                "spyre_tensor_layout: expected dynamic size for identity dim");
+          plan.physDynSizeSource.push_back(plan.logDynIdx[src]);
+          plan.physDynSizeOp.push_back(CoordOp::Identity);
+          plan.physDynSizeArg.push_back(0);
         }
       }
-
-      LLVM_DEBUG({
-        llvm::dbgs() << "  physical sizes: ";
-        llvm::interleaveComma(physStaticSizes, llvm::dbgs());
-        llvm::dbgs() << "\n";
-      });
-
-      // Compute physical strides.
-      SmallVector<int64_t> physStaticStrides;
-      SmallVector<Value> physDynStrides;
-      if (hwDataLayout) {
-        std::tie(physStaticStrides, physDynStrides) =
-            buildPhysicalStrides(physRank, physStaticSizes, physDynSizes, b, loc);
-      } else {
-        auto result =
-            buildLogicalStrides(physRank, physSrc, physOp, physArg,
-                                logStaticStrides, logDynStrides, logDynStrideIdx,
-                                b, loc,
-                                [&]() { return marker.emitError(); });
-        if (failed(result))
-          return failure();
-        std::tie(physStaticStrides, physDynStrides) = std::move(*result);
-      }
-
-      // Physical memref type.
-      auto logMemrefType = cast<MemRefType>(memViewOp.getResult().getType());
-      auto physMemrefType = MemRefType::get(physStaticSizes,
-                                            logMemrefType.getElementType());
-      auto memSpaceAttr = memViewOp.getMemorySpace();
-      auto coordSet = IntegerSetAttr::get(buildRangeSetND(ctx, physStaticSizes));
-
-      newMemView = mlir::ktdp::ConstructMemoryViewOp::create(
-                      b, loc, physMemrefType,
-                      memViewOp.getOffset(),
-                      physDynSizes, physDynStrides,
-                      physStaticSizes, physStaticStrides,
-                      memSpaceAttr, coordSet)
-                      .getResult();
     }
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "  physical sizes: ";
+      llvm::interleaveComma(plan.physStaticSizes, llvm::dbgs());
+      llvm::dbgs() << "\n";
+    });
+
+    // Compute physical strides if all static; otherwise leave for materializer.
+    if (hwDataLayout) {
+      // Row-major strides: check if all sizes are static.
+      bool allStatic = llvm::none_of(plan.physStaticSizes, [](int64_t s) {
+        return s == ShapedType::kDynamic;
+      });
+      if (allStatic) {
+        plan.physStaticStrides.resize(plan.physRank);
+        plan.physStaticStrides[plan.physRank - 1] = 1;
+        for (int k = (int)plan.physRank - 2; k >= 0; --k)
+          plan.physStaticStrides[k] =
+              plan.physStaticStrides[k + 1] * plan.physStaticSizes[k + 1];
+        plan.stridesAreAllStatic = true;
+      }
+    } else {
+      // Logical strides: check if all source logical strides are static.
+      bool allStatic = true;
+      for (unsigned k = 0; k < plan.physRank; ++k) {
+        int64_t s = plan.physSrc[k];
+        if (plan.logStaticStrides[s] == ShapedType::kDynamic) {
+          allStatic = false;
+          break;
+        }
+      }
+      if (allStatic) {
+        plan.physStaticStrides.resize(plan.physRank);
+        for (unsigned k = 0; k < plan.physRank; ++k) {
+          int64_t s = plan.physSrc[k];
+          auto op = static_cast<CoordOp>(plan.physOp[k]);
+          int64_t arg = plan.physArg[k];
+          int64_t logSt = plan.logStaticStrides[s];
+          if (op == CoordOp::FloorDiv)
+            plan.physStaticStrides[k] = logSt * arg;
+          else
+            plan.physStaticStrides[k] = logSt;
+        }
+        plan.stridesAreAllStatic = true;
+      }
+    }
+
+    // Collect access tiles that use the original memory view.
+    for (auto *user : memView.getUsers()) {
+      if (auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(user))
+        plan.directTiles.push_back(tile);
+      else if (auto tile =
+                   dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
+        plan.indirectTiles.push_back(tile);
+    }
+
+    return plan;
+  }
+
+  /// Emission: create new ops from the plan. Mutates IR.
+  LogicalResult materializePhysicalView(PhysicalViewPlan &plan,
+                                        triton::SpyreTensorLayoutOp marker) {
+    OpBuilder b(plan.memViewOp);
+    Location loc = plan.memViewOp.getLoc();
+    MLIRContext *ctx = b.getContext();
+
+    // Build dynamic physical sizes.
+    SmallVector<Value> physDynSizes;
+    for (unsigned k = 0; k < plan.physRank; ++k) {
+      if (plan.physDynSizeSource[k] < 0)
+        continue; // static dim
+      Value logDynSize = plan.logDynSizes[plan.physDynSizeSource[k]];
+      if (plan.physDynSizeOp[k] == CoordOp::FloorDiv) {
+        Value argIdx = arith::ConstantOp::create(
+            b, loc, b.getIndexAttr(plan.physDynSizeArg[k]));
+        physDynSizes.push_back(
+            arith::CeilDivSIOp::create(b, loc, logDynSize, argIdx).getResult());
+      } else {
+        physDynSizes.push_back(logDynSize);
+      }
+    }
+
+    // Compute physical strides.
+    SmallVector<int64_t> physStaticStrides;
+    SmallVector<Value> physDynStrides;
+    if (plan.stridesAreAllStatic) {
+      physStaticStrides = plan.physStaticStrides;
+    } else if (hwDataLayout) {
+      std::tie(physStaticStrides, physDynStrides) =
+          buildPhysicalStrides(plan.physRank, plan.physStaticSizes, physDynSizes,
+                               b, loc);
+    } else {
+      auto result = buildLogicalStrides(
+          plan.physRank, plan.physSrc, plan.physOp, plan.physArg,
+          plan.logStaticStrides, plan.logDynStrides, plan.logDynStrideIdx, b,
+          loc, [&]() { return marker.emitError(); });
+      if (failed(result))
+        return failure();
+      std::tie(physStaticStrides, physDynStrides) = std::move(*result);
+    }
+
+    // Physical memref type.
+    auto logMemrefType = cast<MemRefType>(plan.memViewOp.getResult().getType());
+    auto physMemrefType = MemRefType::get(plan.physStaticSizes,
+                                          logMemrefType.getElementType());
+    auto memSpaceAttr = plan.memViewOp.getMemorySpace();
+    auto coordSet = IntegerSetAttr::get(
+        buildRangeSetND(ctx, plan.physStaticSizes));
+
+    Value newMemView = mlir::ktdp::ConstructMemoryViewOp::create(
+                           b, loc, physMemrefType,
+                           plan.memViewOp.getOffset(),
+                           physDynSizes, physDynStrides,
+                           plan.physStaticSizes, physStaticStrides,
+                           memSpaceAttr, coordSet)
+                           .getResult();
 
     // Record the physical memView -> marker mapping for Phase 2.
     physMemViewToMarker[newMemView] = marker;
 
-    // --- 2. Rebuild each access tile that uses the old memView ---
-    SmallVector<mlir::ktdp::ConstructAccessTilesOp> tiles;
-    SmallVector<mlir::ktdp::ConstructIndirectAccessTilesOp> indirectTiles;
-    for (auto *user : memView.getUsers()) {
-      if (auto tile = dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(user))
-        tiles.push_back(tile);
-      else if (auto tile =
-                   dyn_cast<mlir::ktdp::ConstructIndirectAccessTilesOp>(user))
-        indirectTiles.push_back(tile);
-    }
-
-    for (auto tileOp : tiles) {
-      if (failed(rewriteAccessTile(tileOp, newMemView, physSrc, physOp, physArg)))
+    // Rebuild each access tile that uses the old memView.
+    for (auto tileOp : plan.directTiles) {
+      if (failed(rewriteAccessTile(tileOp, newMemView, plan.physSrc, plan.physOp,
+                                   plan.physArg)))
         return failure();
     }
-    for (auto tileOp : indirectTiles) {
-      if (failed(rewriteIndirectAccessTile(tileOp, newMemView, physSrc, physOp, physArg)))
+    for (auto tileOp : plan.indirectTiles) {
+      if (failed(rewriteIndirectAccessTile(tileOp, newMemView, plan.physSrc,
+                                           plan.physOp, plan.physArg)))
         return failure();
     }
 
     return success();
+  }
+
+  LogicalResult rewriteOnePhysicalize(triton::SpyreTensorLayoutOp marker) {
+    auto planOrErr = planPhysicalization(marker);
+    if (failed(planOrErr))
+      return failure();
+    return materializePhysicalView(*planOrErr, marker);
   }
 
   // --- Phase 3: marker cleanup ---
