@@ -4,6 +4,8 @@
 // emission routines, slicing operands according to per-operand OperandPlans
 // derived from layout markers.
 //
+// Uses MLIR's greedy pattern rewrite driver instead of a manual fixpoint loop.
+//
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
@@ -23,6 +25,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -90,7 +93,7 @@ mlir::ktdp::LoadOp walkToLoad(Value val) {
 
 // Look up the marker for an access tile's base memView in the pass context.
 triton::SpyreTensorLayoutOp
-lookupMarkerFromTile(Value accessTile, PassContext &ctx) {
+lookupMarkerFromTile(Value accessTile, const PassContext &ctx) {
   auto tileOp = accessTile.getDefiningOp<mlir::ktdp::ConstructAccessTilesOp>();
   if (!tileOp)
     return {};
@@ -102,7 +105,7 @@ lookupMarkerFromTile(Value accessTile, PassContext &ctx) {
 // Walk back from an operand through the elementwise chain to the
 // ktdp.load, then look up the physical memView -> marker map.
 triton::SpyreTensorLayoutOp
-findMarkerForOperand(Value operand, PassContext &ctx) {
+findMarkerForOperand(Value operand, const PassContext &ctx) {
   auto ld = walkToLoad(operand);
   if (!ld)
     return {};
@@ -179,13 +182,14 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 //===----------------------------------------------------------------------===//
 
 // Source stage emission: extract slices, optional transpose, call emitOp.
-LogicalResult emitSourceStage(
+// Returns the replacement value for the original op's result.
+Value emitSourceStage(
     linalg::LinalgOp op,
+    OpBuilder &b,
     llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
                              RankedTensorType)>
         emitOp,
     llvm::ArrayRef<OperandPlan> plans) {
-  OpBuilder b(op.getOperation());
   Location loc = op.getLoc();
 
   Value cVal = op.getDpsInits()[0];
@@ -267,14 +271,19 @@ LogicalResult emitSourceStage(
     return r;
   });
 
-  op->getResult(0).replaceAllUsesWith(result);
-  op->erase();
-  return success();
+  return result;
+}
+
+// Helper: emit an error and set the fatal error flag.
+static LogicalResult emitFatalError(Operation *op, const PassContext &ctx,
+                                    const llvm::Twine &msg) {
+  ctx.hadError = true;
+  return op->emitError(msg);
 }
 
 // Classify one operand and populate plans[i].
 LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
-                             PassContext &ctx) {
+                             const PassContext &ctx, PatternRewriter &rewriter) {
   unsigned nOps = spec.operands.size();
   llvm::SmallVector<OperandPlan, 2> plans(nOps);
 
@@ -288,7 +297,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
         if (!tensorTy ||
             tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
-          return op.emitError(
+          return emitFatalError(op, ctx,
               "spyre_tensor_layout: physical operand load has no layout marker");
         plans[i] = classifyScratchpad(operand, spec.operands[i]);
         continue;
@@ -324,7 +333,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
       if (!tensorTy ||
           tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
-        return op.emitError(
+        return emitFatalError(op, ctx,
             "spyre_tensor_layout: source op operand is neither a physical "
             "load nor a logical (scratchpad) tensor of the expected rank");
       plans[i] = classifyScratchpad(operand, spec.operands[i]);
@@ -345,7 +354,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     for (unsigned j = 0; j < nOps; ++j) {
       if (i == j) continue;
       if (plans[j].coords.src.empty())
-        return op.emitError(
+        return emitFatalError(op, ctx,
             "spyre_tensor_layout: operands share a stickified contraction "
             "axis but not all are annotated — any two operands sharing a "
             "stickified contraction axis must both carry a "
@@ -354,7 +363,10 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     }
   }
 
-  return emitSourceStage(op, spec.emitOp, plans);
+  OpBuilder b(op.getOperation());
+  Value result = emitSourceStage(op, b, spec.emitOp, plans);
+  rewriter.replaceOp(op, result);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -364,7 +376,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 // Walk the forward use chain from value through elementwise ops to a
 // ktdp.store, then look up the store's access tile base in physMemViewToMarker.
 triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
-                                               PassContext &ctx) {
+                                               const PassContext &ctx) {
   llvm::SmallVector<Value> worklist = {value};
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
@@ -384,11 +396,13 @@ triton::SpyreTensorLayoutOp findMarkerForStore(Value value,
 
 // Sink stage: scatter a logical data tile into the physical D tensor shape.
 LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
-                            const OperandPlan &dPlan) {
+                            const OperandPlan &dPlan,
+                            const PassContext &ctx,
+                            PatternRewriter &rewriter) {
   LLVM_DEBUG(llvm::dbgs() << "  sink stage: stickSize=" << dPlan.dims.stickSize
                           << ", floorDims=" << dPlan.dims.floorDims.size() << "\n");
   Value inputTile = st.getDataTile();
-  OpBuilder b(st);
+  OpBuilder b(st.getOperation());
   Location loc = st.getLoc();
 
   Type elemTy = cast<RankedTensorType>(inputTile.getType()).getElementType();
@@ -397,13 +411,17 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   int physRank = (int)physBlock.size();
   int64_t stickSize = physBlock[dPlan.dims.lane];
 
-  if (dPlan.dims.floorDims.empty())
+  if (dPlan.dims.floorDims.empty()) {
+    ctx.hadError = true;
     return st.emitError(
         "spyre_tensor_layout: store sink stage requires at least one "
         "parallel floor dim in the output layout");
-  if (!dPlan.dims.loopDims.empty())
+  }
+  if (!dPlan.dims.loopDims.empty()) {
+    ctx.hadError = true;
     return st.emitError(
         "spyre_tensor_layout: store sink stage: unexpected reduction dim");
+  }
 
   unsigned logRank = dPlan.coords.logicalRank;
   llvm::SmallVector<int64_t> sinkPerm;
@@ -488,156 +506,106 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
         });
   }
 
-  st.getDataTileMutable().set(acc);
+  // Mutate the store's data tile operand in-place.
+  rewriter.modifyOpInPlace(st, [&]() {
+    st.getDataTileMutable().set(acc);
+  });
   return success();
 }
 
-// Dispatch a store with an annotated output descriptor.
-LogicalResult dispatchSink(mlir::ktdp::StoreOp st,
-                           triton::SpyreTensorLayoutOp marker,
-                           PassContext &ctx) {
-  auto tileTy = cast<mlir::ktdp::AccessTileType>(st.getAccessTile().getType());
-  llvm::ArrayRef<int64_t> physBlock = tileTy.getShape();
-
-  unsigned logRank =
-      cast<RankedTensorType>(st.getDataTile().getType()).getRank();
-  OperandCoords dC = OperandCoords::fromMarker(marker, logRank, physBlock);
-
-  int physRank = (int)physBlock.size();
-  llvm::SmallVector<int64_t> dimRoleD(physRank);
-  for (int p = 0; p < physRank; ++p)
-    dimRoleD[p] = marker.getPhysSrc()[p];
-
-  OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
-  return emitSinkStage(st, dPlan);
-}
-
 //===----------------------------------------------------------------------===//
-// Per-op dispatch
+// Shared matmul-like pattern helper
 //===----------------------------------------------------------------------===//
 
-// Dispatch a linalg.reduce whose input has a layout marker.
-LogicalResult dispatchReduce(linalg::ReduceOp rd, PassContext &ctx) {
-  auto marker = findMarkerForOperand(rd.getInputs()[0], ctx);
-  if (!marker)
-    return rd.emitError(
-        "spyre_tensor_layout: dispatchReduce called but no marker on input");
-  unsigned logicalRank = 0;
-  for (int64_t src : marker.getPhysSrc())
-    if ((unsigned)(src + 1) > logicalRank)
-      logicalRank = (unsigned)(src + 1);
-  auto reductionDims = rd.getDimensions();
-  (void)reductionDims;
+// Shared implementation for matmul-like contractions (matmul, batch_matmul).
+// Parameterized by the op type, logical rank, canonical axes, and op emitter.
+template <typename OpTy>
+static LogicalResult rewriteMatmulLike(
+    OpTy op, PatternRewriter &rewriter, const PassContext &ctx,
+    unsigned logicalRank,
+    llvm::ArrayRef<SourceOperandSpec> operandSpecs,
+    llvm::function_ref<Value(OpBuilder &, Location, llvm::ArrayRef<Value>, Value,
+                             RankedTensorType)>
+        emitOp) {
+  // Only match when at least one input is physicalized.
+  bool needsDispatch = llvm::any_of(
+      cast<linalg::LinalgOp>(op.getOperation()).getDpsInputOperands(),
+      [&](OpOperand *operand) {
+        auto t = dyn_cast<RankedTensorType>(operand->get().getType());
+        if (!t || t.getRank() <= (int)logicalRank)
+          return false;
+        return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
+      });
+  if (!needsDispatch)
+    return failure();
 
-  llvm::SmallVector<int64_t> canonicalAxes(logicalRank, -1);
-  unsigned outAxis = 0;
-  for (unsigned d = 0; d < logicalRank; ++d)
-    if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
-      canonicalAxes[d] = outAxis++;
+  LLVM_DEBUG(llvm::dbgs() << "  dispatching " << OpTy::getOperationName()
+                          << " at " << op.getLoc() << "\n");
 
-  Block &combinerBlock = rd.getOperation()->getRegion(0).front();
-  llvm::SmallVector<Operation *> combinerOps;
-  for (Operation &op : combinerBlock.without_terminator())
-    combinerOps.push_back(&op);
-  auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
-  llvm::SmallVector<Value> yieldVals(combinerYield.getValues().begin(),
-                                     combinerYield.getValues().end());
-  llvm::SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
-                                         combinerBlock.getArguments().end());
-
-  unsigned outputRank = logicalRank - (unsigned)rd.getDimensions().size();
-  auto emitReduceOp = [outputRank,
-                       combinerOps = std::move(combinerOps),
-                       yieldVals = std::move(yieldVals),
-                       origBlockArgs = std::move(origBlockArgs)](
-                          OpBuilder &b, Location loc,
-                          llvm::ArrayRef<Value> slices, Value acc,
-                          RankedTensorType accTy) -> Value {
-    auto sliceTy = cast<RankedTensorType>(slices[0].getType());
-    llvm::SmallVector<int64_t> dims;
-    for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
-      dims.push_back((int64_t)d);
-    return linalg::ReduceOp::create(
-        b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
-        [&](OpBuilder &inner, Location iloc, ValueRange args) {
-          IRMapping mapping;
-          for (unsigned i = 0; i < origBlockArgs.size(); ++i)
-            mapping.map(origBlockArgs[i], args[i]);
-          for (Operation *op : combinerOps)
-            inner.clone(*op, mapping);
-          llvm::SmallVector<Value> mapped;
-          for (Value v : yieldVals)
-            mapped.push_back(mapping.lookupOrDefault(v));
-          linalg::YieldOp::create(inner, iloc, mapped);
-        }).getResult(0);
-  };
   SourceOpSpec spec;
-  spec.operands = {SourceOperandSpec{canonicalAxes}};
+  spec.operands.assign(operandSpecs.begin(), operandSpecs.end());
   spec.logicalRank = logicalRank;
-  spec.emitOp = emitReduceOp;
-  return dispatchSource(rd, spec, ctx);
+  spec.emitOp = emitOp;
+  return dispatchSource(op, spec, ctx, rewriter);
 }
 
-// linalg.matmul instantiation.
-LogicalResult dispatchMatmul(linalg::MatmulOp mm, PassContext &ctx) {
-  SourceOpSpec spec;
-  spec.operands = {SourceOperandSpec{{0, -1}},   // A=(m,k)
-                   SourceOperandSpec{{-1, 1}}};  // B=(k,n)
-  spec.logicalRank = 2;
-  spec.emitOp = [](OpBuilder &b, Location loc,
-                   llvm::ArrayRef<Value> slices, Value acc,
-                   RankedTensorType accTy) -> Value {
-    return linalg::MatmulOp::create(b, loc, accTy,
-        ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
-  };
-  return dispatchSource(mm, spec, ctx);
-}
+//===----------------------------------------------------------------------===//
+// Pattern: linalg.matmul
+//===----------------------------------------------------------------------===//
 
-// linalg.batch_matmul instantiation.
-LogicalResult dispatchBatchMatmul(linalg::BatchMatmulOp bmm, PassContext &ctx) {
-  SourceOpSpec spec;
-  spec.operands = {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
-                   SourceOperandSpec{{0, -1, 2}}};  // B=(b,k,n)
-  spec.logicalRank = 3;
-  spec.emitOp = [](OpBuilder &b, Location loc,
-                   llvm::ArrayRef<Value> slices, Value acc,
-                   RankedTensorType accTy) -> Value {
-    return linalg::BatchMatmulOp::create(b, loc, accTy,
-        ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
-  };
-  return dispatchSource(bmm, spec, ctx);
-}
+struct RewriteMatmulPattern : OpRewritePattern<linalg::MatmulOp> {
+  const PassContext &ctx;
+  RewriteMatmulPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
 
-// Return true and dispatch if `op` needs Phase 2 processing, false if not.
-LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
-  auto sourceNeedsDispatch = [&](linalg::LinalgOp linalgOp, unsigned logicalRank) {
-    return llvm::any_of(linalgOp.getDpsInputOperands(), [&](OpOperand *operand) {
-      auto t = dyn_cast<RankedTensorType>(operand->get().getType());
-      if (!t || t.getRank() <= (int)logicalRank)
-        return false;
-      return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
-    });
-  };
-
-  if (auto mm = dyn_cast<linalg::MatmulOp>(op)) {
-    if (sourceNeedsDispatch(mm, 2)) {
-      LLVM_DEBUG(llvm::dbgs() << "  dispatching matmul at " << op->getLoc() << "\n");
-      changed = true;
-      return dispatchMatmul(mm, ctx);
-    }
-    return success();
+  LogicalResult matchAndRewrite(linalg::MatmulOp mm,
+                                PatternRewriter &rewriter) const override {
+    return rewriteMatmulLike<linalg::MatmulOp>(
+        mm, rewriter, ctx, /*logicalRank=*/2,
+        {SourceOperandSpec{{0, -1}},   // A=(m,k)
+         SourceOperandSpec{{-1, 1}}},  // B=(k,n)
+        [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
+           RankedTensorType accTy) -> Value {
+          return linalg::MatmulOp::create(b, loc, accTy,
+              ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+        });
   }
+};
 
-  if (auto bmm = dyn_cast<linalg::BatchMatmulOp>(op)) {
-    if (sourceNeedsDispatch(bmm, 3)) {
-      LLVM_DEBUG(llvm::dbgs() << "  dispatching batch_matmul at " << op->getLoc() << "\n");
-      changed = true;
-      return dispatchBatchMatmul(bmm, ctx);
-    }
-    return success();
+//===----------------------------------------------------------------------===//
+// Pattern: linalg.batch_matmul
+//===----------------------------------------------------------------------===//
+
+struct RewriteBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
+  const PassContext &ctx;
+  RewriteBatchMatmulPattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::BatchMatmulOp bmm,
+                                PatternRewriter &rewriter) const override {
+    return rewriteMatmulLike<linalg::BatchMatmulOp>(
+        bmm, rewriter, ctx, /*logicalRank=*/3,
+        {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
+         SourceOperandSpec{{0, -1, 2}}},  // B=(b,k,n)
+        [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
+           RankedTensorType accTy) -> Value {
+          return linalg::BatchMatmulOp::create(b, loc, accTy,
+              ValueRange{slices[0], slices[1]}, ValueRange{acc}).getResult(0);
+        });
   }
+};
 
-  if (auto rd = dyn_cast<linalg::ReduceOp>(op)) {
+//===----------------------------------------------------------------------===//
+// Pattern: linalg.reduce
+//===----------------------------------------------------------------------===//
+
+struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
+  const PassContext &ctx;
+  RewriteReducePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/2), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(linalg::ReduceOp rd,
+                                PatternRewriter &rewriter) const override {
     auto rdMarker = findMarkerForOperand(rd.getInputs()[0], ctx);
     unsigned logicalInputRank = 2;
     if (rdMarker) {
@@ -645,31 +613,115 @@ LogicalResult dispatchOne(Operation *op, bool &changed, PassContext &ctx) {
         if ((unsigned)(src + 1) > logicalInputRank)
           logicalInputRank = (unsigned)(src + 1);
     }
-    if (sourceNeedsDispatch(rd, logicalInputRank)) {
-      LLVM_DEBUG(llvm::dbgs() << "  dispatching reduce at " << op->getLoc() << "\n");
-      changed = true;
-      return dispatchReduce(rd, ctx);
-    }
-    return success();
-  }
 
-  if (auto st = dyn_cast<mlir::ktdp::StoreOp>(op)) {
+    bool needsDispatch = llvm::any_of(
+        cast<linalg::LinalgOp>(rd.getOperation()).getDpsInputOperands(),
+        [&](OpOperand *operand) {
+          auto t = dyn_cast<RankedTensorType>(operand->get().getType());
+          if (!t || t.getRank() <= (int)logicalInputRank)
+            return false;
+          return static_cast<bool>(findMarkerForOperand(operand->get(), ctx));
+        });
+    if (!needsDispatch)
+      return failure();
+
+    LLVM_DEBUG(llvm::dbgs() << "  dispatching reduce at " << rd.getLoc() << "\n");
+
+    auto marker = findMarkerForOperand(rd.getInputs()[0], ctx);
+    if (!marker)
+      return emitFatalError(rd, ctx,
+          "spyre_tensor_layout: dispatchReduce called but no marker on input");
+    unsigned logicalRank = 0;
+    for (int64_t src : marker.getPhysSrc())
+      if ((unsigned)(src + 1) > logicalRank)
+        logicalRank = (unsigned)(src + 1);
+
+    llvm::SmallVector<int64_t> canonicalAxes(logicalRank, -1);
+    unsigned outAxis = 0;
+    for (unsigned d = 0; d < logicalRank; ++d)
+      if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
+        canonicalAxes[d] = outAxis++;
+
+    Block &combinerBlock = rd.getOperation()->getRegion(0).front();
+    llvm::SmallVector<Operation *> combinerOps;
+    for (Operation &op : combinerBlock.without_terminator())
+      combinerOps.push_back(&op);
+    auto combinerYield = cast<linalg::YieldOp>(combinerBlock.getTerminator());
+    llvm::SmallVector<Value> yieldVals(combinerYield.getValues().begin(),
+                                       combinerYield.getValues().end());
+    llvm::SmallVector<Value> origBlockArgs(combinerBlock.getArguments().begin(),
+                                           combinerBlock.getArguments().end());
+
+    unsigned outputRank = logicalRank - (unsigned)rd.getDimensions().size();
+    auto emitReduceOp = [outputRank,
+                         combinerOps = std::move(combinerOps),
+                         yieldVals = std::move(yieldVals),
+                         origBlockArgs = std::move(origBlockArgs)](
+                            OpBuilder &b, Location loc,
+                            llvm::ArrayRef<Value> slices, Value acc,
+                            RankedTensorType accTy) -> Value {
+      auto sliceTy = cast<RankedTensorType>(slices[0].getType());
+      llvm::SmallVector<int64_t> dims;
+      for (unsigned d = outputRank; d < (unsigned)sliceTy.getRank(); ++d)
+        dims.push_back((int64_t)d);
+      return linalg::ReduceOp::create(
+          b, loc, ValueRange{slices[0]}, ValueRange{acc}, dims,
+          [&](OpBuilder &inner, Location iloc, ValueRange args) {
+            IRMapping mapping;
+            for (unsigned i = 0; i < origBlockArgs.size(); ++i)
+              mapping.map(origBlockArgs[i], args[i]);
+            for (Operation *op : combinerOps)
+              inner.clone(*op, mapping);
+            llvm::SmallVector<Value> mapped;
+            for (Value v : yieldVals)
+              mapped.push_back(mapping.lookupOrDefault(v));
+            linalg::YieldOp::create(inner, iloc, mapped);
+          }).getResult(0);
+    };
+    SourceOpSpec spec;
+    spec.operands = {SourceOperandSpec{canonicalAxes}};
+    spec.logicalRank = logicalRank;
+    spec.emitOp = emitReduceOp;
+    return dispatchSource(rd, spec, ctx, rewriter);
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pattern: ktdp.store (sink)
+//===----------------------------------------------------------------------===//
+
+struct RewriteStorePattern : OpRewritePattern<mlir::ktdp::StoreOp> {
+  const PassContext &ctx;
+  RewriteStorePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
+      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
+
+  LogicalResult matchAndRewrite(mlir::ktdp::StoreOp st,
+                                PatternRewriter &rewriter) const override {
     auto dataTy = dyn_cast<RankedTensorType>(st.getDataTile().getType());
     auto tileTy = dyn_cast<mlir::ktdp::AccessTileType>(
         st.getAccessTile().getType());
     if (!dataTy || !tileTy ||
         dataTy.getRank() == (int)tileTy.getShape().size())
-      return success();
+      return failure();
     auto marker = findMarkerForStore(st.getDataTile(), ctx);
     if (!marker)
-      return success();
-    LLVM_DEBUG(llvm::dbgs() << "  dispatching store sink at " << op->getLoc() << "\n");
-    changed = true;
-    return dispatchSink(st, marker, ctx);
-  }
+      return failure();
 
-  return success();
-}
+    LLVM_DEBUG(llvm::dbgs() << "  dispatching store sink at " << st.getLoc() << "\n");
+
+    llvm::ArrayRef<int64_t> physBlock = tileTy.getShape();
+    unsigned logRank = dataTy.getRank();
+    OperandCoords dC = OperandCoords::fromMarker(marker, logRank, physBlock);
+
+    int physRank = (int)physBlock.size();
+    llvm::SmallVector<int64_t> dimRoleD(physRank);
+    for (int p = 0; p < physRank; ++p)
+      dimRoleD[p] = marker.getPhysSrc()[p];
+
+    OperandPlan dPlan = classify(st.getDataTile(), dC, dimRoleD);
+    return emitSinkStage(st, dPlan, ctx, rewriter);
+  }
+};
 
 } // namespace
 
@@ -679,30 +731,12 @@ namespace mlir::triton::ktdp {
 // Entry point
 //===----------------------------------------------------------------------===//
 
-bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
-  bool anyChanged = false;
-  bool changed = true;
-  int iterCount = 0;
-  while (changed) {
-    changed = false;
-    ++iterCount;
-    LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] synthesis iteration "
-                            << iterCount << "\n");
-    llvm::SmallVector<Operation *> candidates;
-    module.walk([&](Operation *op) {
-      if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp, mlir::ktdp::StoreOp>(op))
-        candidates.push_back(op);
-    });
-    for (auto *op : candidates) {
-      if (failed(dispatchOne(op, changed, ctx)))
-        return anyChanged; // error already emitted
-    }
-    if (changed)
-      anyChanged = true;
-  }
-  LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] synthesis converged "
-                          << "after " << iterCount << " iterations\n");
-  return anyChanged;
+void populateContractionPatterns(RewritePatternSet &patterns,
+                                 const PassContext &ctx) {
+  MLIRContext *mlirCtx = patterns.getContext();
+  patterns.add<RewriteMatmulPattern, RewriteBatchMatmulPattern,
+               RewriteReducePattern>(mlirCtx, ctx);
+  patterns.add<RewriteStorePattern>(mlirCtx, ctx);
 }
 
 } // namespace mlir::triton::ktdp

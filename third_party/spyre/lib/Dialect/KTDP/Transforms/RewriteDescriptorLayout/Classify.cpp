@@ -39,8 +39,15 @@ OperandPlan classify(Value val, const OperandCoords &coords,
   plan.dimRoles  = llvm::SmallVector<int64_t>(dimRoles.begin(), dimRoles.end());
 
   ClassifiedDims &d = plan.dims;
-  d.lane      = rank - 1;
-  d.stickSize = coords.physBlock[rank - 1];
+  // Find the lane (mod) dimension — the physical dim carrying CoordOp::Mod.
+  d.lane = rank - 1;  // fallback
+  for (unsigned k = 0; k < rank; ++k) {
+    if (static_cast<CoordOp>(coords.op[k]) == CoordOp::Mod) {
+      d.lane = k;
+      break;
+    }
+  }
+  d.stickSize = coords.physBlock[d.lane];
   d.opInnerDim = -1;
 
   for (int p = rank - 1; p >= 0; --p) {
