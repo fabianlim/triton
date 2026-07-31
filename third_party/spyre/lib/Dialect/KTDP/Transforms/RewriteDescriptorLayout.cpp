@@ -555,10 +555,8 @@ struct RewriteDescriptorLayoutPass
   // True if the op is a shape-constraining op whose result shape is NOT
   // inherited from a single physical input.
   static bool isContractionOp(Operation *op) {
-    if (isa<linalg::ReduceOp>(op))
-      return true;
-    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-    return linalgOp && linalg::isaContractionOpInterface(linalgOp);
+    return isa<linalg::ContractionOpInterface>(op) ||
+           isa<linalg::ReduceOp>(op);
   }
 
   // Retype ktdp.load: replace with a new load of the physical tensor type.
