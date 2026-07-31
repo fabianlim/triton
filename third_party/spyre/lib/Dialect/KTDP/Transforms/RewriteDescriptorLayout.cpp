@@ -42,6 +42,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -811,10 +812,26 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
                             << "entering Phase 2 (contraction synthesis)\n");
 
-    // Phase 2: synthesize contractions.
+    // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
       PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
-      if (failed(synthesizeContractions(module, ctx)))
+      RewritePatternSet patterns(module.getContext());
+      populateContractionPatterns(patterns, ctx);
+      // Collect candidate ops (only op types our patterns target).
+      SmallVector<Operation *> candidates;
+      module.walk([&](Operation *op) {
+        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::ReduceOp,
+                mlir::ktdp::StoreOp>(op))
+          candidates.push_back(op);
+      });
+      GreedyRewriteConfig config;
+      config.enableFolding(false);
+      config.enableConstantCSE(false);
+      config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+      (void)applyOpPatternsGreedily(candidates,
+                                    FrozenRewritePatternSet(std::move(patterns)),
+                                    config);
+      if (ctx.hadError)
         return signalPassFailure();
     }
 

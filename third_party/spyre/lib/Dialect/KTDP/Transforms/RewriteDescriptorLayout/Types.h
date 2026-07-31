@@ -14,6 +14,8 @@ namespace mlir::triton::ktdp {
 struct PassContext {
   const llvm::DenseMap<mlir::Value, triton::SpyreTensorLayoutOp> &physMemViewToMarker;
   const llvm::DenseMap<mlir::Value, llvm::SmallVector<int64_t>> &physicalLoadToTransposePerm;
+  /// Set by patterns to indicate a fatal error that should abort the pass.
+  mutable bool hadError = false;
 };
 
 /// Per-operand coord-map info read from a still-live marker.
