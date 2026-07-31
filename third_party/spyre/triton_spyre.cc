@@ -11,6 +11,7 @@
 #include "Ktdp/KtdpOps.hpp"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
@@ -26,7 +27,7 @@ namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
-  //           LowerInterTile → ConvertFunctions.
+  //           ConvertElementwiseToLinalg → LowerInterTile → ConvertFunctions.
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
@@ -36,6 +37,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
     pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
     pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
     pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
