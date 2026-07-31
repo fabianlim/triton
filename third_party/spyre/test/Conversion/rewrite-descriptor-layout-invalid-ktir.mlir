@@ -283,7 +283,6 @@ module {
     %17 = ktdp.construct_access_tile %14[%15, %16] {access_tile_order = #map12, access_tile_set = #set12c} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     %18 = ktdp.load %17 : <64x64xindex> -> tensor<64x64xf32>
     // expected-error @below {{operands share a stickified contraction axis but not all are annotated}}
-    // expected-error @below {{'linalg.matmul' op expected operand #0 rank (3) to match the result rank of indexing_map (2)}}
     %19 = linalg.matmul ins(%6, %12 : tensor<64x128xf32>, tensor<128x64xf32>) outs(%18 : tensor<64x64xf32>) -> tensor<64x64xf32>
     %20 = arith.index_cast %c0_i32 : i32 to index
     %21 = arith.index_cast %c0_i32 : i32 to index

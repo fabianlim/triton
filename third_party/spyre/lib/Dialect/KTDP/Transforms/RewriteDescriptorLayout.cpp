@@ -814,7 +814,8 @@ struct RewriteDescriptorLayoutPass
     // Phase 2: synthesize contractions.
     {
       PassContext ctx{physMemViewToMarker, physicalLoadToTransposePerm};
-      synthesizeContractions(module, ctx);
+      if (failed(synthesizeContractions(module, ctx)))
+        return signalPassFailure();
     }
 
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "

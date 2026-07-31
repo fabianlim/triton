@@ -679,8 +679,7 @@ namespace mlir::triton::ktdp {
 // Entry point
 //===----------------------------------------------------------------------===//
 
-bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
-  bool anyChanged = false;
+LogicalResult synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
   bool changed = true;
   int iterCount = 0;
   while (changed) {
@@ -695,14 +694,12 @@ bool synthesizeContractions(mlir::ModuleOp module, PassContext &ctx) {
     });
     for (auto *op : candidates) {
       if (failed(dispatchOne(op, changed, ctx)))
-        return anyChanged; // error already emitted
+        return failure();
     }
-    if (changed)
-      anyChanged = true;
   }
   LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] synthesis converged "
                           << "after " << iterCount << " iterations\n");
-  return anyChanged;
+  return success();
 }
 
 } // namespace mlir::triton::ktdp
