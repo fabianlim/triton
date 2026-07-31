@@ -87,6 +87,34 @@ BlockArgument traceToMLIRBlockArg(Value v) {
   }
 }
 
+/// Apply a single coordinate-map operation to an SSA index value.
+/// Returns the transformed index (identity / divsi / remsi).
+Value applyCoordOp(OpBuilder &b, Location loc, Value logicalIdx,
+                   CoordOp op, int64_t arg) {
+  switch (op) {
+  case CoordOp::Identity:
+    return logicalIdx;
+  case CoordOp::FloorDiv: {
+    Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
+    return arith::DivSIOp::create(b, loc, logicalIdx, c).getResult();
+  }
+  case CoordOp::Mod: {
+    Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
+    return arith::RemSIOp::create(b, loc, logicalIdx, c).getResult();
+  }
+  }
+  llvm_unreachable("invalid CoordOp");
+}
+
+/// Apply a coordinate-map operation to an AffineExpr (forward application).
+AffineExpr applyCoordOpExpr(AffineExpr expr, CoordOp op, int64_t arg) {
+  switch (op) {
+  case CoordOp::Identity: return expr;
+  case CoordOp::FloorDiv: return expr.floorDiv(arg);
+  case CoordOp::Mod:      return expr % arg;
+  }
+  llvm_unreachable("invalid CoordOp");
+}
 
 struct RewriteDescriptorLayoutPass
     : public mlir::triton::ktdp::impl::RewriteDescriptorLayoutBase<
@@ -350,11 +378,10 @@ struct RewriteDescriptorLayoutPass
       auto op = static_cast<CoordOp>(physOp[k]);
       int64_t arg = physArg[k];
       Value logI = logIdx[src];
-      switch (op) {
-      case CoordOp::Identity:
-        physIdx.push_back(logI);
-        break;
-      case CoordOp::FloorDiv: {
+
+      // FloorDiv on a rescaled loop IV: the IV itself is already the physical
+      // index (rescaleEnclosingLoop in Pass 1 adjusted the trip count).
+      if (op == CoordOp::FloorDiv) {
         BlockArgument iv = traceToMLIRBlockArg(logI);
         scf::ForOp forOp = iv ? dyn_cast_or_null<scf::ForOp>(
                                     iv.getOwner()->getParentOp())
@@ -365,20 +392,11 @@ struct RewriteDescriptorLayoutPass
                             : arith::IndexCastOp::create(b, loc,
                                   b.getIndexType(), iv).getResult();
           physIdx.push_back(ivIdx);
-        } else {
-          Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
-          physIdx.push_back(
-              arith::DivSIOp::create(b, loc, logI, c).getResult());
+          continue;
         }
-        break;
       }
-      case CoordOp::Mod: {
-        Value c = arith::ConstantOp::create(b, loc, b.getIndexAttr(arg));
-        physIdx.push_back(
-            arith::RemSIOp::create(b, loc, logI, c).getResult());
-        break;
-      }
-      }
+
+      physIdx.push_back(applyCoordOp(b, loc, logI, op, arg));
     }
 
     auto physTileType = mlir::ktdp::AccessTileType::get(physBlock,
@@ -498,12 +516,7 @@ struct RewriteDescriptorLayoutPass
       AffineExpr oldExpr = oldMapAttr.getValue().getResult(0);
       AffineExpr reExpr = oldExpr.replaceDims(oldToNew);
 
-      AffineExpr physExpr;
-      switch (op) {
-      case CoordOp::Identity: physExpr = reExpr; break;
-      case CoordOp::FloorDiv: physExpr = reExpr.floorDiv(arg); break;
-      case CoordOp::Mod:      physExpr = reExpr % arg; break;
-      }
+      AffineExpr physExpr = applyCoordOpExpr(reExpr, op, arg);
 
       newKinds.push_back(oldKindAttr);
       newMaps.push_back(AffineMapAttr::get(
