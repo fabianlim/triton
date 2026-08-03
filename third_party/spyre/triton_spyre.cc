@@ -93,6 +93,19 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
         pm.addPass(mlir::triton::ktdp::createDistributeWorkPass(grid));
       },
       py::arg("pm"), py::arg("grid"));
+  // Opt-in only: MaterializeBaseAddresses is deliberately absent from
+  // add_convert_ttir_to_ktdp above. It changes the kernel's calling
+  // convention (base-address arguments become arith.constant and leave the
+  // signature), which only the dataflow-scheduler path wants; the default
+  // argument-passing path must stay byte-identical. Reached via
+  // required_fixes = {"materialize_base_addresses": "convert_functions"}.
+  m.def(
+      "add_materialize_base_addresses",
+      [](mlir::PassManager &pm, const std::vector<int64_t> &base_addresses) {
+        pm.addPass(mlir::triton::ktdp::createMaterializeBaseAddressesPass(
+            base_addresses));
+      },
+      py::arg("pm"), py::arg("base_addresses"));
 }
 
 void init_triton_spyre_ir_utils(py::module &&m) {

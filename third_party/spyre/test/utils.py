@@ -141,20 +141,43 @@ def walk_module(mod) -> list:
 # make_ktir_mod — full TTIR → KTIR pipeline, returns live ir.module
 # ---------------------------------------------------------------------------
 
-def make_ktir_mod(ttir_path, *, grid=None):
+def make_ktir_mod(ttir_path, *, grid=None, **options):
     """Parse *ttir_path*, run TTIR and KTIR passes, return the live module.
 
-    ``grid`` is an optional per-axis hardware partition forwarded to the
-    DistributeWork pass via SpyreOptions. Defaults to the backend's
-    default grid (currently ``(32,)``) when omitted.
+    Every keyword is forwarded verbatim as a ``SpyreOptions`` field, so a caller
+    reaches the whole option surface without this helper growing a parameter per
+    option. See ``SpyreOptions`` for the fields and what they mean; they are
+    deliberately not restated here, since a second copy of that list would drift
+    as options are added.
+
+    ``grid`` is the one named parameter, and only because ``None`` has to mean
+    "leave the default alone": callers pass ``grid=grid`` with a value that may
+    be ``None``, and forwarding that would override the dataclass default with
+    ``None`` instead of falling back to it. No coercion happens here —
+    ``SpyreOptions.__post_init__`` normalizes list → tuple for the fields that
+    need it, so doing it for ``grid`` alone would just be an inconsistency.
+
+    Unknown keys raise instead of being dropped. ``SpyreBackend.parse_options``
+    silently filters anything it doesn't recognize, so a typo'd option would
+    otherwise become an invisible no-op — the same failure mode ``_make_ktir``
+    guards against by raising on a missing pass binding.
     """
     from triton._C.libtriton import ir
     from triton.backends.compiler import GPUTarget
-    from backend.compiler import SpyreBackend
+    from backend.compiler import SpyreBackend, SpyreOptions
+
+    unknown = sorted(k for k in options if k not in SpyreOptions.__dataclass_fields__)
+    if unknown:
+        raise ValueError(
+            f"unknown SpyreOptions field(s): {', '.join(unknown)}; "
+            f"valid fields are {', '.join(sorted(SpyreOptions.__dataclass_fields__))}"
+        )
 
     target = GPUTarget(backend="spyre", arch=1, warp_size=1)
     backend = SpyreBackend(target)
-    opts = {"grid": tuple(grid)} if grid is not None else {}
+    opts = dict(options)
+    if grid is not None:
+        opts["grid"] = grid
     options = backend.parse_options(opts)
 
     ctx = ir.context()

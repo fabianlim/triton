@@ -24,15 +24,37 @@ Driver files
 ------------
 A driver is a Python file declaring four module-level globals:
 
-    KERNEL      : @triton.jit function to lower
-    SIGNATURE   : dict[str, str] arg name → Triton type ("*fp32", "i32", ...)
-    CONSTEXPRS  : dict[str, value] for every constexpr arg
-    GRID        : optional tuple, forwarded to SpyreOptions.grid
+    KERNEL        : @triton.jit function to lower
+    SIGNATURE     : dict[str, str] arg name → Triton type ("*fp32", "i32", ...)
+    CONSTEXPRS    : dict[str, value] for every constexpr arg
+    GRID          : optional tuple, forwarded to SpyreOptions.grid
+    SPYRE_OPTIONS : optional dict of any other SpyreOptions fields
 
 Drivers are typically dropped next to the kernel they target; the
 script adds the driver's parent directory and any ancestor containing
 ``kernels/`` or ``pyproject.toml`` to ``sys.path`` before importing,
 so ``from kernels.foo.spyre import ...`` style imports work.
+
+Spyre options
+-------------
+``--spyre-options`` takes a JSON object — either inline or ``@path.json`` —
+merged over the driver's ``SPYRE_OPTIONS`` (CLI wins on key collisions) and
+forwarded as keyword arguments to ``make_ktir_mod``. JSON rather than
+repeated ``KEY=VALUE`` flags because ``required_fixes`` is a mapping and a
+flat grammar would need a fragile nested syntax for it.
+
+Unknown keys raise — ``make_ktir_mod`` validates against
+``SpyreOptions.__dataclass_fields__`` so a typo doesn't silently no-op.
+
+The pair that materializes pointer arguments into constants, for feeding
+the dataflow scheduler a zero-argument entry function::
+
+    --spyre-options '{"required_fixes": {"materialize_base_addresses":
+                                         "convert_functions"},
+                      "base_addresses": [0, 8589934592, 17179869184]}'
+
+``base_addresses`` values are **ELEMENTS, not bytes** — divide a device
+byte address by the element width before putting it here.
 
 Usage::
 
@@ -44,12 +66,16 @@ Usage::
     uv run python scripts/dump_round_trip.py --lint-ktir
     uv run python scripts/dump_round_trip.py --driver path/to/foo_lower.py
     uv run python scripts/dump_round_trip.py --driver a.py --driver b.py --dest /tmp/rt/
+    uv run python scripts/dump_round_trip.py --driver a.py \
+        --spyre-options '{"base_addresses": [0, 8589934592]}'
+    uv run python scripts/dump_round_trip.py --driver a.py --spyre-options @opts.json
 """
 
 import argparse
 import ast
 import importlib.util
 import inspect
+import json
 import re
 import shutil
 import subprocess
@@ -206,7 +232,51 @@ def load_driver(path: Path) -> tuple[str, dict]:
     }
     if hasattr(mod, "GRID") and mod.GRID is not None:
         entry["grid"] = tuple(mod.GRID)
+    # Any remaining SpyreOptions field the driver wants to pin. Kept separate
+    # from "grid" above because grid predates this and make_ktir_mod still
+    # takes it as an explicit keyword.
+    if getattr(mod, "SPYRE_OPTIONS", None):
+        if not isinstance(mod.SPYRE_OPTIONS, dict):
+            raise SystemExit(
+                f"driver {path}: SPYRE_OPTIONS must be a dict, got "
+                f"{type(mod.SPYRE_OPTIONS).__name__}"
+            )
+        entry["spyre_options"] = dict(mod.SPYRE_OPTIONS)
     return path.stem, entry
+
+
+def parse_spyre_options(value: str | None) -> dict:
+    """Parse a ``--spyre-options`` value into a dict.
+
+    Accepts an inline JSON object, or ``@path/to/file.json`` to read one from
+    disk (handy when the option set is long-lived, e.g. a fixture's fixed base
+    addresses). Returns ``{}`` for ``None`` so callers can merge unconditionally.
+
+    Only shape is checked here — key names are validated downstream by
+    ``make_ktir_mod`` against ``SpyreOptions``, so there is one authority for
+    what a valid field is.
+    """
+    if value is None:
+        return {}
+    if value.startswith("@"):
+        src = Path(value[1:]).expanduser()
+        if not src.is_file():
+            raise SystemExit(f"--spyre-options: no such file: {src}")
+        text = src.read_text()
+        where = str(src)
+    else:
+        text = value
+        where = "inline value"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--spyre-options: invalid JSON in {where}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(
+            f"--spyre-options: {where} must be a JSON object, got "
+            f"{type(parsed).__name__}"
+        )
+    return parsed
 
 
 def _run_make_ttir(conftest_mod, ttir_text: str):
@@ -245,7 +315,14 @@ def _run_make_ttir(conftest_mod, ttir_text: str):
 def compile_variant(conftest_mod, entry: dict) -> tuple[str, str]:
     """Compile one variant to (ttir_text, ktir_text), both cleaned and
     post-inlining."""
-    grid = entry.get("grid")  # None → backend default
+    # Extra SpyreOptions fields (driver SPYRE_OPTIONS merged with the CLI flag
+    # by main). Empty dict → make_ktir_mod behaves exactly as before.
+    spyre_options = dict(entry.get("spyre_options") or {})
+    # make_ktir_mod takes grid as an explicit keyword, so a "grid" key in the
+    # options blob would collide with entry["grid"] and raise a confusing
+    # TypeError. Fold it in instead: it arrives from the same merge that let
+    # the CLI override the driver, so it wins over the driver's GRID.
+    grid = spyre_options.pop("grid", entry.get("grid"))  # None → backend default
 
     raw_ttir = conftest_mod.compile_to_ttir(
         entry["kernel_fn"],
@@ -261,7 +338,7 @@ def compile_variant(conftest_mod, entry: dict) -> tuple[str, str]:
             mode="w", suffix=".mlir", delete_on_close=False) as f:
         f.write(ttir_text)
         f.flush()
-        mod = conftest_mod.make_ktir_mod(f.name, grid=grid)
+        mod = conftest_mod.make_ktir_mod(f.name, grid=grid, **spyre_options)
     ktir_text = str(mod)
 
     return clean_ir(ttir_text), clean_ir(ktir_text)
@@ -541,10 +618,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--driver", type=Path, action="append", default=[],
-        help="external driver file declaring KERNEL/SIGNATURE/CONSTEXPRS/[GRID] "
-             "(may be passed multiple times). When set, fixtures are skipped.",
+        help="external driver file declaring KERNEL/SIGNATURE/CONSTEXPRS/"
+             "[GRID]/[SPYRE_OPTIONS] (may be passed multiple times). When set, "
+             "fixtures are skipped.",
+    )
+    parser.add_argument(
+        "--spyre-options", type=str, default=None, metavar="JSON",
+        help="JSON object of SpyreOptions fields, or @path/to/file.json. "
+             "Merged over a driver's SPYRE_OPTIONS (this flag wins) and applied "
+             "to every compiled variant. base_addresses is in ELEMENTS, not bytes.",
     )
     args = parser.parse_args()
+
+    cli_options = parse_spyre_options(args.spyre_options)
 
     args.dest.mkdir(parents=True, exist_ok=True)
     conftest_mod = _load_conftest()
@@ -570,6 +656,12 @@ def main() -> int:
             print(f"[{key}] skipped (disabled: {reason})", flush=True)
             disabled_keys.append(key)
             continue
+        # Driver/fixture-declared options first, CLI on top, so a one-off run
+        # can override a pinned option without editing the driver.
+        if cli_options:
+            entry = {**entry,
+                     "spyre_options": {**(entry.get("spyre_options") or {}),
+                                       **cli_options}}
         print(f"[{key}] compiling ...", flush=True)
         ttir, ktir = compile_variant(conftest_mod, entry)
         write_variant(args.dest, key, entry, ttir, ktir,
