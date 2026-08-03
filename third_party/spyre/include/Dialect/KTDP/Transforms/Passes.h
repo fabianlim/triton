@@ -21,6 +21,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createLowerScalarLoadPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLowerComputeOpsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createDistributeWorkPass(
     llvm::ArrayRef<int64_t> grid = {});
+std::unique_ptr<OperationPass<ModuleOp>> createMaterializeBaseAddressesPass(
+    llvm::ArrayRef<int64_t> baseAddresses = {});
 
 } // namespace mlir::triton::ktdp
 

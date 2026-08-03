@@ -5,6 +5,7 @@ add_triton_library(KTDPTransforms
   LowerComputeOps.cpp
   LowerInterTile.cpp
   DistributeWork.cpp
+  MaterializeBaseAddresses.cpp
   Utility.cpp
 
   DEPENDS

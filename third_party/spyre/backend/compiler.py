@@ -22,6 +22,7 @@ _CORE_PIPELINE_PASSES = (
 # they are passed as keyword arguments.
 _PASS_OPTIONS = {
     "distribute_work": ("grid",),
+    "materialize_base_addresses": ("base_addresses",),
 }
 
 
@@ -33,6 +34,18 @@ class SpyreOptions:
     # case. A 2D kernel with grid = (16, 2) would partition the same
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
+
+    # Fixed HBM base addresses for the kernel's pointer arguments, positionally:
+    # entry i is the address for the i-th `index` argument of the lowered
+    # function, which ConvertFunctions produced from the i-th !tt.ptr argument.
+    # When set, MaterializeBaseAddresses replaces those arguments with
+    # arith.constant and drops them from the signature, for feeding the dataflow
+    # scheduler. Empty (default) leaves the signature untouched.
+    #
+    # Values are ELEMENT indices, not byte addresses — ktdp.construct_memory_view's
+    # offset feeds MemRef.base_ptr, and ktir-cpu computes the byte position as
+    # base_ptr * bytes_per_elem(dtype). No scaling is applied on the way through.
+    base_addresses: Tuple[int, ...] = ()
 
     # Optional correctness patches to splice into the TTIR→KTIR pipeline, as
     # {fix pass name: core pass it runs after}. Both are binding names on
@@ -50,6 +63,8 @@ class SpyreOptions:
         # Normalize list → tuple for hashability / dataclass equality.
         if isinstance(self.grid, list):
             self.grid = tuple(self.grid)
+        if isinstance(self.base_addresses, list):
+            self.base_addresses = tuple(self.base_addresses)
 
     def hash(self):
         key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))
