@@ -4,6 +4,7 @@ add_triton_library(KTDPTransforms
   LowerScalarLoad.cpp
   LowerComputeOps.cpp
   LowerInterTile.cpp
+  UnaliasLinalgOuts.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp

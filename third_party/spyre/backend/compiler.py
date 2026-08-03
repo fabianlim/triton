@@ -52,6 +52,12 @@ class SpyreOptions:
     # spyre.passes.ttir_to_ktdp.
     #
     #   required_fixes = {"fold_addptr_into_base": "lower_scalar_load"}
+    #
+    # The anchor is a correctness constraint, not a preference: a fix pass only
+    # repairs IR that its anchor has already produced, so anchoring it earlier
+    # makes it a silent no-op. unalias_linalg_outs, for instance, must anchor on
+    # convert_elementwise_to_linalg — the pass that creates the ins/outs
+    # aliasing it removes.
     required_fixes: Mapping[str, str] = field(default_factory=dict)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
     # Required by Triton code generator
