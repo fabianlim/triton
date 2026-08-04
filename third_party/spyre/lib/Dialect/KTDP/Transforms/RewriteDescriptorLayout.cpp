@@ -261,24 +261,27 @@ struct RewriteDescriptorLayoutPass
     }
   }
 
-  // Rescale an scf.for loop to stick granularity.
+  // Rescale an scf.for loop from block units to stick units, where `factor` is
+  // the number of sticks spanned by one block.  Pass 2 of rewriteAccessTile
+  // consumes the IV directly as the physical stick index, so all three bounds
+  // must be converted together to preserve the iteration space.
   void rescaleEnclosingLoop(scf::ForOp forOp, int64_t factor) {
+    // factor == 1 means block and stick units already agree; there is nothing
+    // to convert and the loop must be left exactly as it is.
+    if (factor <= 1)
+      return;
     LLVM_DEBUG(llvm::dbgs() << "  rescaling loop by factor " << factor << "\n");
     Type ivTy = forOp.getInductionVar().getType();
     OpBuilder b(forOp);
     Location loc = forOp.getLoc();
-    if (factor > 1) {
-      Value factorV = arith::ConstantOp::create(b, loc,
-                          b.getIntegerAttr(ivTy, factor));
-      Value newUb = arith::MulIOp::create(b, loc,
-                        forOp.getUpperBound(), factorV).getResult();
-      forOp.setUpperBound(newUb);
-      forOp.setStep(factorV);
-    } else {
-      Value c1v = arith::ConstantOp::create(b, loc,
-                      b.getIntegerAttr(ivTy, 1));
-      forOp.setStep(c1v);
-    }
+    Value factorV =
+        arith::ConstantOp::create(b, loc, b.getIntegerAttr(ivTy, factor));
+    auto scale = [&](Value v) -> Value {
+      return arith::MulIOp::create(b, loc, v, factorV).getResult();
+    };
+    forOp.setLowerBound(scale(forOp.getLowerBound()));
+    forOp.setUpperBound(scale(forOp.getUpperBound()));
+    forOp.setStep(scale(forOp.getStep()));
   }
 
   // --- Access tile rewriting ---
