@@ -99,6 +99,16 @@ inline llvm::SmallVector<int64_t> invertPerm(llvm::ArrayRef<int64_t> perm) {
   return inv;
 }
 
+/// Compose two permutations: result[i] = first[second[i]]. `first` is applied
+/// after `second` (i.e. `second` runs first, `first` runs second).
+inline llvm::SmallVector<int64_t> composePerm(llvm::ArrayRef<int64_t> first,
+                                              llvm::ArrayRef<int64_t> second) {
+  llvm::SmallVector<int64_t> result(second.size());
+  for (unsigned i = 0; i < second.size(); ++i)
+    result[i] = first[second[i]];
+  return result;
+}
+
 } // namespace mlir::triton::ktdp
 
 #endif // KTDP_TRANSFORMS_REWRITEDESCRIPTORLAYOUT_PERMUTATIONUTILS_H

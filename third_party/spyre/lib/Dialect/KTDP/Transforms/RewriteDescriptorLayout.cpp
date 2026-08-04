@@ -611,7 +611,8 @@ struct RewriteDescriptorLayoutPass
           llvm::interleaveComma(perm, llvm::dbgs());
           llvm::dbgs() << "\n";
         });
-        physicalLoadToTransposePerm[physLoadResult] = perm;
+        auto &slot = physicalLoadToTransposePerm[physLoadResult];
+        slot = slot.empty() ? perm : composePerm(slot, perm);
         Value physInput = tr.getInput();
         SmallVector<Operation *> fmrConsumers(tr.getResult()[0].getUsers().begin(),
                                               tr.getResult()[0].getUsers().end());
