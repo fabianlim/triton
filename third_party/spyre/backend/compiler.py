@@ -12,7 +12,6 @@ _CORE_PIPELINE_PASSES = (
     "lower_scalar_load",
     "lower_compute_ops",
     "rewrite_descriptor_layout",
-    "convert_elementwise_to_linalg",
     "lower_inter_tile",
     "convert_functions",
 )
@@ -54,7 +53,7 @@ class SpyreOptions:
     # {fix pass name: core pass it runs after}. Both are binding names on
     # spyre.passes.ttir_to_ktdp.
     #
-    #   required_fixes = {"fold_addptr_into_base": "lower_scalar_load"}
+    #   required_fixes = {"convert_elementwise_to_linalg": "lower_compute_ops"}
     required_fixes: Mapping[str, str] = field(default_factory=dict)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
     # HBM data layout: "device" (stickified row-major physical strides) or
@@ -176,8 +175,8 @@ class SpyreBackend(BaseBackend):
           - LowerScalarLoad: scalar tt.load (+ addptr chain) -> ktdp.* rank-0 read
           - LowerComputeOps: tt.reduce/broadcast/expand_dims -> linalg/tensor
             + dead op sweep
-          - ConvertElementwiseToLinalg (upstream MLIR): tensor-typed
-            arith/math -> linalg.generic
+          - RewriteDescriptorLayout: logical tensor descriptors -> physical
+            (stick-tiled) layout from tt.spyre_tensor_layout annotations
           - LowerInterTile: tt.inter_tile_reduce -> ktdp.inter_tile_produce + delivery
           - ConvertFunctions: tt.func/return -> func.func/return, !tt.ptr -> index
             (last of the core passes — the memory passes above consume !tt.ptr

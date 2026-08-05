@@ -41,8 +41,6 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   //              │                  already linalg.matmul before its operands
   //              │                  are physicalized]
   //              ↓
-  //   ConvertElementwiseToLinalg   (upstream MLIR pass)
-  //              ↓
   //        LowerInterTile
   //              ↓
   //       ConvertFunctions
@@ -65,7 +63,6 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
         pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
         pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        pm.addPass(mlir::createConvertElementwiseToLinalgPass());
         pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
         pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
       },
@@ -78,6 +75,7 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // chosen point in the pipeline, and by the per-pass unit tests that run one
   // pass over inline MLIR. Every pass in the default order has a binding here,
   // so any reordering expressible in C++ is also expressible from Python.
+  //
   m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
     pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   });
