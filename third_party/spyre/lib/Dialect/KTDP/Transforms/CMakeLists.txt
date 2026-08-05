@@ -8,6 +8,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/Classify.cpp
   RewriteDescriptorLayout/ContractionSynthesis.cpp
   DistributeWork.cpp
+  MaterializeBaseAddresses.cpp
   Utility.cpp
 
   DEPENDS
@@ -21,6 +22,7 @@ add_triton_library(KTDPTransforms
   MLIRFuncDialect
   MLIRArithDialect
   MLIRLinalgDialect
+  MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect

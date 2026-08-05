@@ -11,6 +11,7 @@
 #include "Ktdp/KtdpOps.hpp"
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
@@ -25,33 +26,68 @@
 namespace py = pybind11;
 
 void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
-  // Pipeline: LowerDescriptorMemory → LowerScalarLoad → LowerComputeOps →
-  //           RewriteDescriptorLayout → LowerInterTile → ConvertFunctions.
-  // RewriteDescriptorLayout runs after LowerComputeOps so that tt.dot is
-  // already linalg.matmul before operands are physicalized.
+  // Pass order built by add_convert_ttir_to_ktdp:
+  //
+  //     LowerDescriptorMemory      [LowerPointerChainMemory — planned,
+  //              │                  not yet implemented; would handle the
+  //              │                  tensor-of-pointers tt.load that
+  //              │                  LowerScalarLoad leaves legal]
+  //              ↓
+  //       LowerScalarLoad
+  //              ↓
+  //       LowerComputeOps
+  //              ↓
+  //   RewriteDescriptorLayout      [runs after LowerComputeOps so tt.dot is
+  //              │                  already linalg.matmul before its operands
+  //              │                  are physicalized]
+  //              ↓
+  //   ConvertElementwiseToLinalg   (upstream MLIR pass)
+  //              ↓
+  //        LowerInterTile
+  //              ↓
+  //       ConvertFunctions
+  //
+  // This is only the nested pipeline. DistributeWork and canonicalize + CSE
+  // run after it, added separately by the `ktir` stage in
+  // third_party/spyre/backend/compiler.py.
+  //
+  // Ordering constraints (each pass also states its own in Passes.td):
   // ConvertFunctions runs last because it replaces !tt.ptr args with index;
   // memory passes must consume !tt.ptr via getBasePtrAsIndex/ptrToIndex first.
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
   // and before ConvertFunctions (reads work-slice function attributes that
   // ConvertFunctions would rewrite).
-  m.def("add_convert_ttir_to_ktdp",
-        [](mlir::PassManager &pm, const std::string &data_layout) {
-          pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-          pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-          pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
-              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-          pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
-          pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-        },
-        py::arg("pm"), py::arg("data_layout") = "device");
-  // Individual pass bindings for debugging and testing.
-  m.def("add_rewrite_descriptor_layout",
-        [](mlir::PassManager &pm, const std::string &data_layout) {
-          pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
-              mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
-        },
-        py::arg("pm"), py::arg("data_layout") = "device");
+  m.def(
+      "add_convert_ttir_to_ktdp",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+        pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
+        pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+        pm.addPass(mlir::createConvertElementwiseToLinalgPass());
+        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+        pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
+  // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
+  // order, but a caller that needs a different one — a subset of the passes,
+  // a repeat, or an extra pass slotted between two of them — builds the
+  // sequence from these instead. Used by the `required_fixes` mechanism in
+  // third_party/spyre/backend/compiler.py to insert correctness patches at a
+  // chosen point in the pipeline, and by the per-pass unit tests that run one
+  // pass over inline MLIR. Every pass in the default order has a binding here,
+  // so any reordering expressible in C++ is also expressible from Python.
+  m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
+  });
+  m.def(
+      "add_rewrite_descriptor_layout",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
   });
@@ -67,11 +103,25 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_convert_functions", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
   });
-  m.def("add_distribute_work",
-        [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
-          pm.addPass(
-              mlir::triton::ktdp::createDistributeWorkPass(grid));
-        });
+  m.def(
+      "add_distribute_work",
+      [](mlir::PassManager &pm, const std::vector<int64_t> &grid) {
+        pm.addPass(mlir::triton::ktdp::createDistributeWorkPass(grid));
+      },
+      py::arg("pm"), py::arg("grid"));
+  // Opt-in only: MaterializeBaseAddresses is deliberately absent from
+  // add_convert_ttir_to_ktdp above. It changes the kernel's calling
+  // convention (base-address arguments become arith.constant and leave the
+  // signature), which only the dataflow-scheduler path wants; the default
+  // argument-passing path must stay byte-identical. Reached via
+  // required_fixes = {"materialize_base_addresses": "convert_functions"}.
+  m.def(
+      "add_materialize_base_addresses",
+      [](mlir::PassManager &pm, const std::vector<int64_t> &base_addresses) {
+        pm.addPass(mlir::triton::ktdp::createMaterializeBaseAddressesPass(
+            base_addresses));
+      },
+      py::arg("pm"), py::arg("base_addresses"));
 }
 
 void init_triton_spyre_ir_utils(py::module &&m) {

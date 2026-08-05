@@ -55,6 +55,7 @@ Fixes, in order of preference:
 """
 
 import importlib.util
+import itertools
 import os
 import re
 import subprocess
@@ -169,19 +170,19 @@ def _resolve_variant(
       - ``module_sig`` — module-level ``SIGNATURE`` dict (maps arg name
         to dtype string). Used only if the variant doesn't declare its
         own ``SIGNATURE``.
-      - ``entry`` — the fully-merged variant dict. Must declare
-        ``constexpr`` (list[str]) and ``params`` (dict[str, list[Any]]).
-        May declare ``SIGNATURE`` to override the module-level default
-        wholesale (use when the variant's kernel has a different arg
-        list, e.g. softmax_multi_tile has BLOCK_N where
+      - ``entry`` — the fully-merged variant dict (after base resolution).
+        Must declare ``constexpr`` (list[str]) and ``params``
+        (dict[str, list[Any]]). May declare ``SIGNATURE`` to override the
+        module-level default wholesale (use when the variant's kernel has
+        a different arg list, e.g. softmax_multi_tile has BLOCK_N where
         softmax_single_tile has BLOCK_SIZE).
 
     Outputs:
       - ``runtime_signature`` — ``{name: dtype}`` subset of the effective
         ``SIGNATURE`` for arg names not in the variant's ``constexpr``.
       - ``constexprs`` — ``{name: value}`` for arg names in ``constexpr``.
-        The value is ``params[name][0]`` (Cartesian expansion is deferred;
-        see ``fixtures/README.md``).
+        The value is ``params[name][0]`` (always a single-element list by
+        the time this function is called; expansion happens in ``_load_examples``).
       - ``param_values`` — ``{name: value}`` flattened from ``params``
         using ``[0]``. Used by the numerical test to build runtime kwargs.
     """
@@ -204,12 +205,104 @@ def _resolve_variant(
 
     effective_sig = entry.get("SIGNATURE", module_sig)
     constexpr_names = set(entry["constexpr"])
+
+    # Validate: every constexpr name must be covered by params.  A missing
+    # name would otherwise surface as a cryptic KeyError or NoneType crash
+    # during Triton compilation rather than at collection time.
+    missing = constexpr_names - set(param_values)
+    if missing:
+        raise ValueError(
+            f"{kernel_name}: constexpr name(s) {sorted(missing)} not found in "
+            f"'params'. Add them to the variant's 'params' or its base variant's "
+            f"'params'."
+        )
+
     runtime_signature = {
         name: dtype for name, dtype in effective_sig.items()
         if name not in constexpr_names
     }
     constexprs = {name: param_values[name] for name in constexpr_names}
     return runtime_signature, constexprs, param_values
+
+
+def _normalise_param_list(
+    pname: str, values: list, kernel_name: str = ""
+) -> list[tuple]:
+    """Normalise *values* to a list of ``(label, value)`` pairs.
+
+    Accepts two forms:
+
+    - **Plain values** (int, float, str, dict, …) — auto-labelled as
+      ``str(value)``.
+    - **Labelled tuples** ``(label, value)`` where *label* is a ``str`` —
+      returned as-is.
+
+    Mixed lists (some tuples, some plain) raise :exc:`ValueError`.  So do
+    tuples whose first element is not a ``str``.
+    """
+    has_tuple = [isinstance(v, tuple) for v in values]
+    if any(has_tuple) and not all(has_tuple):
+        prefix = f"{kernel_name}: " if kernel_name else ""
+        raise ValueError(
+            f"{prefix}params[{pname!r}] mixes labelled tuples and plain "
+            f"values — use either all (label, value) tuples or all plain "
+            f"values, not both."
+        )
+    if all(has_tuple):
+        for v in values:
+            if len(v) != 2 or not isinstance(v[0], str):
+                prefix = f"{kernel_name}: " if kernel_name else ""
+                raise ValueError(
+                    f"{prefix}params[{pname!r}] labelled tuple must be "
+                    f"(str, value), got {v!r}"
+                )
+        return list(values)
+    else:
+        return [(str(v), v) for v in values]
+
+
+def _expand_params(
+    params: dict, kernel_name: str = ""
+) -> tuple[list[dict], set]:
+    """Return ``(combos, always_suffixed)``.
+
+    *combos* is a list of dicts mapping param name → ``(label, value)`` pair.
+
+    *always_suffixed* is the set of param names whose original list contained
+    labelled tuples — these params always appear in the suffix string even when
+    only one value is present.
+    """
+    normalised: dict = {}
+    always_suffixed: set = set()
+    for name, values in params.items():
+        normed = _normalise_param_list(name, values, kernel_name)
+        normalised[name] = normed
+        if any(isinstance(v, tuple) for v in values):
+            always_suffixed.add(name)
+
+    names = list(normalised)
+    combos = [
+        dict(zip(names, combo))
+        for combo in itertools.product(*[normalised[n] for n in names])
+    ]
+    return combos, always_suffixed
+
+
+def _sweep_suffix(merged_params: dict, combo: dict, always_suffixed: set = frozenset()) -> str:
+    """Build a ``[k=v, ...]`` suffix for params that have more than one value
+    or are explicitly labelled (in *always_suffixed*).
+
+    *combo* maps param name → ``(label, value)`` pair (post-normalisation).
+
+    Returns ``""`` when no param qualifies.
+    """
+    swept = sorted(
+        k for k, v in merged_params.items()
+        if len(v) > 1 or k in always_suffixed
+    )
+    if not swept:
+        return ""
+    return "[" + ", ".join(f"{k}={combo[k][0]}" for k in swept) + "]"
 
 
 def _load_examples():
@@ -222,21 +315,79 @@ def _load_examples():
         mod = _import_meta(meta_path)
         module_sig = getattr(mod, "SIGNATURE", {})
         variants = mod.VARIANTS
-        default = variants["default"]
-        for vname, delta in variants.items():
-            # Shallow merge: variant dict overrides default wholesale per key.
-            # Any key the variant omits (constexpr, params, etc.)
-            # inherits from default as-is.
-            merged = {**default, **delta}
-            if module_sig:
-                runtime, constexprs, param_values = _resolve_variant(
-                    module_sig, merged, kernel_name=f"{name}::{vname}"
+        # Build resolved bases before iterating so forward references are
+        # supported.  Resolution is lazy (depth-first) to catch cycles.
+        resolved: dict = {}
+
+        def _resolve_base(vname: str, chain: tuple = ()) -> dict:
+            if vname in resolved:
+                return resolved[vname]
+            if vname in chain:
+                raise ValueError(
+                    f"{name}: circular 'base' chain: {' -> '.join(chain)} -> {vname}"
                 )
-                merged["signature"] = runtime
-                merged["constexprs"] = constexprs
-                merged["param_values"] = param_values
-            key = name if vname == "default" else f"{name}__{vname}"
-            registry[key] = merged
+            delta = variants[vname]
+            base_name = delta.get("base", None if vname == "default" else "default")
+            if base_name is not None:
+                if base_name not in variants:
+                    raise ValueError(
+                        f"{name}::{vname}: 'base' refers to unknown variant {base_name!r}"
+                    )
+                base = _resolve_base(base_name, chain + (vname,))
+                merged = {**base, **delta}
+                merged.pop("base", None)
+            else:
+                merged = dict(delta)
+            resolved[vname] = merged
+            return merged
+
+        for vname in variants:
+            # Shallow-copy so that injected keys (signature, constexprs,
+            # param_values) don't leak into resolved[] and corrupt later
+            # base merges.
+            merged = dict(_resolve_base(vname))
+
+            # Disabled variants: one entry, no expansion.
+            if merged.get("disabled"):
+                key = name if vname == "default" else f"{name}__{vname}"
+                registry[key] = merged
+                continue
+
+            merged_params = merged.get("params", {})
+            combos, always_suffixed = _expand_params(
+                merged_params, kernel_name=f"{name}::{vname}"
+            )
+            base_key = name if vname == "default" else f"{name}__{vname}"
+
+            for combo in combos:
+                entry = dict(merged)
+                entry["params"] = {k: [combo[k][1]] for k in merged_params}
+                suffix = _sweep_suffix(merged_params, combo, always_suffixed)
+                key = base_key + suffix
+
+                # extra_checks factory protocol: if the callable accepts
+                # **kwargs, call it with the combo to get the final
+                # (tester)->None. Existing lambda t: (...) lambdas have no
+                # **kwargs and pass through unchanged.
+                # TODO(#71): remove this block when extra_checks is dropped
+                # from fixtures entirely (KTIRStructuralTester removal).
+                ec = entry.get("extra_checks")
+                if ec is not None:
+                    import inspect
+                    sig = inspect.signature(ec)
+                    if any(p.kind == inspect.Parameter.VAR_KEYWORD
+                           for p in sig.parameters.values()):
+                        combo_values = {k: v[1] for k, v in combo.items()}
+                        entry["extra_checks"] = ec(**combo_values)
+
+                if module_sig:
+                    runtime, constexprs, param_values = _resolve_variant(
+                        module_sig, entry, kernel_name=f"{name}::{vname}{suffix}"
+                    )
+                    entry["signature"]    = runtime
+                    entry["constexprs"]   = constexprs
+                    entry["param_values"] = param_values
+                registry[key] = entry
     return registry
 
 

@@ -4,32 +4,18 @@
 include "mlir/Pass/PassBase.td"
 
 // ============================================================================
-// Pass pipeline: TTIR → KTIR
-//
-//
-//   LowerDescriptorMemory       [LowerPointerChainMemory]
-//           └───────────┬───────────┘
-//
-//                LowerScalarLoad
-//                       ↓
-//                 LowerComputeOps
-//                       ↓
-//            RewriteDescriptorLayout
-//                       ↓
-//               LowerInterTile
-//                       ↓
-//               ConvertFunctions
-//                       ↓
-//               DistributeWork
-//                       ↓
-//              canonicalize + CSE
-//                       ↓
-//                     KTIR
+// Passes used to lower TTIR → KTIR.
 //
 // Each pass declares its contract below:
 //   Input    — dialects/ops it expects to see
 //   Lowering — ops it converts and what they become
 //   Output   — what the IR looks like after this pass
+//
+// Ordering constraints are stated per-pass in the descriptions below, since
+// they are properties of the individual pass. For the order the passes are
+// actually run in, see the two places that build the pipeline:
+//   - add_convert_ttir_to_ktdp in third_party/spyre/triton_spyre.cc
+//   - the `ktir` stage in third_party/spyre/backend/compiler.py
 // ============================================================================
 
 def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"> {
@@ -267,6 +253,69 @@ def DistributeWork : Pass<"distribute-work-to-spyre-cores", "mlir::ModuleOp"> {
     let dependentDialects = [
         "mlir::ktdp::KtdpDialect",
         "mlir::scf::SCFDialect",
+        "mlir::arith::ArithDialect"
+    ];
+}
+
+def MaterializeBaseAddresses
+    : Pass<"materialize-base-addresses", "mlir::ModuleOp"> {
+    let summary = "Replace base-address function arguments with arith.constant "
+                  "and drop them from the signature.";
+    let description = [{
+        Input: func.func after ConvertFunctions — base addresses are `index`
+        arguments of the entry block. Must run after ConvertFunctions: before
+        it the arguments are still !tt.ptr and the memory passes still see
+        unrealized_conversion_cast placeholders.
+
+        Lowering:
+        - the i-th `index` argument of the entry block, for each entry i of
+          baseAddresses, → arith.constant baseAddresses[i] : index, with the
+          argument erased from the signature
+
+        The address list is positional over the entry block's `index`
+        arguments, in scan order — not over all arguments. ConvertFunctions
+        retypes only !tt.ptr arguments to `index`, so after it runs the `index`
+        arguments are exactly the base addresses. An interleaved signature such
+        as `(%a: index, %n: i32, %b: index)` therefore assigns the two
+        addresses to %a and %b, never to the i32 runtime scalar %n. Argument
+        names and attributes are already gone by this point (ConvertFunctions
+        clones from the FunctionType), so position is the only available key.
+
+        Values are ELEMENT indices, not byte addresses: `$offset` on
+        ktdp.construct_memory_view feeds MemRef.base_ptr, which ktir-cpu
+        derives the byte position from as `base_ptr * bytes_per_elem(dtype)`
+        (ktir_cpu/ir_types.py:84-87). No scaling is applied here — the integer
+        supplied is emitted as-is. Scaling could not be done in this pass in
+        any case, since element size is per-descriptor and only the function
+        signature is visible here.
+
+        Negative addresses, and a list longer than the `index`-argument count,
+        are rejected with a diagnostic. A shorter list is legal — it
+        materializes a prefix and leaves the rest as arguments.
+
+        Applies to public functions only; a private helper is not a kernel
+        boundary. With an empty list the pass is a no-op — it is opt-in, run
+        only via required_fixes, and is in neither _CORE_PIPELINE_PASSES nor
+        the fused add_convert_ttir_to_ktdp binding.
+
+        Output: func.func whose base-address arguments are gone; every other
+        argument survives, keeping relative order. Arity zero is not
+        guaranteed — a kernel with a runtime scalar keeps it.
+    }];
+
+    let options = [
+        ListOption<"baseAddresses", "base-addresses", "int64_t",
+                   "Fixed HBM base addresses, as element indices, for the "
+                   "kernel's base-address "
+                   "arguments, positionally: entry i is the address for the "
+                   "i-th `index` argument of the entry block. May be shorter "
+                   "than the `index`-argument count (materializes a prefix); "
+                   "longer is an error. Empty (default) makes the pass a "
+                   "no-op.">
+    ];
+
+    let dependentDialects = [
+        "mlir::func::FuncDialect",
         "mlir::arith::ArithDialect"
     ];
 }
