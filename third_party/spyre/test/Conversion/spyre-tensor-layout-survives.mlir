@@ -23,13 +23,13 @@ module {
 // CHECK:           %[[VAL_9:.*]] = arith.index_cast %[[VAL_4]] : i64 to index
 // CHECK:           %[[VAL_10:.*]] = ktdp.construct_memory_view %[[VAL_5]], sizes: {{\[}}%[[VAL_6]], %[[VAL_7]]], strides: {{\[}}%[[VAL_8]], %[[VAL_9]]] {coordinate_set = #[[$ATTR_0]], memory_space = #ktdp.spyre_memory_space<HBM>} : memref<?x?xf16>
 // CHECK:           %[[VAL_11:.*]] = builtin.unrealized_conversion_cast %[[VAL_10]] : memref<?x?xf16> to !tt.tensordesc<128x64xf16>
-// CHECK:           tt.spyre_tensor_layout %[[VAL_11]] {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 2, 0, 3>, phys_src = array<i64: 1, 0, 1>} : <128x64xf16>
+// CHECK:           tt.spyre_tensor_layout %[[VAL_11]] {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <128x64xf16>
 // CHECK:           tt.return
 // CHECK:         }
 tt.func @layout_survives(%ptr: !tt.ptr<f16>, %M: i32, %N: i32, %sr: i64, %sc: i64) {
   %desc = tt.make_tensor_descriptor %ptr, [%M, %N], [%sr, %sc]
       : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
-  tt.spyre_tensor_layout %desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 2, 0, 3>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<128x64xf16>
+  tt.spyre_tensor_layout %desc {phys_src = array<i64: 1, 0, 1>, phys_op = array<i64: 1, 0, 2>, phys_arg = array<i64: 64, 0, 64>} : !tt.tensordesc<128x64xf16>
   %c0 = arith.constant 0 : i32
   %d = tt.descriptor_load %desc[%c0, %c0] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
   tt.return

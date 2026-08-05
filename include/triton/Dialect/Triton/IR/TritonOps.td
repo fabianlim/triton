@@ -1093,6 +1093,7 @@ def TT_SpyreTensorLayoutOp : TT_Op<"spyre_tensor_layout", []> {
   );
 
   let assemblyFormat = "$desc attr-dict `:` type($desc)";
+  let hasVerifier = 1;
 }
 // --- END --- added for spyre
 

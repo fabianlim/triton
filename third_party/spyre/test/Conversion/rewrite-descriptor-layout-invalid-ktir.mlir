@@ -60,7 +60,9 @@ tt.func @no_construct_memory_view(%memview: memref<64x64xf32>) {
 // -----
 
 // Test 4: phys_src out of range (memview path).
-// The marker's phys_src[0] references logical dim 2, but the memview is only rank 2.
+// The marker's phys_src[0] references logical dim 2, which is in range for the
+// rank-3 descriptor the op verifier sees but out of range for the rank-2
+// memview the pass reads sizes/strides from.
 #map4 = affine_map<(d0, d1) -> (d0, d1)>
 #set4 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 module {
@@ -69,9 +71,9 @@ tt.func @phys_src_out_of_range(%arg0: !tt.ptr<f32>) {
   %c0b_i32 = arith.constant 0 : i32
   %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
   %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set4, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<64x64xf32>
-  %2 = builtin.unrealized_conversion_cast %1 : memref<64x64xf32> to !tt.tensordesc<64x64xf32>
+  %2 = builtin.unrealized_conversion_cast %1 : memref<64x64xf32> to !tt.tensordesc<1x64x64xf32>
   // expected-error @below {{spyre_tensor_layout: phys_src out of range}}
-  tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 2, 0, 1>} : <64x64xf32>
+  tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 2, 0, 1>} : <1x64x64xf32>
   %3 = arith.index_cast %c0_i32 : i32 to index
   %4 = arith.index_cast %c0b_i32 : i32 to index
   %5 = ktdp.construct_access_tile %1[%3, %4] {access_tile_order = #map4, access_tile_set = #set4} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
