@@ -27,6 +27,12 @@ class SpyreOptions:
         # Normalize list → tuple for hashability / dataclass equality.
         if isinstance(self.grid, list):
             self.grid = tuple(self.grid)
+        # RewriteDescriptorLayout treats any value other than "device" as
+        # "host", so an unrecognized string would silently pick a layout
+        # rather than fail.
+        if self.data_layout not in ("device", "host"):
+            raise ValueError(
+                f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
 
     def hash(self):
         key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))

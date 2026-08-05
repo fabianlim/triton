@@ -926,7 +926,16 @@ struct RewriteDescriptorLayoutPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Resolve the data-layout option.
+    // Resolve the data-layout option. Reject anything unrecognized rather
+    // than silently falling through to the "host" branch below — the pass is
+    // also invocable directly (spyre-triton-opt), bypassing the frontend's
+    // own validation.
+    if (dataLayout != "device" && dataLayout != "host") {
+      module.emitError("rewrite-descriptor-layout: data-layout must be "
+                       "'device' or 'host', got '")
+          << dataLayout << "'";
+      return signalPassFailure();
+    }
     hwDataLayout = (dataLayout == "device");
 
     // Collect markers up front; mutating while walking invalidates the cursor.
