@@ -11,6 +11,7 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
+    "rewrite_descriptor_layout",
     "convert_elementwise_to_linalg",
     "lower_inter_tile",
     "convert_functions",
@@ -23,6 +24,8 @@ _CORE_PIPELINE_PASSES = (
 _PASS_OPTIONS = {
     "distribute_work": ("grid",),
     "materialize_base_addresses": ("base_addresses",),
+    "rewrite_descriptor_layout": ("data_layout",),
+    "convert_ttir_to_ktdp": ("data_layout",),
 }
 
 
@@ -54,6 +57,9 @@ class SpyreOptions:
     #   required_fixes = {"fold_addptr_into_base": "lower_scalar_load"}
     required_fixes: Mapping[str, str] = field(default_factory=dict)
     lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
+    # HBM data layout: "device" (stickified row-major physical strides) or
+    # "host" (strides derived from logical strides via the coordinate map).
+    data_layout: str = "device"
     # Required by Triton code generator
     sanitize_overflow: bool = False
     debug: bool = False
@@ -65,6 +71,12 @@ class SpyreOptions:
             self.grid = tuple(self.grid)
         if isinstance(self.base_addresses, list):
             self.base_addresses = tuple(self.base_addresses)
+        # RewriteDescriptorLayout treats any value other than "device" as
+        # "host", so an unrecognized string would silently pick a layout
+        # rather than fail.
+        if self.data_layout not in ("device", "host"):
+            raise ValueError(
+                f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
 
     def hash(self):
         key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))

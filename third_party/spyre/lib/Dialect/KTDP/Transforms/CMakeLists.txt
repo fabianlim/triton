@@ -4,6 +4,9 @@ add_triton_library(KTDPTransforms
   LowerScalarLoad.cpp
   LowerComputeOps.cpp
   LowerInterTile.cpp
+  RewriteDescriptorLayout.cpp
+  RewriteDescriptorLayout/Classify.cpp
+  RewriteDescriptorLayout/ContractionSynthesis.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp

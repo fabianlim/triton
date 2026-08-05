@@ -2107,4 +2107,64 @@ class TritonSemantic(Generic[TensorTy]):
             is_i = self.equal(pid, self.scalar_constant(i, tl.int32))
             coord = self.where(is_i, self.scalar_constant(c, tl.int32), coord)
         return coord
+
+    def _parse_coord_entry(self, i, entry):
+        """Parse one layout entry into (src_dim, op_code, arg).
+
+        Accepted forms:
+          src_dim                        -> identity on logical dim
+          (src_dim, "floordiv", divisor) -> logical_dim // divisor
+          (src_dim, "mod", modulus)      -> logical_dim %  modulus
+          (src_dim, "identity")          -> same as bare int
+        """
+
+        # Coordinate-op encoding: maps keyword -> i64 stored on the MLIR op.
+        _COORD_OPS = {"identity": 0, "floordiv": 1, "mod": 2}
+
+        if not isinstance(entry, (tuple, list)):
+            return int(tl._unwrap_if_constexpr(entry)), 0, 0
+
+        entry = [tl._unwrap_if_constexpr(e) for e in entry]
+        if len(entry) not in (2, 3):
+            raise ValueError(
+                f"spyre_tensor_layout: entry {i} must be int or "
+                f"(src, op[, arg]), got {tuple(entry)}")
+
+        src_dim = int(entry[0])
+        op_key = entry[1]
+        if isinstance(op_key, str):
+            if op_key not in _COORD_OPS:
+                raise ValueError(
+                    f"spyre_tensor_layout: entry {i} op must be one of "
+                    f"{sorted(_COORD_OPS)}, got {op_key!r}")
+            op_code = _COORD_OPS[op_key]
+        else:
+            op_code = int(op_key)
+            if op_code not in (0, 1, 2):
+                raise ValueError(
+                    f"spyre_tensor_layout: entry {i} op must be "
+                    f"{sorted(_COORD_OPS)} or 0/1/2, got {op_key!r}")
+
+        arg_val = int(entry[2]) if len(entry) == 3 else 0
+        return src_dim, op_code, arg_val
+
+    def spyre_tensor_layout(self, desc, layout):
+        """Emit tt.spyre_tensor_layout — annotates a descriptor with its
+        physical device layout as parallel arrays (phys_src, phys_op, phys_arg),
+        one entry per physical dimension."""
+        target = driver.active.get_current_target()
+        if target.backend != "spyre":
+            raise ValueError(
+                "tl.spyre_tensor_layout is only supported on the 'spyre' "
+                f"backend, not '{target.backend}'")
+
+        src, op, arg = [], [], []
+        for i, entry in enumerate(layout):
+            s, o, a = self._parse_coord_entry(i, entry)
+            src.append(s)
+            op.append(o)
+            arg.append(a)
+
+        self.builder.create_spyre_tensor_layout(desc.handle, src, op, arg)
+        return tl.tensor(None, tl.void)
     # --- END --- added for spyre

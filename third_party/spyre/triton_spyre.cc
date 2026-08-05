@@ -37,6 +37,10 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   //              ↓
   //       LowerComputeOps
   //              ↓
+  //   RewriteDescriptorLayout      [runs after LowerComputeOps so tt.dot is
+  //              │                  already linalg.matmul before its operands
+  //              │                  are physicalized]
+  //              ↓
   //   ConvertElementwiseToLinalg   (upstream MLIR pass)
   //              ↓
   //        LowerInterTile
@@ -53,14 +57,19 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   // LowerInterTile runs after LowerComputeOps (partials are linalg/tensor)
   // and before ConvertFunctions (reads work-slice function attributes that
   // ConvertFunctions would rewrite).
-  m.def("add_convert_ttir_to_ktdp", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
-    pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
-    pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
-    pm.addPass(mlir::createConvertElementwiseToLinalgPass());
-    pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
-    pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
-  });
+  m.def(
+      "add_convert_ttir_to_ktdp",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createLowerDescriptorMemoryPass());
+        pm.addPass(mlir::triton::ktdp::createLowerScalarLoadPass());
+        pm.addPass(mlir::triton::ktdp::createLowerComputeOpsPass());
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+        pm.addPass(mlir::createConvertElementwiseToLinalgPass());
+        pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
+        pm.addPass(mlir::triton::ktdp::createConvertFunctionsPass());
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
   // Individual pass bindings. add_convert_ttir_to_ktdp above is the default
   // order, but a caller that needs a different one — a subset of the passes,
   // a repeat, or an extra pass slotted between two of them — builds the
@@ -72,6 +81,13 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_convert_elementwise_to_linalg", [](mlir::PassManager &pm) {
     pm.addPass(mlir::createConvertElementwiseToLinalgPass());
   });
+  m.def(
+      "add_rewrite_descriptor_layout",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayout(
+            mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
   });

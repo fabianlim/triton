@@ -293,7 +293,8 @@ struct LowerScalarLoadPass
     // `UnrealizedConversionCastOp` is used by `getBasePtrAsIndex` to convert
     // a `!tt.ptr` base pointer to `index`; the cast survives this pass and
     // is consumed by the later `ConvertFunctions` pass.
-    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp>();
+    target.addLegalOp<ModuleOp, UnrealizedConversionCastOp,
+                      triton::SpyreTensorLayoutOp>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<ConvertScalarLoad>(ctx);
