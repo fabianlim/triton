@@ -60,3 +60,34 @@ tt.func @gather_stick_split_indirect_dim(%data_ptr: !tt.ptr<f32>, %idx_ptr: !tt.
   tt.return
 }
 }
+
+// -----
+
+// Test 3: two annotated operands whose parallel floor dims land on *different*
+// output axes. A[B,M,K] is split on M and K, B[B,K,N] on K and N, so A wants a
+// parallel scatter loop on the accumulator's M axis and B wants one on N. That
+// needs two independent nested scatter loops (a genuine 2-D output tiling);
+// emitSourceStage carries a single (factor, axis) pair, so it rejects instead of
+// silently scattering only one axis.
+module {
+tt.func @parallel_scatter_axis_disagreement(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>) {
+  %z = arith.constant 0 : i32
+  %b2 = arith.constant 2 : i32
+  %m = arith.constant 128 : i32
+  %s1 = arith.constant 1 : i64
+  %s128 = arith.constant 128 : i64
+  %s16384 = arith.constant 16384 : i64
+  %ad = tt.make_tensor_descriptor %a, [%b2, %m, %m], [%s16384, %s128, %s1] : !tt.ptr<f16>, !tt.tensordesc<2x128x128xf16>
+  tt.spyre_tensor_layout %ad {phys_src = array<i64: 1, 2, 0, 1, 2>, phys_op = array<i64: 1, 1, 0, 2, 2>, phys_arg = array<i64: 64, 64, 0, 64, 64>} : !tt.tensordesc<2x128x128xf16>
+  %av = tt.descriptor_load %ad[%z, %z, %z] : !tt.tensordesc<2x128x128xf16> -> tensor<2x128x128xf16>
+  %bd = tt.make_tensor_descriptor %b, [%b2, %m, %m], [%s16384, %s128, %s1] : !tt.ptr<f16>, !tt.tensordesc<2x128x128xf16>
+  tt.spyre_tensor_layout %bd {phys_src = array<i64: 1, 2, 0, 1, 2>, phys_op = array<i64: 1, 1, 0, 2, 2>, phys_arg = array<i64: 64, 64, 0, 64, 64>} : !tt.tensordesc<2x128x128xf16>
+  %bv = tt.descriptor_load %bd[%z, %z, %z] : !tt.tensordesc<2x128x128xf16> -> tensor<2x128x128xf16>
+  %cd = tt.make_tensor_descriptor %c, [%b2, %m, %m], [%s16384, %s128, %s1] : !tt.ptr<f16>, !tt.tensordesc<2x128x128xf16>
+  %cv = tt.descriptor_load %cd[%z, %z, %z] : !tt.tensordesc<2x128x128xf16> -> tensor<2x128x128xf16>
+  // expected-error @below {{spyre_tensor_layout: operands disagree on the parallel multi-stick scatter}}
+  %d = tt.dot %av, %bv, %cv : tensor<2x128x128xf16> * tensor<2x128x128xf16> -> tensor<2x128x128xf16>
+  tt.descriptor_store %cd[%z, %z, %z], %d : !tt.tensordesc<2x128x128xf16>, tensor<2x128x128xf16>
+  tt.return
+}
+}

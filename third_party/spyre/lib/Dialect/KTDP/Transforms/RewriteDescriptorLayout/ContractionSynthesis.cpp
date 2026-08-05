@@ -132,6 +132,30 @@ Value emitStickLoop(OpBuilder &b, Location loc, int64_t tripCount,
   return forOp.getResult(0);
 }
 
+// Outer parallel-scatter loop: iterates parallelIV = 0..tripCount, filling
+// disjoint slabs of `container` via tensor.insert_slice returned by `body`.
+// Inlines for tripCount <= 1 (passes a const-0 IV and returns the body result
+// directly), so the extent-1 case emits exactly what the plain reduction path
+// would.
+Value emitParallelScatterLoop(
+    OpBuilder &b, Location loc, int64_t tripCount, Value container,
+    llvm::function_ref<Value(OpBuilder &, Value, Value)> body) {
+  if (tripCount <= 1) {
+    Value s0 = arith::ConstantIndexOp::create(b, loc, 0);
+    return body(b, s0, container);
+  }
+  Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
+  Value c1 = arith::ConstantIndexOp::create(b, loc, 1);
+  Value ub = arith::ConstantIndexOp::create(b, loc, tripCount);
+  auto forOp = scf::ForOp::create(b, loc, c0, ub, c1, ValueRange{container});
+  OpBuilder ib = OpBuilder::atBlockBegin(forOp.getBody());
+  Value updated =
+      body(ib, forOp.getInductionVar(), forOp.getRegionIterArgs()[0]);
+  scf::YieldOp::create(ib, loc, ValueRange{updated});
+  b.setInsertionPointAfter(forOp);
+  return forOp.getResult(0);
+}
+
 // Extract an op-tile stick slice from `plan`.
 Value extractOpSlice(OpBuilder &b, Location loc,
                      const OperandPlan &plan,
@@ -252,26 +276,96 @@ Value emitSourceStage(
   LLVM_DEBUG(llvm::dbgs() << "  source stage: stickFactor=" << stickFactor
                           << ", " << plans.size() << " operand plans\n");
 
-  // Reduction-only path (no parallel scatter for Stage 4).
-  Value stickIV;
-  Value result = emitStickLoop(b, loc, stickFactor, cVal,
-      [&](OpBuilder &bb, Value s, Value acc) {
-    stickIV = s;
-    OpBuilder saved = b;
-    b = bb;
-    llvm::SmallVector<Value> slices;
-    for (unsigned i = 0; i < plans.size(); ++i) {
-      Value slicePhys = extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV);
-      slices.push_back(!plans[i].transposePerm.empty()
-                           ? doTranspose(slicePhys, plans[i].transposePerm)
-                           : slicePhys);
+  // Determine the parallel-scatter trip count (parallelFactor): a *parallel*
+  // (role >= 0) floor dim spanning more than one stick. Such a dim cannot be
+  // folded into the op tile — `accDims` holds the per-stick extent because
+  // linalg.matmul requires its init/result extents to match the A/B slice
+  // extents — so the full parallel extent is assembled by tiling the
+  // accumulator across an outer loop.
+  //
+  // `parallelAccAxis` is the accumulator axis the parallel floor dim maps to
+  // (`dimRoles[p]`, which indexes `accDims` directly); `parallelStickSize` is
+  // that plan's lane extent, i.e. the width of one scattered slab.
+  int64_t parallelFactor = 1;
+  int64_t parallelAccAxis = -1;
+  int64_t parallelStickSize = 1;
+  for (auto &plan : plans) {
+    for (int p : plan.dims.floorDims) {
+      int64_t role = plan.dimRoles[p];
+      if (role < 0 || plan.coords.physBlock[p] <= 1)
+        continue;
+      int64_t f = plan.coords.physBlock[p];
+      if (parallelFactor != 1 &&
+          (parallelFactor != f || parallelAccAxis != role))
+        return Value{}; // caller reports; see dispatchSource
+      parallelFactor = f;
+      parallelAccAxis = role;
+      parallelStickSize = plan.coords.physBlock[plan.dims.lane];
     }
-    Value r = emitOp(b, loc, slices, acc, accTy);
-    b = saved;
-    return r;
-  });
+  }
 
-  return result;
+  LLVM_DEBUG(llvm::dbgs() << "  source stage: parallelFactor=" << parallelFactor
+                          << " accAxis=" << parallelAccAxis
+                          << " stickSize=" << parallelStickSize << "\n");
+
+  // Emit the reduction stick loop for one parallel slab. `acc` is the
+  // per-slab accumulator (shape `accTy`); `pIV` selects the parallel stick.
+  Value stickIV;
+  auto emitReductionLoop = [&](OpBuilder &bb, Value acc, Value pIV) -> Value {
+    return emitStickLoop(bb, loc, stickFactor, acc,
+        [&](OpBuilder &bbb, Value s, Value innerAcc) {
+      stickIV = s;
+      OpBuilder saved = b;
+      b = bbb;
+      llvm::SmallVector<Value> slices;
+      for (unsigned i = 0; i < plans.size(); ++i) {
+        Value slicePhys =
+            extractOpSlice(b, loc, plans[i], sliceTys[i], stickIV, pIV);
+        slices.push_back(!plans[i].transposePerm.empty()
+                             ? doTranspose(slicePhys, plans[i].transposePerm)
+                             : slicePhys);
+      }
+      Value r = emitOp(b, loc, slices, innerAcc, accTy);
+      b = saved;
+      return r;
+    });
+  };
+
+  if (parallelFactor <= 1) {
+    // Reduction-only path: no parallel scatter, accumulate straight into cVal.
+    // extractOpSlice gets a null parallelIV, so every StickIndex dim uses the
+    // reduction IV exactly as before.
+    return emitReductionLoop(b, cVal, /*pIV=*/Value{});
+  }
+
+  // Parallel-scatter path. emitSourceStage must always return a canonical
+  // LOGICAL value (the sink stage physicalizes it), so scatter into `cVal`
+  // itself: it already has the full logical output shape and carries the
+  // incoming accumulator. Each iteration extracts the pIV'th slab (shape
+  // accTy) at offset pIV*stickSize on `parallelAccAxis`, runs the reduction
+  // loop over it, and inserts the result back.
+  llvm::SmallVector<OpFoldResult> slabSizes;
+  for (int64_t d : accDims)
+    slabSizes.push_back(b.getIndexAttr(d));
+  llvm::SmallVector<OpFoldResult> slabStrides(accDims.size(),
+                                              b.getIndexAttr(1));
+
+  return emitParallelScatterLoop(b, loc, parallelFactor, cVal,
+      [&](OpBuilder &bb, Value pIV, Value container) -> Value {
+        Value stickSizeV =
+            arith::ConstantIndexOp::create(bb, loc, parallelStickSize);
+        Value off = arith::MulIOp::create(bb, loc, pIV, stickSizeV);
+        llvm::SmallVector<OpFoldResult> slabOffsets(accDims.size(),
+                                                    bb.getIndexAttr(0));
+        slabOffsets[parallelAccAxis] = off;
+
+        Value slab = tensor::ExtractSliceOp::create(
+            bb, loc, accTy, container, slabOffsets, slabSizes, slabStrides);
+        Value computed = emitReductionLoop(bb, slab, pIV);
+        return tensor::InsertSliceOp::create(bb, loc, computed, container,
+                                             slabOffsets, slabSizes,
+                                             slabStrides);
+      });
 }
 
 // Helper: emit an error and set the fatal error flag.
@@ -342,7 +436,7 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
 
   resolveAndReconcile(plans, spec);
 
-  // R6 check: scratchpad on multi-stick reduction axis.
+  // Reject a scratchpad operand paired with a multi-stick reduction axis.
   for (unsigned i = 0; i < nOps; ++i) {
     if (plans[i].coords.src.empty())
       continue;
@@ -359,12 +453,18 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
             "axis but not all are annotated — any two operands sharing a "
             "stickified contraction axis must both carry a "
             "tt.spyre_tensor_layout marker with the same stick size on that "
-            "axis (R6)");
+            "axis");
     }
   }
 
   OpBuilder b(op.getOperation());
   Value result = emitSourceStage(op, b, spec.emitOp, plans);
+  if (!result)
+    return emitFatalError(op, ctx,
+        "spyre_tensor_layout: operands disagree on the parallel multi-stick "
+        "scatter — two annotated operands carry parallel floor dims with "
+        "different trip counts or on different output axes, which would need "
+        "two independent scatter loops (not supported)");
   rewriter.replaceOp(op, result);
   return success();
 }

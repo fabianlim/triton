@@ -253,7 +253,7 @@ tt.func @indirect_unexpected_user(%arg0: !tt.ptr<f32>, %idx_ptr: !tt.ptr<i32>) {
 
 // -----
 
-// Test 12: operands share a stickified contraction axis without annotation (R6).
+// Test 12: operands share a stickified contraction axis without annotation.
 // A has a multi-stick layout on K (K=128, stick=64 → 2 sticks) while B has no
 // layout marker, violating the requirement that shared stickified contraction
 // axes must be annotated on all operands.
