@@ -51,34 +51,26 @@ inline bool applyCoordMap(llvm::ArrayRef<int64_t> logSizes,
   return true;
 }
 
-/// Compute the permutation that reorders opTileDims from physical to canonical
-/// axis order. Returns empty vector if already identity (no transpose needed).
+/// Compute the permutation that reorders opTileDims from physical order into
+/// the target op's axis order. `targetOrder[t]` names the role (or -1 for the
+/// contracted/reduced slot) that must land at target axis position `t`, so the
+/// index into `targetOrder` *is* the destination position.
+/// Returns empty vector if already identity (no transpose needed).
 inline llvm::SmallVector<int64_t> computeTransposePerm(
     llvm::ArrayRef<int> opTileDims,
     llvm::ArrayRef<int64_t> dimRoles,
-    llvm::ArrayRef<int64_t> canonicalAxes) {
+    llvm::ArrayRef<int64_t> targetOrder) {
   unsigned nTile = opTileDims.size();
   llvm::SmallVector<int64_t> perm(nTile, -1);
   llvm::SmallVector<bool> used(nTile, false);
 
-  // First pass: match parallel dims (role >= 0) — unique role values.
-  for (unsigned c = 0; c < nTile; ++c) {
-    int64_t canonRole = canonicalAxes[c];
-    if (canonRole == -1) continue;
+  // Repeated roles cannot occur (roles are unique); -1 slots are matched
+  // left-to-right against the physical reduction dims via `used`.
+  for (unsigned t = 0; t < targetOrder.size(); ++t) {
+    int64_t wantRole = targetOrder[t];
     for (unsigned j = 0; j < nTile; ++j) {
-      if (!used[j] && dimRoles[opTileDims[j]] == canonRole) {
-        perm[j] = (int64_t)c;
-        used[j] = true;
-        break;
-      }
-    }
-  }
-  // Second pass: match reduction dims (role == -1) left-to-right.
-  for (unsigned c = 0; c < nTile; ++c) {
-    if (canonicalAxes[c] != -1) continue;
-    for (unsigned j = 0; j < nTile; ++j) {
-      if (!used[j] && dimRoles[opTileDims[j]] == -1) {
-        perm[j] = (int64_t)c;
+      if (!used[j] && dimRoles[opTileDims[j]] == wantRole) {
+        perm[j] = (int64_t)t;
         used[j] = true;
         break;
       }

@@ -149,8 +149,10 @@ void resolveAndReconcile(llvm::SmallVectorImpl<OperandPlan> &plans,
     OperandPlan &plan = plans[i];
     const SourceOperandSpec &opSpec = spec.operands[i];
 
+    // `targetOrder` is a property of the *target op*, not of this operand's
+    // physical layout, so it is never reordered by an erased transpose perm.
     plan.transposePerm = computeTransposePerm(
-        plan.dims.opTileDims, plan.dimRoles, opSpec.canonicalAxes);
+        plan.dims.opTileDims, plan.dimRoles, opSpec.targetOrder);
 
     plan.opExtents.clear();
     for (int p : plan.dims.opTileDims)

@@ -426,10 +426,12 @@ LogicalResult emitSinkStage(mlir::ktdp::StoreOp st,
   unsigned logRank = dPlan.coords.logicalRank;
   llvm::SmallVector<int64_t> sinkPerm;
   {
-    llvm::SmallVector<int64_t> canonicalAxesD(logRank);
-    std::iota(canonicalAxesD.begin(), canonicalAxesD.end(), 0);
+    // The sink's target order is the logical dim order itself: logical dim d
+    // goes to position d. Dense iota, so no compaction skew here.
+    llvm::SmallVector<int64_t> targetOrderD(logRank);
+    std::iota(targetOrderD.begin(), targetOrderD.end(), 0);
     auto fwdPerm = computeTransposePerm(dPlan.dims.opTileDims, dPlan.dimRoles,
-                                        canonicalAxesD);
+                                        targetOrderD);
     if (!fwdPerm.empty()) {
       auto inv = invertPerm(fwdPerm);
       bool isIdentity = true;
@@ -562,8 +564,10 @@ struct RewriteMatmulPattern : OpRewritePattern<linalg::MatmulOp> {
                                 PatternRewriter &rewriter) const override {
     return rewriteMatmulLike<linalg::MatmulOp>(
         mm, rewriter, ctx, /*logicalRank=*/2,
-        {SourceOperandSpec{{0, -1}},   // A=(m,k)
-         SourceOperandSpec{{-1, 1}}},  // B=(k,n)
+        // canonicalAxes and targetOrder coincide: K sits at its operand
+        // position in the emitted linalg.matmul (trailing in A, leading in B).
+        {SourceOperandSpec{{0, -1}, {0, -1}},   // A=(m,k)
+         SourceOperandSpec{{-1, 1}, {-1, 1}}},  // B=(k,n)
         [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
            RankedTensorType accTy) -> Value {
           return linalg::MatmulOp::create(b, loc, accTy,
@@ -585,8 +589,8 @@ struct RewriteBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
                                 PatternRewriter &rewriter) const override {
     return rewriteMatmulLike<linalg::BatchMatmulOp>(
         bmm, rewriter, ctx, /*logicalRank=*/3,
-        {SourceOperandSpec{{0, 1, -1}},   // A=(b,m,k)
-         SourceOperandSpec{{0, -1, 2}}},  // B=(b,k,n)
+        {SourceOperandSpec{{0, 1, -1}, {0, 1, -1}},   // A=(b,m,k)
+         SourceOperandSpec{{0, -1, 2}, {0, -1, 2}}},  // B=(b,k,n)
         [](OpBuilder &b, Location loc, llvm::ArrayRef<Value> slices, Value acc,
            RankedTensorType accTy) -> Value {
           return linalg::BatchMatmulOp::create(b, loc, accTy,
@@ -642,6 +646,15 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
       if (!llvm::is_contained(rd.getDimensions(), (int64_t)d))
         canonicalAxes[d] = outAxis++;
 
+    // emitReduceOp always reduces the trailing axes (dims = [outputRank,
+    // rank)), so the surviving roles must come first, in order, and the
+    // reduced slots last — regardless of where the reduced axis sits
+    // logically.
+    llvm::SmallVector<int64_t> targetOrder;
+    for (unsigned r = 0; r < outAxis; ++r)
+      targetOrder.push_back((int64_t)r);
+    targetOrder.append(logicalRank - outAxis, -1);
+
     Block &combinerBlock = rd.getOperation()->getRegion(0).front();
     llvm::SmallVector<Operation *> combinerOps;
     for (Operation &op : combinerBlock.without_terminator())
@@ -679,7 +692,7 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
           }).getResult(0);
     };
     SourceOpSpec spec;
-    spec.operands = {SourceOperandSpec{canonicalAxes}};
+    spec.operands = {SourceOperandSpec{canonicalAxes, targetOrder}};
     spec.logicalRank = logicalRank;
     spec.emitOp = emitReduceOp;
     return dispatchSource(rd, spec, ctx, rewriter);
