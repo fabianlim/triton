@@ -737,6 +737,22 @@ class JITFunction(JITCallable, KernelInterface[T]):
         # the type and the second parameter is the 'specialization' value.
         bound_args, specialization, options = binder(*args, **kwargs)
 
+        # --- START --- added for spyre
+        # Some backends compile against the grid and the argument addresses
+        # instead of receiving them at launch (see
+        # BaseBackend.compile_time_launch_options; a no-op returning {} for the
+        # GPU backends). Both are only available here: `grid` is consumed by
+        # this method's own keyword-only parameter and so never reaches the
+        # `**options` the binder collects, and the addresses come off
+        # `specialization`, which the binder just produced. Feeding both dicts
+        # keeps the in-process cache key (which hashes `options`) and the
+        # backend.parse_options(kwargs) call in _pack_args in agreement.
+        extra_options = backend.compile_time_launch_options(grid, specialization)
+        if extra_options:
+            options.update(extra_options)
+            kwargs.update(extra_options)
+        # --- END --- added for spyre
+
         # add a cache field to the kernel specializations for kernel specific
         # pass pipelines
         if knobs.runtime.add_stages_inspection_hook is not None:

@@ -71,6 +71,24 @@ class BaseBackend(metaclass=ABCMeta):
         """
         raise NotImplementedError
 
+    # --- START --- added for spyre
+    def compile_time_launch_options(self, grid, specialization) -> Dict:
+        """Extra `parse_options` inputs that are only knowable at launch time.
+
+        Most backends have none, and return `{}`: the launch grid and the
+        argument addresses are runtime parameters that never reach the compiler.
+        On Spyre both are baked into the compiled artifact, so this gives the
+        backend one chance to contribute them before the cache key is computed.
+
+        `grid` is whatever `kernel[grid]` carried (`None` for a warmup);
+        `specialization` is the per-argument `(type, specialization)` list
+        `create_function_from_signature` built. Called from `JITFunction.run`;
+        the returned keys must be fields of the object `parse_options`
+        produces, or `_pack_args` will reject them.
+        """
+        return {}
+
+    # --- END --- added for spyre
     @staticmethod
     def parse_attr(desc):
         assert isinstance(desc, str)
