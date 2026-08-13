@@ -94,6 +94,14 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
   m.def("add_unalias_linalg_outs", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createUnaliasLinalgOutsPass());
   });
+  // Also a fix pass, and also anchored on the pass that creates what it removes:
+  // lower_compute_ops is what gives every tt.reduce a linalg.fill init. The
+  // scheduler's allowlist has no linalg.fill, so without this the KTIR is
+  // rejected at pass 00; see the pass description for why the gate is zero
+  // rather than the combiner's neutral element.
+  m.def("add_drop_reduction_init_fill", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::ktdp::createDropReductionInitFillPass());
+  });
   m.def("add_lower_inter_tile", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::ktdp::createLowerInterTilePass());
   });
