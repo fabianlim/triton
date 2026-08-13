@@ -1,9 +1,97 @@
 import hashlib
+import io
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
 
+from triton import knobs
+from triton._utils import BITWIDTH_DICT
 from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Tuple
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple
 from types import ModuleType
+
+# ---------------------------------------------------------------------------
+# Fixed HBM address policy (issue #100)
+#
+# Pointer argument i is based at i * _SLOT_BYTES. This is the same assignment
+# torch-spyre's Inductor path makes (SEGMENT_OFFSETS), so the two producers of
+# a Spyre binary agree by construction rather than by coincidence. Slot 7 holds
+# the program itself, which is why only 7 pointer arguments fit.
+# ---------------------------------------------------------------------------
+_SLOT_BYTES = 16 * 1024 ** 3
+_MAX_POINTER_ARGS = 7
+
+
+def _elem_bytes(pointee: str) -> int:
+    """Bytes per element for a Triton pointee spelling ("fp16", "i32", ...).
+
+    Derived from ``triton._utils.BITWIDTH_DICT`` so there is one authority for
+    element widths. Unknown or sub-byte types raise rather than being guessed:
+    a base address wrong by a factor of the element width reads unrelated HBM
+    and returns plausible garbage with no diagnostic.
+    """
+    bits = BITWIDTH_DICT.get(pointee)
+    if not bits or bits % 8:
+        raise ValueError(
+            f"pointer element type {pointee!r} has no usable byte width "
+            f"(BITWIDTH_DICT gives {bits!r}); Spyre base addresses are element "
+            "indices, so the width must be a whole number of bytes"
+        )
+    return bits // 8
+
+
+def resolve_dbo_opt(required: bool = True) -> Optional[str]:
+    """Absolute path to the ``dbo-opt`` named by ``knobs.spyre.dbo_opt``.
+
+    A value containing a path separator is taken literally; a bare name is
+    looked up on ``PATH``. Returns ``None`` instead of raising when
+    ``required`` is False, which is what :meth:`SpyreBackend.hash` wants: a
+    missing tool must still produce a cache key (and a distinct one), with the
+    actionable error raised later by the stage that actually needs the tool.
+    """
+    tool = knobs.spyre.dbo_opt
+    path = tool if os.sep in tool else shutil.which(tool)
+    if path is None or not os.path.isfile(path):
+        if not required:
+            return None
+        raise RuntimeError(
+            f"dbo-opt not found: {tool!r}. Set TRITON_SPYRE_DBO_OPT (or "
+            "knobs.spyre.dbo_opt) to the dbo-opt binary that should compile "
+            "KTIR to SpyreCode."
+        )
+    return os.path.realpath(path)
+
+
+def base_addresses_for(signature_types) -> Tuple[int, ...]:
+    """Fixed base addresses, in ELEMENTS, for the pointer entries of a signature.
+
+    ``signature_types`` is an iterable of Triton type spellings in argument
+    order; entries starting with ``*`` are the pointer arguments and everything
+    else (runtime scalars, ``constexpr``) is skipped. The i-th pointer gets
+    ``i * _SLOT_BYTES`` — converted to an element index because that is the unit
+    ``ktdp.construct_memory_view``'s ``$offset`` carries (see
+    MaterializeBaseAddresses.cpp).
+
+    Raises when the kernel has more than :data:`_MAX_POINTER_ARGS` pointers, or
+    when a pointee type has no usable element width.
+    """
+    ptr_types = [ty for ty in signature_types
+                 if isinstance(ty, str) and ty.startswith("*")]
+    if len(ptr_types) > _MAX_POINTER_ARGS:
+        raise ValueError(
+            f"Spyre supports at most {_MAX_POINTER_ARGS} pointer arguments "
+            f"(slot {_MAX_POINTER_ARGS} holds the program itself); this kernel "
+            f"has {len(ptr_types)}: {ptr_types}"
+        )
+    # "*k" marks a const pointer and "*" a plain one; neither changes the
+    # element width (see triton._utils.canonicalize_ptr_dtype).
+    pointees = [ty[2:] if ty.startswith("*k") else ty[1:] for ty in ptr_types]
+    return tuple(i * _SLOT_BYTES // _elem_bytes(pointee)
+                 for i, pointee in enumerate(pointees))
 
 # The TTIR→KTIR core pass sequence, as binding names on
 # spyre.passes.ttir_to_ktdp.
@@ -74,6 +162,35 @@ class SpyreOptions:
     debug: bool = False
     allowed_dot_input_precisions: tuple = ("ieee",)
 
+    # --- Fields Triton's runtime requires but Spyre has no analogue for ---
+    #
+    # Both are fictions, chosen so the ceiling checks in
+    # CompiledKernel._init_handles become no-ops rather than false floors. The
+    # third value in the same set, n_max_threads, is reported by
+    # SpyreUtils.load_binary in driver.py:
+    #
+    #   num_warps  -- compared as `num_warps * warp_size > n_max_threads`
+    #                 (python/triton/compiler/compiler.py:480). With
+    #                 warp_size = 1 from SpyreDriver.get_current_target() and
+    #                 n_max_threads = 1 from SpyreUtils.load_binary, 1*1 > 1 is
+    #                 false. Spyre has no warps.
+    #   shared     -- compared as `shared > max_shared_mem` (:467), and
+    #                 SpyreUtils.get_device_properties reports 0, so 0 > 0 is
+    #                 false. Spyre's LX scratchpad is not Triton shared memory;
+    #                 it is sized by lx_size and allocated by the scheduler.
+    #
+    # An upstream refactor of _init_handles breaks these silently, hence the
+    # explicit note here and at each reported value.
+    num_warps: int = 1
+    shared: int = 0
+
+    # JITFunction.run injects instrumentation_mode into kwargs unconditionally
+    # (python/triton/runtime/jit.py:725) and _pack_args rejects any launch kwarg
+    # that is not a field of the parsed options (:711), so every launch fails
+    # that check unless the field exists. Spyre runs no instrumentation passes;
+    # the value is accepted and ignored.
+    instrumentation_mode: str = ""
+
     def __post_init__(self):
         # Normalize list → tuple for hashability / dataclass equality.
         if isinstance(self.grid, list):
@@ -104,18 +221,98 @@ class SpyreBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
-        self.binary_ext = "ktir"
+        # Set here, not in add_stages: CompiledKernel constructs a *fresh*
+        # backend via make_backend() (python/triton/compiler/compiler.py:418),
+        # so an attribute assigned on the compiling instance is not the one it
+        # reads. It also decides bytes-vs-text per artifact (:427) — the file
+        # whose extension matches binary_ext is read as bytes.
+        self.binary_ext = "spyrecode"
 
     def hash(self) -> str:
-        return f"spyre-{self.target.arch}"
+        """Backend identity folded into the on-disk cache key.
+
+        Includes the ``dbo-opt`` binary and the device description, because both
+        change the emitted artifact while leaving the source, the signature and
+        the options untouched. Without them, repointing or rebuilding dbo-opt
+        silently reuses a stale binary. NVIDIA closes the same hole by folding
+        ``get_ptxas_version(arch)`` into its options
+        (``third_party/nvidia/backend/compiler.py:574``).
+        """
+        return "-".join([
+            f"spyre-{self.target.arch}",
+            self._dbo_opt_identity(),
+            self._device_identity(),
+            f"dbo_debug-{int(bool(knobs.spyre.dbo_debug))}",
+        ])
+
+    @staticmethod
+    def _dbo_opt_identity() -> str:
+        """``dbo-opt`` identity: resolved path plus size and mtime.
+
+        dbo-opt has no meaningful ``--version`` (it reports the LLVM version it
+        was linked against, which is identical across rebuilds), so size+mtime
+        of the resolved path is what actually distinguishes two builds. A
+        missing tool gets its own key rather than raising — see resolve_dbo_opt.
+        """
+        path = resolve_dbo_opt(required=False)
+        if path is None:
+            return f"dbo_opt-missing-{knobs.spyre.dbo_opt}"
+        st = os.stat(path)
+        return f"dbo_opt-{path}-{st.st_size}-{st.st_mtime_ns}"
+
+    @staticmethod
+    def _device_identity() -> str:
+        """Digest of the device description, or an explicit "no file" marker.
+
+        ``knobs.spyre.device`` is optional: unset, dbo-opt falls back to its own
+        default under ``$DEEPTOOLS_PATH``. In that case there is no file to
+        digest, so we say so instead of hashing an empty string as though it
+        were a device — a real device file must never collide with "default".
+        """
+        device = knobs.spyre.device
+        if not device:
+            return "device-dbo_opt_default"
+        path = Path(device)
+        if not path.is_file():
+            # Report it rather than hash nothing; _make_spyrecode raises with a
+            # usable message when it actually needs the file.
+            return f"device-{device}-missing"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        return f"device-{device}-{digest}"
 
     def parse_options(self, options: dict) -> SpyreOptions:
         return SpyreOptions(**{k: v for k, v in options.items()
                                if k in SpyreOptions.__dataclass_fields__})
 
+    def compile_time_launch_options(self, grid, specialization) -> dict:
+        """Contribute the grid and the base addresses as *compile* inputs.
+
+        On Spyre both are baked into the artifact, so they must be part of the
+        options before the cache key is computed. Neither can be produced by
+        ``parse_options``: the grid is consumed by ``JITFunction.run``'s own
+        keyword-only parameter and never reaches ``**options``, and the
+        addresses are derived from the specialized signature, which only exists
+        once the argument binder has run. See the hook's default in
+        ``python/triton/backends/compiler.py`` and its single call site in
+        ``python/triton/runtime/jit.py``.
+        """
+        extra = {"base_addresses": base_addresses_for(ty for ty, _ in specialization)}
+        if grid is None:
+            # warmup=True: there is no grid to bake, leave the option default.
+            return extra
+        if callable(grid):
+            raise ValueError(
+                "Spyre bakes the grid into the compiled artifact, so a callable "
+                "grid cannot be used: the tile count must be known before the "
+                "kernel is compiled. Pass a concrete tuple, e.g. kernel[(32,)]."
+            )
+        extra["grid"] = tuple(grid)
+        return extra
+
     def add_stages(self, stages: dict, options: SpyreOptions, language=None) -> None:
         stages["ttir"] = lambda src, metadata: self._make_ttir(src, metadata, options)
         stages["ktir"] = lambda src, metadata: self._make_ktir(src, metadata, options)
+        stages["spyrecode"] = lambda src, metadata: self._make_spyrecode(src, metadata, options)
 
     def load_dialects(self, context) -> None:
         from triton._C.libtriton import spyre
@@ -234,3 +431,111 @@ class SpyreBackend(BaseBackend):
         metadata["name"] = mod.get_entry_func_name()
         metadata["stage"] = "ktir"
         return mod
+
+    def _make_spyrecode(self, mod, metadata, options):
+        """Lower KTIR to a loadable Spyre binary by running ``dbo-opt``.
+
+        Returns the spyreCodeDir as **ZIP bytes**. A compile stage yields one
+        artifact, but a spyreCodeDir is two files (``spyrecode.json`` +
+        ``init_binary.bin``) plus dbo-opt's ``debug/`` tree, so the archive is
+        the single artifact and ``SpyreUtils.load_binary`` unpacks it. Layout
+        inside the ZIP is flat — spyreCodeDir's own contents at the root, with
+        ``debug/`` as a subdirectory — because ``prepare_kernel`` opens
+        ``<dir>/spyrecode.json`` and the ``init_bin_file`` it names, both by
+        name and with no directory scan.
+
+        Two steps:
+
+        1. ``MaterializeBaseAddresses``, which replaces the pointer arguments
+           with ``arith.constant`` and drops them from the signature. The
+           dataflow scheduler requires a zero-argument entry function. This runs
+           here rather than in ``_make_ktir`` so the cached ``.ktir`` artifact
+           keeps the argument-passing calling convention.
+        2. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
+           codegen stages write the spyreCodeDir. ``--kEmitSpyreCode`` is a pass
+           pipeline that has to be requested explicitly; ``--export-dir`` alone
+           makes dbo-opt exit 0 having written nothing.
+
+        The scheduler additionally requires the compute to be a ``linalg`` op
+        with an unaliased ``outs``, which this stage does not arrange: it is a
+        property of the KTIR handed to it, produced by the
+        ``convert_elementwise_to_linalg`` / ``unalias_linalg_outs`` entries of
+        ``SpyreOptions.required_fixes``. Without them dbo-opt rejects the
+        ``ktdp.load`` operand, because the memref keeps a dynamic
+        ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins it.
+        """
+        from triton._C.libtriton import ir, passes, spyre
+
+        if options.base_addresses:
+            pm = ir.pass_manager(mod.context)
+            spyre.passes.ttir_to_ktdp.add_materialize_base_addresses(
+                pm, base_addresses=list(options.base_addresses))
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
+            pm.run(mod, "make_spyrecode")
+
+        dbo_opt = resolve_dbo_opt()
+        device = knobs.spyre.device
+        if device and not Path(device).is_file():
+            raise FileNotFoundError(
+                f"knobs.spyre.device / TRITON_SPYRE_DEVICE points at {device!r}, "
+                "which does not exist. Leave it unset to let dbo-opt use its "
+                "own default device under $DEEPTOOLS_PATH."
+            )
+
+        with tempfile.TemporaryDirectory(prefix="spyrecode_") as tmp:
+            tmp = Path(tmp)
+            ktir_path = tmp / "kernel.ktir"
+            ktir_path.write_text(str(mod))
+            export_dir = tmp / "export"
+            export_dir.mkdir()
+
+            argv = [dbo_opt, "--from-ktir", "--kEmitSpyreCode",
+                    f"--export-dir={export_dir}"]
+            if device:
+                argv.append(f"--device={device}")
+            argv.append(str(ktir_path))
+
+            env = dict(os.environ)
+            if knobs.spyre.dbo_debug:
+                env["DBO_DEBUG"] = "1"
+            # dbo-opt prints the optimized module on stdout; only the files it
+            # writes under --export-dir matter here.
+            result = subprocess.run(argv, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"dbo-opt failed (exit {result.returncode}):\n"
+                    f"  argv: {' '.join(argv)}\n{result.stderr}"
+                )
+
+            code_dir = export_dir / "spyreCodeDir"
+            # dbo-opt can exit 0 having written nothing, so check rather than
+            # trust the exit status.
+            missing = [name for name in ("spyrecode.json", "init_binary.bin")
+                       if not (code_dir / name).is_file()]
+            if missing:
+                raise RuntimeError(
+                    f"dbo-opt exited 0 but did not write {', '.join(missing)} "
+                    f"under {code_dir}\n  argv: {' '.join(argv)}\n{result.stderr}"
+                )
+
+            members = [(path, path.relative_to(code_dir).as_posix())
+                       for path in sorted(code_dir.rglob("*")) if path.is_file()]
+            debug_dir = export_dir / "debug"
+            members += [(path, f"debug/{path.relative_to(debug_dir).as_posix()}")
+                        for path in sorted(debug_dir.rglob("*")) if path.is_file()]
+
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                for path, name in members:
+                    # Fixed timestamp and mode: the artifact digest is the key
+                    # SpyreUtils.load_binary unpacks under, so identical inputs
+                    # must give identical bytes. Real mtimes would make every
+                    # recompile look like a new binary.
+                    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    info.external_attr = 0o644 << 16
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    archive.writestr(info, path.read_bytes())
+
+        metadata["stage"] = "spyrecode"
+        return buffer.getvalue()
