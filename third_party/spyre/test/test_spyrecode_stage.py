@@ -548,7 +548,7 @@ class TestSymbolicArgs:
 
 
 class TestSpyreOptionsFictions:
-    """The three values that exist only to make Triton's ceiling checks no-ops."""
+    """``num_warps`` and ``shared`` are inert; ``instrumentation_mode`` is not."""
 
     def test_num_warps_and_shared_defaults(self):
         options = SpyreBackend(_TARGET).parse_options({})
@@ -557,9 +557,33 @@ class TestSpyreOptionsFictions:
         assert options.num_warps == 1
         assert options.shared == 0
 
-    def test_instrumentation_mode_is_tolerated(self):
+    def test_a_non_default_num_warps_is_tolerated(self):
+        # Deliberately NOT an error. num_warps is the standard portable Triton
+        # knob -- every triton.Config in an autotune list carries one -- and
+        # nothing in the Spyre pipeline reads it, so rejecting it would break
+        # portable kernels for no correctness gain. warp_size = 1 makes it vacuous.
+        options = SpyreBackend(_TARGET).parse_options({"num_warps": 4})
+        assert options.num_warps == 4
+
+    def test_the_default_instrumentation_mode_is_tolerated(self):
         # JITFunction.run injects this into kwargs unconditionally, and
-        # _pack_args rejects launch kwargs absent from the parsed options.
+        # _pack_args rejects launch kwargs absent from the parsed options, so the
+        # field has to exist and the empty default has to pass.
         options = SpyreBackend(_TARGET).parse_options({"instrumentation_mode": ""})
         assert options.instrumentation_mode == ""
         assert "instrumentation_mode" in options.__dict__
+
+    def test_a_requested_instrumentation_mode_raises(self):
+        # Unlike num_warps, a non-empty value here means the caller believes
+        # instrumentation is running. Nothing on Spyre honours it, so accepting it
+        # is a silent wrong answer rather than a harmless no-op.
+        with pytest.raises(ValueError, match="instrumentation_mode"):
+            SpyreBackend(_TARGET).parse_options({"instrumentation_mode": "profile"})
+
+    def test_the_env_knob_is_reported_not_ignored(self, monkeypatch):
+        # The realistic route in: TRITON_INSTRUMENTATION_MODE feeds
+        # knobs.compilation.instrumentation_mode, which run() injects every launch.
+        monkeypatch.setattr(knobs.compilation, "instrumentation_mode", "profile")
+        with pytest.raises(ValueError, match="TRITON_INSTRUMENTATION_MODE"):
+            SpyreBackend(_TARGET).parse_options(
+                {"instrumentation_mode": knobs.compilation.instrumentation_mode})

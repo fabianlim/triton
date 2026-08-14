@@ -277,6 +277,18 @@ class SpyreOptions:
                 f"there is nothing for base_addresses={self.base_addresses} to be "
                 "baked into. Drop one."
             )
+        # Validated here rather than at a launch site because __post_init__ is the
+        # one funnel both entry points cross: compile_time_launch_options runs only
+        # for kernel[grid](...), not for a direct triton.compile().
+        if self.instrumentation_mode:
+            raise ValueError(
+                f"instrumentation_mode={self.instrumentation_mode!r} is not "
+                "supported: Spyre runs no instrumentation passes, so the value "
+                "would be accepted and quietly do nothing. Unset "
+                "TRITON_INSTRUMENTATION_MODE (knobs.compilation."
+                "instrumentation_mode), which JITFunction.run injects into every "
+                "launch."
+            )
 
     def hash(self):
         key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))
