@@ -17,15 +17,15 @@ from triton.backends.driver import DriverBase
 # ``utils`` and ``launcher_cls`` are NOT declared on DriverBase — it declares
 # only is_active / map_python_to_cpp_type / get_current_target /
 # get_active_torch_device / get_benchmarker / allocate_default_profile_scratch.
-# They are an undeclared convention that ``compiler.py`` reaches for by name:
+# They are an undeclared convention that ``CompiledKernel`` reaches for by name:
 #
-#   compiler.py:135  driver.active.utils.get_device_properties(dev)["max_shared_mem"]
-#   compiler.py:445  driver.active.utils.unload_module(self.module)
-#   compiler.py:464  driver.active.launcher_cls(self.src, self.metadata)
-#   compiler.py:477  driver.active.utils.load_binary(name, kernel, shared, device)
+#   driver.active.utils.get_device_properties(device)["max_shared_mem"]
+#   driver.active.utils.unload_module(self.module)
+#   driver.active.launcher_cls(self.src, self.metadata)
+#   driver.active.utils.load_binary(name, kernel, shared, device)
 #
 # plus get_current_device() / get_current_stream(device) unconditionally at the
-# top of JITFunction.run (jit.py:728). Every in-tree backend implements the same
+# top of JITFunction.run (jit.py). Every in-tree backend implements the same
 # shape (CudaUtils / CudaLauncher), so this is the local spelling of an existing
 # Triton role — but an upstream refactor moves the contract with no deprecation.
 # ---------------------------------------------------------------------------
@@ -45,10 +45,10 @@ class SpyreUtils:
         """One key, because one key is what Triton actually reads.
 
         ``CompiledKernel._init_handles`` uses ``max_shared_mem`` to bound
-        ``metadata.shared`` (``compiler.py:467``). Spyre's LX scratchpad is not
-        Triton shared memory — it is sized by ``SpyreOptions.lx_size`` and
-        allocated by the scheduler — so 0 is reported against ``shared = 0`` and
-        the check is a no-op rather than a false floor.
+        ``metadata.shared``. Spyre's LX scratchpad is not Triton shared memory —
+        it is sized by the device description and allocated by the scheduler — so
+        0 is reported against ``shared = 0`` and the check is a no-op rather than
+        a false floor.
 
         CUDA reports seven keys. The other six are read only by
         ``python/triton/testing.py``; inventing them would make that module
@@ -78,9 +78,8 @@ class SpyreUtils:
         ``CompiledKernel.hash`` is not passed in.
 
         ``n_regs`` / ``n_spills`` are meaningless here and reported as 0.
-        ``n_max_threads`` is 1, which keeps
-        ``num_warps * warp_size > n_max_threads`` (1 * 1 > 1) false
-        (``compiler.py:480``).
+        ``n_max_threads`` is 1, which keeps ``_init_handles``' check
+        ``num_warps * warp_size > n_max_threads`` (1 * 1 > 1) false.
 
         ``prepare_kernel`` is deliberately **not** called here, despite being
         once-per-kernel work. It needs an initialized Spyre runtime and SIGSEGVs
@@ -135,7 +134,7 @@ class SpyreLauncher:
     ``profile_scratch_*``, ``launch_cooperative_grid`` and ``launch_pdl`` as hard
     attributes; any of those here is an immediate AttributeError.
 
-    Of the nine positionals (``jit.py:776``) only ``function`` and ``*args``
+    Of the nine positionals (``jit.py``) only ``function`` and ``*args``
     carry information: ``stream`` is a stub, ``packed_metadata`` is ``()``
     (``SpyreBackend.pack_metadata``) and both hooks are ``None`` unless a
     profiler installed them.
@@ -162,7 +161,7 @@ class SpyreDriver(DriverBase):
 
     Sits on ``DriverBase`` rather than ``GPUDriver`` because
     ``GPUDriver.__init__`` hard-imports ``torch.cuda``
-    (``python/triton/backends/driver.py:161``).
+    (``python/triton/backends/driver.py``).
 
     Absent rather than stubbed: ``get_device_interface``,
     ``allocate_default_profile_scratch`` (inherits the raising base),
@@ -174,7 +173,7 @@ class SpyreDriver(DriverBase):
 
     def __init__(self) -> None:
         super().__init__()
-        # Mirrors CudaDriver.__init__ (nvidia/backend/driver.py:340-342): the two
+        # Mirrors CudaDriver.__init__ (nvidia/backend/driver.py): the two
         # members Triton's runtime reaches for by name are assigned here.
         self.utils = SpyreUtils()
         self.launcher_cls = SpyreLauncher
@@ -201,7 +200,7 @@ class SpyreDriver(DriverBase):
 
     def get_current_device(self) -> int:
         """Single device. Called unconditionally at the top of JITFunction.run
-        (``jit.py:728``) and used to index the per-device compile caches."""
+        (``jit.py``) and used to index the per-device compile caches."""
         return 0
 
     def get_current_stream(self, device) -> int:

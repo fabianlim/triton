@@ -9,7 +9,7 @@ sites, and ``JITFunction.run`` calls ``get_current_device()`` /
 
 No device is needed. The end-to-end test drives ``kernel[grid](...)`` with a
 duck-typed tensor — ``specialize.cc`` falls back to its tensor handler for any
-object carrying ``data_ptr()`` (``python/src/specialize.cc:562``) — so the whole
+object carrying ``data_ptr()`` (``python/src/specialize.cc``) — so the whole
 compile-and-load path runs and the launch stops *inside*
 ``SpyreLauncher.__call__``. That is the whole point of the issue: the failure
 must be ours and about the launch, not Triton's plumbing about a missing member.
