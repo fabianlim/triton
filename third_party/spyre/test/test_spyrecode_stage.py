@@ -461,6 +461,92 @@ class TestSpyrecodeStage:
             triton_compile(src, target=_TARGET, options=_compile_options())
 
 
+class TestSymbolicArgs:
+    """The argument-passing mode, as an explicit compile option.
+
+    ``symbolic_args=False`` bakes the fixed HBM base addresses in and lets
+    torch-spyre bind the buffers positionally from the tensor list;
+    ``symbolic_args=True`` would leave them symbolic for a runtime that patches
+    them through the correction table, which nothing here emits yet.
+    """
+
+    def test_defaults_to_false(self, monkeypatch):
+        monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
+        assert SpyreBackend(_TARGET).parse_options({}).symbolic_args is False
+
+    @pytest.mark.parametrize("env, expected", [
+        # Polarity follows torch-spyre's prepare_kernel.cpp, where
+        # bind_io_addresses_ = (env == nullptr || env != "1"): only the literal
+        # "1" means symbolic, and anything else binds from the tensor list.
+        ("1", True),
+        ("0", False),
+        ("", False),
+        ("true", False),
+    ])
+    def test_env_var_sets_the_default(self, monkeypatch, env, expected):
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", env)
+        options = SpyreBackend(_TARGET).parse_options({})
+        assert options.symbolic_args is expected
+
+    def test_explicit_option_wins_over_the_env(self, monkeypatch):
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
+        options = SpyreBackend(_TARGET).parse_options({"symbolic_args": False})
+        assert options.symbolic_args is False
+
+    def test_participates_in_the_cache_key(self):
+        backend = SpyreBackend(_TARGET)
+        bound = backend.parse_options({"symbolic_args": False})
+        symbolic = backend.parse_options({"symbolic_args": True})
+        # It changes the emitted artifact, so the two must not share a key.
+        assert bound.hash() != symbolic.hash()
+
+    def test_the_env_var_reaches_the_key_too(self, monkeypatch):
+        # The point of reading the env in parse_options rather than at
+        # pass-install time: a compile under one value must not be served from
+        # the cache under the other.
+        backend = SpyreBackend(_TARGET)
+        monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
+        unset = backend.parse_options({}).hash()
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
+        assert backend.parse_options({}).hash() != unset
+
+    def test_symbolic_mode_raises_rather_than_skipping(self, monkeypatch):
+        # Skipping MaterializeBaseAddresses alone would leave the entry function
+        # taking `index` pointer arguments, which the scheduler rejects deep
+        # inside dbo-opt with an operand-type error. Fail here instead, and
+        # without needing dbo-opt at all.
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
+        src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
+                        constexprs=dict(_CONSTEXPRS))
+        with pytest.raises(NotImplementedError,
+                           match="BUNDLE_SYMBOLIC_ARGS=1"):
+            triton_compile(src, target=_TARGET, options=_compile_options())
+
+    def test_mutually_exclusive_with_base_addresses(self):
+        # Honouring one and dropping the other would silently pick a mode the
+        # caller did not ask for.
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SpyreBackend(_TARGET).parse_options(
+                {"symbolic_args": True, "base_addresses": [0, 262144]})
+
+    def test_no_addresses_are_inferred_in_symbolic_mode(self, monkeypatch):
+        # Inferring them anyway would surface a pointer-width or pointer-count
+        # complaint instead of the NotImplementedError the caller is about to get.
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
+        _, metadata = _lower_to_ktir()
+        assert "base_addresses" not in metadata
+
+    def test_symbolic_mode_reports_itself_not_a_width_problem(self, monkeypatch):
+        # The ordering that guard buys: a kernel whose pointee type has no usable
+        # width must still report the mode, not the width.
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
+        backend = SpyreBackend(_TARGET)
+        options = backend.parse_options({})
+        mod, metadata = _lower_to_ktir(symbolic_args=True)
+        with pytest.raises(NotImplementedError):
+            backend._make_spyrecode(mod, metadata, options)
+
+
 class TestSpyreOptionsFictions:
     """The three values that exist only to make Triton's ceiling checks no-ops."""
 

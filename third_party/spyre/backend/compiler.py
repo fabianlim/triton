@@ -183,6 +183,24 @@ class SpyreOptions:
     # base_ptr * bytes_per_elem(dtype). No scaling is applied on the way through.
     base_addresses: Tuple[int, ...] = ()
 
+    # How the kernel's buffer addresses reach the entry function.
+    #
+    # False (the default and the only supported mode): the pointer arguments are
+    # replaced by base addresses — base_addresses if set, otherwise the derived
+    # ones — so the entry function dbo-opt sees takes no arguments, which is what
+    # the dataflow scheduler requires. torch-spyre's runtime then binds the buffers
+    # positionally from the tensor list (job_plan.cpp populates tensor_allocs
+    # from ctx.inputs_outputs).
+    #
+    # True: leave the addresses symbolic, for a runtime that patches them via
+    # the correction table. Not implemented — see _make_spyrecode, which raises.
+    #
+    # This is a *compile* option, not an environment read at pass-install time:
+    # it changes the emitted artifact, so it has to be in options.hash() and
+    # therefore in the cache key. Its default comes from the BUNDLE_SYMBOLIC_ARGS
+    # environment variable, read once in parse_options.
+    symbolic_args: bool = False
+
     # Optional correctness patches to splice into the TTIR→KTIR pipeline, as
     # {fix pass name: core pass it runs after}. Both are binding names on
     # spyre.passes.ttir_to_ktdp.
@@ -249,6 +267,16 @@ class SpyreOptions:
         if self.data_layout not in ("device", "host"):
             raise ValueError(
                 f"data_layout must be 'device' or 'host', got {self.data_layout!r}")
+        # Symbolic mode leaves the pointer arguments un-materialized, so there is
+        # nothing for supplied addresses to be baked into. Silently honouring one
+        # and dropping the other would pick a mode the caller did not ask for.
+        if self.symbolic_args and self.base_addresses:
+            raise ValueError(
+                "base_addresses and symbolic_args=True are mutually exclusive: "
+                "symbolic mode does not materialize the pointer arguments, so "
+                f"there is nothing for base_addresses={self.base_addresses} to be "
+                "baked into. Drop one."
+            )
 
     def hash(self):
         key = "_".join(f"{name}-{val}" for name, val in sorted(self.__dict__.items()))
@@ -327,8 +355,26 @@ class SpyreBackend(BaseBackend):
         return f"device-{device}-{digest}"
 
     def parse_options(self, options: dict) -> SpyreOptions:
-        return SpyreOptions(**{k: v for k, v in options.items()
-                               if k in SpyreOptions.__dataclass_fields__})
+        """Build :class:`SpyreOptions` from the launch/compile kwargs.
+
+        The one environment read on this path lives here. ``BUNDLE_SYMBOLIC_ARGS``
+        is torch-spyre's spelling of the argument-passing mode, so it is honoured,
+        but it is turned into an *option* at this single point instead of being
+        consulted where the pass is installed: only then does it reach
+        ``SpyreOptions.hash()`` and so the cache key. Read later, a compile under
+        one value could be silently served from the cache under the other.
+
+        Polarity follows torch-spyre's ``prepare_kernel.cpp``, where
+        ``bind_io_addresses_ = (env == nullptr || env != "1")``: only the literal
+        ``"1"`` selects symbolic arguments; unset or ``"0"`` means the runtime
+        binds the addresses from the tensor list, which is the supported mode. An
+        explicitly passed ``symbolic_args`` wins over the environment.
+        """
+        parsed = {k: v for k, v in options.items()
+                  if k in SpyreOptions.__dataclass_fields__}
+        parsed.setdefault("symbolic_args",
+                          os.environ.get("BUNDLE_SYMBOLIC_ARGS") == "1")
+        return SpyreOptions(**parsed)
 
     def compile_time_launch_options(self, grid, specialization) -> dict:
         """Contribute the grid as a *compile* input.
@@ -463,7 +509,12 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes, spyre
 
-        metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
+        # Only the address-binding mode has any use for these. Inferring them in
+        # symbolic mode would also mean reporting a pointer-width or pointer-count
+        # problem in place of the NotImplementedError the caller is actually about
+        # to get, which buries the real answer.
+        if not options.symbolic_args:
+            metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
 
         fixes = options.required_fixes
         ttir_to_ktdp = spyre.passes.ttir_to_ktdp
@@ -516,7 +567,10 @@ class SpyreBackend(BaseBackend):
 
         Two steps:
 
-        1. ``MaterializeBaseAddresses`` replaces the pointer arguments with
+        1. Resolve the entry function's arguments, which is where
+           ``options.symbolic_args`` is honoured — the one place in the backend
+           that branches on the mode. With it False (the default),
+           ``MaterializeBaseAddresses`` replaces the pointer arguments with
            ``arith.constant`` and drops them from the signature, because the
            dataflow scheduler requires a zero-argument entry function. It uses
            ``options.base_addresses`` if the caller set them and the addresses
@@ -538,6 +592,25 @@ class SpyreBackend(BaseBackend):
         ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins it.
         """
         from triton._C.libtriton import ir, passes, spyre
+
+        if options.symbolic_args:
+            # Deliberately a raise, not a skip. Skipping MaterializeBaseAddresses
+            # leaves the entry function taking `index` pointer arguments, which
+            # the scheduler rejects deep inside dbo-opt with an operand-type
+            # error rather than anything a caller could act on. Making the mode
+            # work needs a pass that emits the symbols plus a populated
+            # correction table, neither of which exists yet; when they land, this
+            # becomes the second install branch right here.
+            raise NotImplementedError(
+                "symbolic_args=True (BUNDLE_SYMBOLIC_ARGS=1) is not supported "
+                "by the Triton Spyre backend: nothing here emits the argument "
+                "symbols or the correction table a runtime would patch, and an "
+                "entry function whose pointer arguments survive as `index` is "
+                "rejected by the dataflow scheduler inside dbo-opt. Leave "
+                "BUNDLE_SYMBOLIC_ARGS unset (or \"0\") so the fixed HBM base "
+                "addresses are baked in and torch-spyre binds the buffers "
+                "positionally from the tensor list."
+            )
 
         # required_fixes may have installed MaterializeBaseAddresses already, at
         # the anchor the caller chose, in which case the pointer arguments are
