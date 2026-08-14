@@ -738,15 +738,15 @@ class JITFunction(JITCallable, KernelInterface[T]):
         bound_args, specialization, options = binder(*args, **kwargs)
 
         # --- START --- added for spyre
-        # Some backends compile against the grid and the argument addresses
-        # instead of receiving them at launch (see
-        # BaseBackend.compile_time_launch_options; a no-op returning {} for the
-        # GPU backends). Both are only available here: `grid` is consumed by
-        # this method's own keyword-only parameter and so never reaches the
-        # `**options` the binder collects, and the addresses come off
-        # `specialization`, which the binder just produced. Feeding both dicts
-        # keeps the in-process cache key (which hashes `options`) and the
-        # backend.parse_options(kwargs) call in _pack_args in agreement.
+        # Some backends bake the grid into the compiled artifact instead of
+        # receiving it at launch (see BaseBackend.compile_time_launch_options; a
+        # no-op returning {} for the GPU backends). This is the only point where
+        # it can be contributed: `grid` is consumed by this method's own
+        # keyword-only parameter and so never reaches the `**options` the binder
+        # collects, and compute_cache_key below hashes those raw options, well
+        # before backend.parse_options runs. Feeding both dicts keeps the
+        # in-process cache key and the backend.parse_options(kwargs) call in
+        # _pack_args in agreement.
         extra_options = backend.compile_time_launch_options(grid, specialization)
         if extra_options:
             options.update(extra_options)

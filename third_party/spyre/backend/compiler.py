@@ -1,13 +1,13 @@
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
 
 from triton import knobs
-from triton._utils import BITWIDTH_DICT
 from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,20 +25,31 @@ from types import ModuleType
 _SLOT_BYTES = 16 * 1024 ** 3
 _MAX_POINTER_ARGS = 7
 
+# Bit width of an MLIR builtin element type, read off its own spelling. Every
+# type Triton can put behind a !tt.ptr names its width immediately after the
+# leading letters: i8/i32/i64, f16/f32/f64, bf16, and the f8 family
+# (f8E4M3FN, f8E5M2, ...) whose "8" is likewise the width.
+#
+# BITWIDTH_DICT is deliberately not used here: it is keyed by *Triton* spellings
+# ("fp16", "fp8e4nv"), and what the IR hands us are MLIR spellings ("f16",
+# "f8E4M3FN"), with no reverse map in tree. Translating would need a second
+# hand-written table for the f8 variants, which is the thing this regex avoids.
+_MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
+
 
 def _elem_bytes(pointee: str) -> int:
-    """Bytes per element for a Triton pointee spelling ("fp16", "i32", ...).
+    """Bytes per element for an MLIR pointee spelling ("f16", "i32", ...).
 
-    Derived from ``triton._utils.BITWIDTH_DICT`` so there is one authority for
-    element widths. Unknown or sub-byte types raise rather than being guessed:
-    a base address wrong by a factor of the element width reads unrelated HBM
-    and returns plausible garbage with no diagnostic.
+    Unknown or sub-byte types raise rather than being guessed: a base address
+    wrong by a factor of the element width reads unrelated HBM and returns
+    plausible garbage with no diagnostic.
     """
-    bits = BITWIDTH_DICT.get(pointee)
+    match = _MLIR_ELEM_BITS.match(pointee)
+    bits = int(match.group(1)) if match else None
     if not bits or bits % 8:
         raise ValueError(
             f"pointer element type {pointee!r} has no usable byte width "
-            f"(BITWIDTH_DICT gives {bits!r}); Spyre base addresses are element "
+            f"(read as {bits!r} bits); Spyre base addresses are element "
             "indices, so the width must be a whole number of bytes"
         )
     return bits // 8
@@ -69,10 +80,12 @@ def resolve_dbo_opt(required: bool = True) -> Optional[str]:
 def base_addresses_for(signature_types) -> Tuple[int, ...]:
     """Fixed base addresses, in ELEMENTS, for the pointer entries of a signature.
 
-    ``signature_types`` is an iterable of Triton type spellings in argument
-    order; entries starting with ``*`` are the pointer arguments and everything
-    else (runtime scalars, ``constexpr``) is skipped. The i-th pointer gets
-    ``i * _SLOT_BYTES`` — converted to an element index because that is the unit
+    ``signature_types`` is an iterable of MLIR type spellings in argument order,
+    exactly as ``ir.module.get_function_signature`` produces them: entries
+    starting with ``*`` are the pointer arguments (``"*f16"`` for
+    ``!tt.ptr<f16>``) and everything else — runtime scalars, and any argument a
+    ``constexpr`` was already folded into — is skipped. The i-th pointer gets
+    ``i * _SLOT_BYTES``, converted to an element index because that is the unit
     ``ktdp.construct_memory_view``'s ``$offset`` carries (see
     MaterializeBaseAddresses.cpp).
 
@@ -87,11 +100,36 @@ def base_addresses_for(signature_types) -> Tuple[int, ...]:
             f"(slot {_MAX_POINTER_ARGS} holds the program itself); this kernel "
             f"has {len(ptr_types)}: {ptr_types}"
         )
-    # "*k" marks a const pointer and "*" a plain one; neither changes the
-    # element width (see triton._utils.canonicalize_ptr_dtype).
-    pointees = [ty[2:] if ty.startswith("*k") else ty[1:] for ty in ptr_types]
-    return tuple(i * _SLOT_BYTES // _elem_bytes(pointee)
-                 for i, pointee in enumerate(pointees))
+    return tuple(i * _SLOT_BYTES // _elem_bytes(ty[1:])
+                 for i, ty in enumerate(ptr_types))
+
+
+def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
+    """Infer the default base addresses from ``mod``'s entry-function pointers.
+
+    "Infer" because this is the fallback when nobody set
+    ``SpyreOptions.base_addresses``: it applies :func:`base_addresses_for`'s fixed
+    slot policy rather than reporting where any buffer really lives.
+
+    Both the *count* and the *widths* of the pointer arguments matter. The count
+    decides how many slots are handed out, but the address of slot i is
+    ``i * 16 GiB`` in *elements*, so it depends on that pointer's own pointee
+    type: ``["*f32", "*f16"]`` and ``["*f16", "*f16"]`` have the same number of
+    arguments and different addresses.
+
+    Must be called while the entry function still takes ``!tt.ptr<...>``
+    arguments — i.e. before or at the very start of the TTIR→KTIR pipeline.
+    ConvertFunctions erases the pointee types, rewriting every pointer argument
+    to a bare ``index``, and after that the element widths this needs are simply
+    not in the IR any more.
+    """
+    entry = mod.get_entry_func_name()
+    if not entry:
+        raise RuntimeError(
+            "module has no kernel entry function, so its pointer arguments "
+            "cannot be located; Spyre needs them to assign HBM base addresses"
+        )
+    return base_addresses_for(mod.get_function_signature(mod.get_function(entry)))
 
 # The TTIR→KTIR core pass sequence, as binding names on
 # spyre.passes.ttir_to_ktdp.
@@ -125,12 +163,20 @@ class SpyreOptions:
     # 32 cores as 16x2 across axes x and y.
     grid: Tuple[int, ...] = (32,)
 
-    # Fixed HBM base addresses for the kernel's pointer arguments, positionally:
-    # entry i is the address for the i-th `index` argument of the lowered
-    # function, which ConvertFunctions produced from the i-th !tt.ptr argument.
-    # When set, MaterializeBaseAddresses replaces those arguments with
-    # arith.constant and drops them from the signature, for feeding the dataflow
-    # scheduler. Empty (default) leaves the signature untouched.
+    # Explicit override for the kernel's HBM base addresses, positionally: entry
+    # i is the address for the i-th `index` argument of the lowered function,
+    # which ConvertFunctions produced from the i-th !tt.ptr argument. Empty (the
+    # default) means the backend derives them from the TTIR pointer types with
+    # base_addresses_for's fixed i * 16 GiB policy — that is the right answer for
+    # a Triton launch, where the runtime binds buffers to those slots.
+    #
+    # It stays an option because a caller can have addresses that no policy can
+    # reproduce. dataflow-test-framework's `dft triton-lower` is the live example
+    # (dftest/triton.py): it sets this from a fixture's data_dti.json manifest as
+    # dev_ptr // word_length, which are the addresses that fixture's device
+    # buffers actually live at, and pairs it with a required_fixes entry naming
+    # materialize_base_addresses so the pass runs at KTIR time. Both halves are
+    # load-bearing for that caller.
     #
     # Values are ELEMENT indices, not byte addresses — ktdp.construct_memory_view's
     # offset feeds MemRef.base_ptr, and ktir-cpu computes the byte position as
@@ -285,29 +331,37 @@ class SpyreBackend(BaseBackend):
                                if k in SpyreOptions.__dataclass_fields__})
 
     def compile_time_launch_options(self, grid, specialization) -> dict:
-        """Contribute the grid and the base addresses as *compile* inputs.
+        """Contribute the grid as a *compile* input.
 
-        On Spyre both are baked into the artifact, so they must be part of the
-        options before the cache key is computed. Neither can be produced by
-        ``parse_options``: the grid is consumed by ``JITFunction.run``'s own
-        keyword-only parameter and never reaches ``**options``, and the
-        addresses are derived from the specialized signature, which only exists
-        once the argument binder has run. See the hook's default in
-        ``python/triton/backends/compiler.py`` and its single call site in
-        ``python/triton/runtime/jit.py``.
+        The grid is baked into the artifact, so it must be part of the options
+        before the cache key is computed, and this hook is the only way to get
+        it there: ``JITFunction.run`` takes ``grid`` as its own keyword-only
+        parameter, so it never reaches the ``**options`` the argument binder
+        collects, and ``parse_options`` runs after the key. Without it
+        ``kernel[(2,)](...)`` and ``kernel[(4,)](...)`` have identical
+        specializations and identical kwargs: they collide, and the second
+        launch silently runs the binary baked for the first grid.
+
+        The grid is the *only* thing that needs the hook. ``base_addresses``
+        used to be contributed here too, but it is a pure function of the
+        specialized signature, and ``specialization`` is already in the cache
+        key — so it is derived inside the backend instead, in ``_make_ktir``.
+        ``specialization`` stays in the signature because the hook is a general
+        upstream capability and another backend may want it.
+
+        See the hook's default in ``python/triton/backends/compiler.py`` and its
+        single call site in ``python/triton/runtime/jit.py``.
         """
-        extra = {"base_addresses": base_addresses_for(ty for ty, _ in specialization)}
         if grid is None:
             # warmup=True: there is no grid to bake, leave the option default.
-            return extra
+            return {}
         if callable(grid):
             raise ValueError(
                 "Spyre bakes the grid into the compiled artifact, so a callable "
                 "grid cannot be used: the tile count must be known before the "
                 "kernel is compiled. Pass a concrete tuple, e.g. kernel[(32,)]."
             )
-        extra["grid"] = tuple(grid)
-        return extra
+        return {"grid": tuple(grid)}
 
     def add_stages(self, stages: dict, options: SpyreOptions, language=None) -> None:
         stages["ttir"] = lambda src, metadata: self._make_ttir(src, metadata, options)
@@ -392,8 +446,24 @@ class SpyreBackend(BaseBackend):
         then:
           - DistributeWork: tt.get_program_id -> ktdp.get_compute_tile_id
           - canonicalize + CSE
+
+        The default pointer base addresses are also inferred here, into
+        metadata["base_addresses"], and consumed by _make_spyrecode. It has to
+        happen *before* this pipeline runs: ConvertFunctions rewrites every
+        !tt.ptr<f16> argument to a bare index, and the element widths the address
+        policy needs are gone from the IR after that. Nothing about them belongs
+        in the launch path, since they are a pure function of the specialized
+        signature, which the cache key already covers.
+
+        Inferring them does not install MaterializeBaseAddresses — _make_spyrecode
+        does that, so the cached .ktir keeps its arguments. A caller that wants
+        the materialization to happen *here* instead, against addresses of its
+        own, names the pass in options.required_fixes and sets
+        options.base_addresses; `dft triton-lower` does exactly that.
         """
         from triton._C.libtriton import ir, passes, spyre
+
+        metadata["base_addresses"] = infer_base_addresses_from_ptr_types(mod)
 
         fixes = options.required_fixes
         ttir_to_ktdp = spyre.passes.ttir_to_ktdp
@@ -446,11 +516,14 @@ class SpyreBackend(BaseBackend):
 
         Two steps:
 
-        1. ``MaterializeBaseAddresses``, which replaces the pointer arguments
-           with ``arith.constant`` and drops them from the signature. The
-           dataflow scheduler requires a zero-argument entry function. This runs
-           here rather than in ``_make_ktir`` so the cached ``.ktir`` artifact
-           keeps the argument-passing calling convention.
+        1. ``MaterializeBaseAddresses`` replaces the pointer arguments with
+           ``arith.constant`` and drops them from the signature, because the
+           dataflow scheduler requires a zero-argument entry function. It uses
+           ``options.base_addresses`` if the caller set them and the addresses
+           ``_make_ktir`` derived otherwise, and it is skipped when
+           ``required_fixes`` already ran it. Running here rather than in
+           ``_make_ktir`` is what lets the cached ``.ktir`` artifact keep the
+           argument-passing calling convention.
         2. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
            codegen stages write the spyreCodeDir. ``--kEmitSpyreCode`` is a pass
            pipeline that has to be requested explicitly; ``--export-dir`` alone
@@ -466,10 +539,30 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes, spyre
 
-        if options.base_addresses:
+        # required_fixes may have installed MaterializeBaseAddresses already, at
+        # the anchor the caller chose, in which case the pointer arguments are
+        # gone. Installing it a second time would hand the pass more addresses
+        # than there are `index` arguments left to put them in, and it fails on
+        # exactly that (MaterializeBaseAddresses.cpp, step 2a).
+        if "materialize_base_addresses" not in options.required_fixes:
+            # options.base_addresses is an override; without one, use the fixed
+            # policy _make_ktir derived from the TTIR pointer types.
+            base_addresses = options.base_addresses or metadata.get("base_addresses")
+            if base_addresses is None:
+                # A compile that starts from a .ktir source skips _make_ktir, and
+                # by then the element widths are no longer in the IR to recover.
+                # Distinct from an empty override, which means "no pointers".
+                raise RuntimeError(
+                    "no base addresses were derived for this kernel. They come "
+                    "from the TTIR pointer types in _make_ktir, so a compile "
+                    "entered at the .ktir stage cannot produce them; compile "
+                    "from the @triton.jit source, or set "
+                    "SpyreOptions.base_addresses explicitly."
+                )
+
             pm = ir.pass_manager(mod.context)
             spyre.passes.ttir_to_ktdp.add_materialize_base_addresses(
-                pm, base_addresses=list(options.base_addresses))
+                pm, base_addresses=list(base_addresses))
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
             pm.run(mod, "make_spyrecode")

@@ -30,6 +30,7 @@ from backend.compiler import (
     SpyreBackend,
     SpyreOptions,
     base_addresses_for,
+    infer_base_addresses_from_ptr_types,
     resolve_dbo_opt,
 )
 
@@ -67,11 +68,41 @@ def _add_kernel_1core(x_ptr, y_ptr, output_ptr, M: tl.constexpr, N: tl.constexpr
 
 
 def _compile_options():
+    # No base_addresses: the backend derives them from the TTIR pointer types.
     return {
         "grid": (1,),
-        "base_addresses": base_addresses_for(_SIGNATURE.values()),
         "required_fixes": dict(_REQUIRED_FIXES),
     }
+
+
+def _lower_to_ktir(signature=None, **options):
+    """Run the ``ttir`` and ``ktir`` stages only; return ``(module, metadata)``.
+
+    Stops short of ``spyrecode`` so the tests that care about the derivation need
+    neither ``dbo-opt`` nor a device.
+    """
+    from triton._C.libtriton import ir
+
+    backend = SpyreBackend(_TARGET)
+    opts = backend.parse_options(options)
+
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+
+    src = ASTSource(fn=_add_kernel_1core,
+                    signature=dict(signature or _SIGNATURE),
+                    constexprs=dict(_CONSTEXPRS))
+    mod = src.make_ir(_TARGET, opts, backend.get_codegen_implementation(opts),
+                      backend.get_module_map(), context)
+    # Keep the context alive for as long as the module: it owns the IR, and a
+    # collected context leaves the returned module dangling (same reason
+    # utils.make_ktir_mod does this).
+    mod.context = context
+
+    metadata = {}
+    mod = backend._make_ttir(mod, metadata, opts)
+    return backend._make_ktir(mod, metadata, opts), metadata
 
 
 @pytest.fixture(scope="module")
@@ -96,37 +127,48 @@ def compiled(dbo_opt):
 # ---------------------------------------------------------------------------
 
 class TestBaseAddresses:
+    """The policy function. Inputs are MLIR spellings, as
+    ``ir.module.get_function_signature`` produces them ("*f16", not "*fp16")."""
 
     def test_element_indexed_16gib_slots(self):
-        # Slot i is based at i * 16 GiB, expressed in ELEMENTS: for fp16 that
+        # Slot i is based at i * 16 GiB, expressed in ELEMENTS: for f16 that
         # divides by 2. These are the same three constants torch-spyre's
         # Inductor path bakes for a 3-buffer fp16 kernel.
-        assert base_addresses_for(["*fp16", "*fp16", "*fp16"]) == (
+        assert base_addresses_for(["*f16", "*f16", "*f16"]) == (
             0, 8589934592, 17179869184)
 
     def test_scales_with_element_width(self):
-        assert base_addresses_for(["*fp32", "*fp32"]) == (0, 4294967296)
+        assert base_addresses_for(["*f32", "*f32"]) == (0, 4294967296)
         assert base_addresses_for(["*i8", "*i8"]) == (0, 17179869184)
+        assert base_addresses_for(["*bf16", "*bf16"]) == (0, 8589934592)
+        # The f8 family names its width the same way, right after the "f".
+        assert base_addresses_for(["*f8E4M3FN", "*f8E4M3FN"]) == (0, 17179869184)
+
+    def test_each_pointer_uses_its_own_width(self):
+        # A single global element stride would misplace the narrower type in a
+        # mixed-precision kernel: slot 1 is 16 GiB either way, but how many
+        # elements that is depends on the pointer sitting in it.
+        assert base_addresses_for(["*f32", "*f16", "*i8"]) == (
+            0, 8589934592, 34359738368)
 
     def test_skips_non_pointer_arguments(self):
-        # Only ``*``-prefixed entries are pointers; a runtime scalar or a
-        # constexpr consumes no address slot. Positions must stay dense so slot
-        # i and pointer i agree by construction.
-        assert base_addresses_for(["*fp16", "i32", "*fp16", "constexpr"]) == (
+        # Only ``*``-prefixed entries are pointers; a runtime scalar consumes no
+        # address slot. Positions must stay dense so slot i and pointer i agree
+        # by construction.
+        assert base_addresses_for(["*f16", "i32", "*f16", "index"]) == (
             0, 8589934592)
 
     def test_seven_pointers_is_the_ceiling(self):
-        assert len(base_addresses_for(["*fp16"] * 7)) == 7
+        assert len(base_addresses_for(["*f16"] * 7)) == 7
         with pytest.raises(ValueError, match="at most 7 pointer arguments"):
-            base_addresses_for(["*fp16"] * 8)
-
-    def test_const_pointer_marker_is_ignored(self):
-        # "*k" marks a const pointer; it does not change the element width.
-        assert base_addresses_for(["*kfp16", "*fp16"]) == (0, 8589934592)
+            base_addresses_for(["*f16"] * 8)
 
     def test_unknown_element_width_raises(self):
         with pytest.raises(ValueError, match="no usable byte width"):
             base_addresses_for(["*float128"])
+        # A pointer to a pointer has no element width of its own.
+        with pytest.raises(ValueError, match="no usable byte width"):
+            base_addresses_for(["*!tt.ptr<f16>"])
 
     def test_sub_byte_element_raises(self):
         # i1 is a bit, and a base address is an element index, so there is no
@@ -135,8 +177,147 @@ class TestBaseAddresses:
             base_addresses_for(["*i1", "*i1"])
 
 
+class TestInferBaseAddresses:
+    """Derivation inside the backend, off the TTIR entry function.
+
+    This is what replaced the hook contributing ``base_addresses``: the widths
+    live in the IR as ``!tt.ptr<f16>``, and the specialized signature they come
+    from is already part of the cache key, so deriving late cannot produce a
+    wrong key.
+    """
+
+    def test_derived_addresses_land_in_metadata(self):
+        # metadata is how the derivation reaches the spyrecode stage; nothing on
+        # the launch path is involved.
+        _, metadata = _lower_to_ktir()
+        assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
+
+    def test_scales_with_the_kernels_own_element_type(self):
+        _, metadata = _lower_to_ktir(
+            signature={name: "*fp32" for name in _SIGNATURE})
+        assert metadata["base_addresses"] == (0, 4294967296, 8589934592)
+
+    def test_pointee_types_are_gone_after_the_pipeline(self):
+        # Why the derivation cannot be deferred to the spyrecode stage:
+        # ConvertFunctions has by then rewritten every !tt.ptr<f16> argument to a
+        # plain `index`, and the element widths are no longer in the IR.
+        mod, _ = _lower_to_ktir()
+        text = str(mod)
+        assert "!tt.ptr" not in text
+        entry = next(line for line in text.splitlines() if "func.func" in line)
+        assert entry.count("index") == len(_SIGNATURE), entry
+
+    def test_a_module_without_a_kernel_raises(self, tmp_path):
+        # The KTIR module is one such: ConvertFunctions turns the tt.func into a
+        # func.func, which get_entry_func_name (looking for a Triton kernel) does
+        # not recognize, so it must not be walked into blindly.
+        from triton._C.libtriton import ir
+        context = ir.context()
+        ir.load_dialects(context)
+        SpyreBackend(_TARGET).load_dialects(context)
+        path = tmp_path / "empty.mlir"
+        path.write_text("module {}\n")
+        mod = ir.parse_mlir_module(str(path), context)
+        mod.context = context
+        with pytest.raises(RuntimeError, match="no kernel entry function"):
+            infer_base_addresses_from_ptr_types(mod)
+
+    def test_the_spyrecode_stage_requires_them(self):
+        # Empty metadata means nobody inferred the addresses — a compile entered
+        # at the .ktir stage, where the widths are already gone. Say so, rather
+        # than emit a binary based at whatever the scheduler defaults to.
+        backend = SpyreBackend(_TARGET)
+        mod, _ = _lower_to_ktir()
+        with pytest.raises(RuntimeError, match="no base addresses were derived"):
+            backend._make_spyrecode(mod, {}, backend.parse_options({}))
+
+    def test_the_count_alone_does_not_determine_the_addresses(self):
+        # Guards the function's name as much as its behaviour: same number of
+        # pointer arguments, different addresses, because each slot is 16 GiB
+        # expressed in that pointer's own elements.
+        assert (base_addresses_for(["*f32", "*f32"])
+                != base_addresses_for(["*f16", "*f16"]))
+
+
 # ---------------------------------------------------------------------------
-# compile_time_launch_options — the grid and the addresses as compile inputs
+# base_addresses as an explicit override
+# ---------------------------------------------------------------------------
+
+# Addresses that the i * 16 GiB policy cannot produce: this is the shape of what
+# `dft triton-lower` supplies, dev_ptr // word_length out of a fixture's
+# data_dti.json, i.e. where that fixture's buffers actually live on the device.
+_DTI_ADDRESSES = (0, 262144, 524288)
+
+
+class TestBaseAddressesOverride:
+    """``SpyreOptions.base_addresses``, set by a caller that has real addresses.
+
+    dataflow-test-framework's ``dft triton-lower`` (``dftest/triton.py``) is the
+    live example, and it needs both halves: the field, and a ``required_fixes``
+    entry naming ``materialize_base_addresses`` so the pass runs at KTIR time.
+    """
+
+    def _materialized_entry(self, mod):
+        return next(line for line in str(mod).splitlines() if "func.func" in line)
+
+    def test_required_fixes_materializes_at_ktir_time(self):
+        # The dft path exactly: name the pass, anchored on the last core pass,
+        # and hand it the DTI addresses.
+        mod, _ = _lower_to_ktir(
+            base_addresses=list(_DTI_ADDRESSES),
+            required_fixes={"materialize_base_addresses": "convert_functions"})
+        text = str(mod)
+        # A zero-argument entry function is what the dataflow scheduler wants.
+        assert "func.func" in text
+        assert self._materialized_entry(mod).count("index") == 0, text
+        for address in _DTI_ADDRESSES[1:]:
+            assert str(address) in text, f"{address} missing from:\n{text}"
+
+    def test_derived_addresses_do_not_overwrite_the_override(self, monkeypatch):
+        # The regression this pins: the override must survive the derivation that
+        # _make_ktir now also does. Stop before dbo-opt — the pass has run by
+        # then, and this needs neither the tool nor a device.
+        import backend.compiler as compiler_module
+
+        class _Stop(Exception):
+            pass
+
+        def _stop(*args, **kwargs):
+            raise _Stop
+        monkeypatch.setattr(compiler_module, "resolve_dbo_opt", _stop)
+
+        backend = SpyreBackend(_TARGET)
+        options = backend.parse_options({"base_addresses": list(_DTI_ADDRESSES)})
+        mod, metadata = _lower_to_ktir()
+        assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
+
+        with pytest.raises(_Stop):
+            backend._make_spyrecode(mod, metadata, options)
+
+        text = str(mod)
+        assert self._materialized_entry(mod).count("index") == 0, text
+        for address in _DTI_ADDRESSES[1:]:
+            assert str(address) in text, f"{address} missing from:\n{text}"
+        # The derived slot-1 address must not have been baked in instead.
+        assert "8589934592" not in text, text
+
+    def test_a_list_is_normalized_to_a_tuple(self):
+        # SPYRE_OPTIONS arrives as JSON, so the field is handed a list; it has to
+        # end up hashable for the option hash and dataclass equality.
+        options = SpyreBackend(_TARGET).parse_options(
+            {"base_addresses": list(_DTI_ADDRESSES)})
+        assert options.base_addresses == _DTI_ADDRESSES
+        assert isinstance(options.base_addresses, tuple)
+
+    def test_the_override_is_in_the_cache_key(self):
+        backend = SpyreBackend(_TARGET)
+        derived = backend.parse_options({})
+        overridden = backend.parse_options({"base_addresses": list(_DTI_ADDRESSES)})
+        assert derived.hash() != overridden.hash()
+
+
+# ---------------------------------------------------------------------------
+# compile_time_launch_options — the grid, and nothing else
 # ---------------------------------------------------------------------------
 
 class TestCompileTimeLaunchOptions:
@@ -144,10 +325,13 @@ class TestCompileTimeLaunchOptions:
     def _backend(self):
         return SpyreBackend(_TARGET)
 
-    def test_grid_and_addresses(self):
+    def test_contributes_the_grid_alone(self):
+        # The grid is the one thing that cannot be recovered later. Anything
+        # derivable from the specialization is derived inside the backend
+        # instead, because the specialization is already in the cache key.
         spec = [("*fp16", 16), ("*fp16", 16), ("i32", None)]
         extra = self._backend().compile_time_launch_options((4, ), spec)
-        assert extra == {"grid": (4, ), "base_addresses": (0, 8589934592)}
+        assert extra == {"grid": (4, )}
 
     def test_keys_are_option_fields(self):
         # _pack_args rejects any launch kwarg that is not a field of the parsed
