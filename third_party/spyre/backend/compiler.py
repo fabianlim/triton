@@ -14,46 +14,6 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
 from types import ModuleType
 
-# ---------------------------------------------------------------------------
-# Fixed HBM address policy (issue #100)
-#
-# Pointer argument i is based at i * _SLOT_BYTES. This is the same assignment
-# torch-spyre's Inductor path makes (SEGMENT_OFFSETS), so the two producers of
-# a Spyre binary agree by construction rather than by coincidence. Slot 7 holds
-# the program itself, which is why only 7 pointer arguments fit.
-# ---------------------------------------------------------------------------
-_SLOT_BYTES = 16 * 1024 ** 3
-_MAX_POINTER_ARGS = 7
-
-# Bit width of an MLIR builtin element type, read off its own spelling. Every
-# type Triton can put behind a !tt.ptr names its width immediately after the
-# leading letters: i8/i32/i64, f16/f32/f64, bf16, and the f8 family
-# (f8E4M3FN, f8E5M2, ...) whose "8" is likewise the width.
-#
-# BITWIDTH_DICT is deliberately not used here: it is keyed by *Triton* spellings
-# ("fp16", "fp8e4nv"), and what the IR hands us are MLIR spellings ("f16",
-# "f8E4M3FN"), with no reverse map in tree. Translating would need a second
-# hand-written table for the f8 variants, which is the thing this regex avoids.
-_MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
-
-
-def _elem_bytes(pointee: str) -> int:
-    """Bytes per element for an MLIR pointee spelling ("f16", "i32", ...).
-
-    Unknown or sub-byte types raise rather than being guessed: a base address
-    wrong by a factor of the element width reads unrelated HBM and returns
-    plausible garbage with no diagnostic.
-    """
-    match = _MLIR_ELEM_BITS.match(pointee)
-    bits = int(match.group(1)) if match else None
-    if not bits or bits % 8:
-        raise ValueError(
-            f"pointer element type {pointee!r} has no usable byte width "
-            f"(read as {bits!r} bits); Spyre base addresses are element "
-            "indices, so the width must be a whole number of bytes"
-        )
-    return bits // 8
-
 
 def resolve_dbo_opt(required: bool = True) -> Optional[str]:
     """Absolute path to the ``dbo-opt`` named by ``knobs.spyre.dbo_opt``.
@@ -77,21 +37,33 @@ def resolve_dbo_opt(required: bool = True) -> Optional[str]:
     return os.path.realpath(path)
 
 
-def base_addresses_for(signature_types) -> Tuple[int, ...]:
-    """Fixed base addresses, in ELEMENTS, for the pointer entries of a signature.
+# Pointer argument i is based at i * 16 GiB, matching the assignment
+# torch-spyre's Inductor path makes, so the two producers of a Spyre binary agree
+# by construction. Slot 7 holds the program, which is why only 7 pointers fit.
+_SLOT_BYTES = 16 * 1024 ** 3
+_MAX_POINTER_ARGS = 7
 
-    ``signature_types`` is an iterable of MLIR type spellings in argument order,
-    exactly as ``ir.module.get_function_signature`` produces them: entries
-    starting with ``*`` are the pointer arguments (``"*f16"`` for
-    ``!tt.ptr<f16>``) and everything else — runtime scalars, and any argument a
-    ``constexpr`` was already folded into — is skipped. The i-th pointer gets
-    ``i * _SLOT_BYTES``, converted to an element index because that is the unit
-    ``ktdp.construct_memory_view``'s ``$offset`` carries (see
-    MaterializeBaseAddresses.cpp).
+# Width of an MLIR element type, read off its own spelling: i8/i32, f16/f32,
+# bf16, and the f8 family (f8E4M3FN, ...) all name it after the leading letters.
+# BITWIDTH_DICT is keyed by *Triton* spellings ("fp16") and the IR hands us MLIR
+# ones, with no reverse map in tree — hence a regex rather than a second table.
+_MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
 
-    Raises when the kernel has more than :data:`_MAX_POINTER_ARGS` pointers, or
-    when a pointee type has no usable element width.
-    """
+
+def _elem_bytes(pointee: str) -> int:
+    match = _MLIR_ELEM_BITS.match(pointee)
+    bits = int(match.group(1)) if match else None
+    if not bits or bits % 8:
+        raise ValueError(
+            f"pointer element type {pointee!r} has no usable byte width "
+            f"(read as {bits!r} bits); Spyre base addresses are element "
+            "indices, so the width must be a whole number of bytes"
+        )
+    return bits // 8
+
+
+def _slot_addresses(signature_types) -> Tuple[int, ...]:
+    """Slot addresses in ELEMENTS for the ``*``-prefixed entries, in order."""
     ptr_types = [ty for ty in signature_types
                  if isinstance(ty, str) and ty.startswith("*")]
     if len(ptr_types) > _MAX_POINTER_ARGS:
@@ -105,23 +77,21 @@ def base_addresses_for(signature_types) -> Tuple[int, ...]:
 
 
 def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
-    """Infer the default base addresses from ``mod``'s entry-function pointers.
+    """The default base addresses, from ``mod``'s entry-function pointer types.
 
     "Infer" because this is the fallback when nobody set
-    ``SpyreOptions.base_addresses``: it applies :func:`base_addresses_for`'s fixed
-    slot policy rather than reporting where any buffer really lives.
+    ``SpyreOptions.base_addresses``: it applies the fixed slot policy rather than
+    reporting where any buffer really lives.
 
-    Both the *count* and the *widths* of the pointer arguments matter. The count
-    decides how many slots are handed out, but the address of slot i is
-    ``i * 16 GiB`` in *elements*, so it depends on that pointer's own pointee
-    type: ``["*f32", "*f16"]`` and ``["*f16", "*f16"]`` have the same number of
-    arguments and different addresses.
+    Both the *count* and the *widths* matter. The count decides how many slots
+    are handed out; the address of slot i is ``i * 16 GiB`` in *elements*, so it
+    also depends on that pointer's own pointee type — ``["*f32", "*f32"]`` and
+    ``["*f16", "*f16"]`` have the same number of arguments and different
+    addresses.
 
-    Must be called while the entry function still takes ``!tt.ptr<...>``
-    arguments — i.e. before or at the very start of the TTIR→KTIR pipeline.
-    ConvertFunctions erases the pointee types, rewriting every pointer argument
-    to a bare ``index``, and after that the element widths this needs are simply
-    not in the IR any more.
+    Must run while the entry function still takes ``!tt.ptr<...>`` arguments,
+    i.e. before or at the very start of the TTIR→KTIR pipeline: ConvertFunctions
+    rewrites every pointer to a bare ``index`` and the widths are then gone.
     """
     entry = mod.get_entry_func_name()
     if not entry:
@@ -129,7 +99,8 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
             "module has no kernel entry function, so its pointer arguments "
             "cannot be located; Spyre needs them to assign HBM base addresses"
         )
-    return base_addresses_for(mod.get_function_signature(mod.get_function(entry)))
+    return _slot_addresses(mod.get_function_signature(mod.get_function(entry)))
+
 
 # The TTIR→KTIR core pass sequence, as binding names on
 # spyre.passes.ttir_to_ktdp.
@@ -167,30 +138,19 @@ class SpyreOptions:
     # i is the address for the i-th `index` argument of the lowered function,
     # which ConvertFunctions produced from the i-th !tt.ptr argument. Empty (the
     # default) means the backend derives them from the TTIR pointer types with
-    # base_addresses_for's fixed i * 16 GiB policy — that is the right answer for
+    # the fixed i * 16 GiB slot policy — that is the right answer for
     # a Triton launch, where the runtime binds buffers to those slots.
     #
-    # It stays an option because a caller can have addresses that no policy can
-    # reproduce. dataflow-test-framework's `dft triton-lower` is the live example
-    # (dftest/triton.py): it sets this from a fixture's data_dti.json manifest as
-    # dev_ptr // word_length, which are the addresses that fixture's device
-    # buffers actually live at, and pairs it with a required_fixes entry naming
-    # materialize_base_addresses so the pass runs at KTIR time. Both halves are
-    # load-bearing for that caller.
+    # It stays an option because a caller may want to specify addresses.
     #
-    # Values are ELEMENT indices, not byte addresses — ktdp.construct_memory_view's
-    # offset feeds MemRef.base_ptr, and ktir-cpu computes the byte position as
-    # base_ptr * bytes_per_elem(dtype). No scaling is applied on the way through.
+    # Values are ELEMENT indices, not byte addresses.
     base_addresses: Tuple[int, ...] = ()
 
     # How the kernel's buffer addresses reach the entry function.
     #
     # False (the default and the only supported mode): the pointer arguments are
     # replaced by base addresses — base_addresses if set, otherwise the derived
-    # ones — so the entry function dbo-opt sees takes no arguments, which is what
-    # the dataflow scheduler requires. torch-spyre's runtime then binds the buffers
-    # positionally from the tensor list (job_plan.cpp populates tensor_allocs
-    # from ctx.inputs_outputs).
+    # ones.
     #
     # True: leave the addresses symbolic, for a runtime that patches them via
     # the correction table. Not implemented — see _make_spyrecode, which raises.
@@ -217,11 +177,12 @@ class SpyreOptions:
     # or a plausible-looking "distribute_work" — is silently ignored and the fix
     # never runs. A missing pass *binding* raises; a bad *anchor* does not.
     required_fixes: Mapping[str, str] = field(default_factory=dict)
-    lx_size: int = 2 * 1024 * 1024  # 2 MB scratchpad per core
+
     # HBM data layout: "device" (stickified row-major physical strides) or
     # "host" (strides derived from logical strides via the coordinate map).
     data_layout: str = "device"
-    # Required by Triton code generator
+
+    # ---- Required by Triton code generator -----
     sanitize_overflow: bool = False
     debug: bool = False
     allowed_dot_input_precisions: tuple = ("ieee",)
@@ -234,14 +195,15 @@ class SpyreOptions:
     # SpyreUtils.load_binary in driver.py:
     #
     #   num_warps  -- compared as `num_warps * warp_size > n_max_threads`
-    #                 (python/triton/compiler/compiler.py:480). With
+    #                 (python/triton/compiler/compiler.py). With
     #                 warp_size = 1 from SpyreDriver.get_current_target() and
     #                 n_max_threads = 1 from SpyreUtils.load_binary, 1*1 > 1 is
     #                 false. Spyre has no warps.
-    #   shared     -- compared as `shared > max_shared_mem` (:467), and
+    #   shared     -- compared as `shared > max_shared_mem`, and
     #                 SpyreUtils.get_device_properties reports 0, so 0 > 0 is
     #                 false. Spyre's LX scratchpad is not Triton shared memory;
-    #                 it is sized by lx_size and allocated by the scheduler.
+    #                 it is sized by the device description and allocated by
+#                 the scheduler.
     #
     # An upstream refactor of _init_handles breaks these silently, hence the
     # explicit note here and at each reported value.
@@ -249,8 +211,8 @@ class SpyreOptions:
     shared: int = 0
 
     # JITFunction.run injects instrumentation_mode into kwargs unconditionally
-    # (python/triton/runtime/jit.py:725) and _pack_args rejects any launch kwarg
-    # that is not a field of the parsed options (:711), so every launch fails
+    # (python/triton/runtime/jit.py) and _pack_args rejects any launch kwarg
+    # that is not a field of the parsed options, so every launch fails
     # that check unless the field exists. Spyre runs no instrumentation passes;
     # the value is accepted and ignored.
     instrumentation_mode: str = ""
@@ -308,9 +270,9 @@ class SpyreBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         # Set here, not in add_stages: CompiledKernel constructs a *fresh*
-        # backend via make_backend() (python/triton/compiler/compiler.py:418),
+        # backend via make_backend() (python/triton/compiler/compiler.py),
         # so an attribute assigned on the compiling instance is not the one it
-        # reads. It also decides bytes-vs-text per artifact (:427) — the file
+        # reads. It also decides bytes-vs-text per artifact — the file
         # whose extension matches binary_ext is read as bytes.
         self.binary_ext = "spyrecode"
 
@@ -322,7 +284,7 @@ class SpyreBackend(BaseBackend):
         the options untouched. Without them, repointing or rebuilding dbo-opt
         silently reuses a stale binary. NVIDIA closes the same hole by folding
         ``get_ptxas_version(arch)`` into its options
-        (``third_party/nvidia/backend/compiler.py:574``).
+        (``third_party/nvidia/backend/compiler.py``).
         """
         return "-".join([
             f"spyre-{self.target.arch}",
@@ -444,14 +406,14 @@ class SpyreBackend(BaseBackend):
         min_K)`` lower bounds that a ``tl.dot`` call's operand shapes
         must satisfy. Upstream backends pick:
 
-          - NVIDIA (``third_party/nvidia/backend/compiler.py:19``) —
+          - NVIDIA (``third_party/nvidia/backend/compiler.py``) —
             ``(1, 1, 16)`` for fp16/bf16, ``(1, 1, 32)`` for int8/fp8.
             Only K is constrained; small M/N are padded into tensor
             cores.
-          - AMD (``third_party/amd/backend/compiler.py:16``) —
+          - AMD (``third_party/amd/backend/compiler.py``) —
             ``(1, 1, 1)``, falling back to FMA for configurations not
             natively supported by its matrix cores.
-          - Interpreter (``python/triton/runtime/interpreter.py:290``) —
+          - Interpreter (``python/triton/runtime/interpreter.py``) —
             ``(1, 1, 1)``.
 
         Spyre has no ``tl.dot`` shape floor today (``linalg.matmul``

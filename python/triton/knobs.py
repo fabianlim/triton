@@ -546,9 +546,8 @@ class spyre_knobs(base_knobs):
     # that tree is the only on-disk record of what was actually scheduled; it
     # is packed into the artifact and unpacked beside spyrecode.json.
     dbo_debug: env_bool = env_bool("TRITON_SPYRE_DBO_DEBUG", True)
-
-
 # --- END --- added for spyre
+
 class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
     cupti_lib_dir: env_str = env_str(

@@ -29,7 +29,7 @@ from triton.compiler.compiler import ASTSource, compile as triton_compile
 from backend.compiler import (
     SpyreBackend,
     SpyreOptions,
-    base_addresses_for,
+    _slot_addresses,
     infer_base_addresses_from_ptr_types,
     resolve_dbo_opt,
 )
@@ -134,47 +134,47 @@ class TestBaseAddresses:
         # Slot i is based at i * 16 GiB, expressed in ELEMENTS: for f16 that
         # divides by 2. These are the same three constants torch-spyre's
         # Inductor path bakes for a 3-buffer fp16 kernel.
-        assert base_addresses_for(["*f16", "*f16", "*f16"]) == (
+        assert _slot_addresses(["*f16", "*f16", "*f16"]) == (
             0, 8589934592, 17179869184)
 
     def test_scales_with_element_width(self):
-        assert base_addresses_for(["*f32", "*f32"]) == (0, 4294967296)
-        assert base_addresses_for(["*i8", "*i8"]) == (0, 17179869184)
-        assert base_addresses_for(["*bf16", "*bf16"]) == (0, 8589934592)
+        assert _slot_addresses(["*f32", "*f32"]) == (0, 4294967296)
+        assert _slot_addresses(["*i8", "*i8"]) == (0, 17179869184)
+        assert _slot_addresses(["*bf16", "*bf16"]) == (0, 8589934592)
         # The f8 family names its width the same way, right after the "f".
-        assert base_addresses_for(["*f8E4M3FN", "*f8E4M3FN"]) == (0, 17179869184)
+        assert _slot_addresses(["*f8E4M3FN", "*f8E4M3FN"]) == (0, 17179869184)
 
     def test_each_pointer_uses_its_own_width(self):
         # A single global element stride would misplace the narrower type in a
         # mixed-precision kernel: slot 1 is 16 GiB either way, but how many
         # elements that is depends on the pointer sitting in it.
-        assert base_addresses_for(["*f32", "*f16", "*i8"]) == (
+        assert _slot_addresses(["*f32", "*f16", "*i8"]) == (
             0, 8589934592, 34359738368)
 
     def test_skips_non_pointer_arguments(self):
         # Only ``*``-prefixed entries are pointers; a runtime scalar consumes no
         # address slot. Positions must stay dense so slot i and pointer i agree
         # by construction.
-        assert base_addresses_for(["*f16", "i32", "*f16", "index"]) == (
+        assert _slot_addresses(["*f16", "i32", "*f16", "index"]) == (
             0, 8589934592)
 
     def test_seven_pointers_is_the_ceiling(self):
-        assert len(base_addresses_for(["*f16"] * 7)) == 7
+        assert len(_slot_addresses(["*f16"] * 7)) == 7
         with pytest.raises(ValueError, match="at most 7 pointer arguments"):
-            base_addresses_for(["*f16"] * 8)
+            _slot_addresses(["*f16"] * 8)
 
     def test_unknown_element_width_raises(self):
         with pytest.raises(ValueError, match="no usable byte width"):
-            base_addresses_for(["*float128"])
+            _slot_addresses(["*float128"])
         # A pointer to a pointer has no element width of its own.
         with pytest.raises(ValueError, match="no usable byte width"):
-            base_addresses_for(["*!tt.ptr<f16>"])
+            _slot_addresses(["*!tt.ptr<f16>"])
 
     def test_sub_byte_element_raises(self):
         # i1 is a bit, and a base address is an element index, so there is no
         # honest byte width to divide by.
         with pytest.raises(ValueError, match="no usable byte width"):
-            base_addresses_for(["*i1", "*i1"])
+            _slot_addresses(["*i1", "*i1"])
 
 
 class TestInferBaseAddresses:
@@ -235,8 +235,8 @@ class TestInferBaseAddresses:
         # Guards the function's name as much as its behaviour: same number of
         # pointer arguments, different addresses, because each slot is 16 GiB
         # expressed in that pointer's own elements.
-        assert (base_addresses_for(["*f32", "*f32"])
-                != base_addresses_for(["*f16", "*f16"]))
+        assert (_slot_addresses(["*f32", "*f32"])
+                != _slot_addresses(["*f16", "*f16"]))
 
 
 # ---------------------------------------------------------------------------

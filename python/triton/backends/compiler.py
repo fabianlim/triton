@@ -95,8 +95,8 @@ class BaseBackend(metaclass=ABCMeta):
         object `parse_options` produces, or `_pack_args` will reject them.
         """
         return {}
-
     # --- END --- added for spyre
+
     @staticmethod
     def parse_attr(desc):
         assert isinstance(desc, str)
