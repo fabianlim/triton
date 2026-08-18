@@ -11,10 +11,10 @@
 
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Dialect/KTDP/Transforms/Utility.h"
-#include "Ktdp/KtdpAttrs.hpp"
-#include "Ktdp/KtdpDialect.hpp"
-#include "Ktdp/KtdpOps.hpp"
-#include "Ktdp/KtdpTypes.hpp"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/KTDP/KTDPTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 
@@ -99,8 +99,8 @@ static Value buildBaseMemoryView(OpBuilder &builder, Location loc,
   }
 
   auto memrefType = MemRefType::get(shape, elemType);
-  auto memSpaceAttr = mlir::ktdp::SpyreMemorySpaceAttr::get(
-      ctx, mlir::ktdp::SpyreMemorySpaceKind::HBM, /*core=*/-1);
+  auto memSpaceAttr = mlir::ktdp::MemorySpaceAttr::get(
+      ctx, mlir::ktdp::MemorySpaceKind::global, /*ct_id=*/-1);
 
   auto memView = mlir::ktdp::ConstructMemoryViewOp::create(
       builder, loc, memrefType, baseIndex,
