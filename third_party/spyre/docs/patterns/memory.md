@@ -603,12 +603,15 @@ _+ 15 more variants_
 _`tt.addptr` result feeding `tt.make_tensor_descriptor`_
 
 When a `tt.addptr` result is the base pointer for a tensor
-descriptor, `ConvertFunctions` rewrites the `!tt.ptr` argument
-to `index` before `LowerDescriptorMemory` can fold the pointer
-arithmetic, and the op's verifier then rejects the now-illegal
-operand type. This is the underlying reason batched matmul is
-currently disabled: each batch step wants to offset the base
-pointer before constructing the descriptor.
+descriptor, `LowerDescriptorMemory` lowers the descriptor ops but
+leaves the `tt.addptr` reading the `!tt.ptr` function argument
+directly. `ConvertFunctions` only knows how to fold
+`unrealized_conversion_cast` users of a pointer argument, so it
+rejects the module up front — before any retype — and names the
+missing `getBasePtrAsIndex` consumption as the cause. This is the
+underlying reason batched matmul is currently disabled: each batch
+step wants to offset the base pointer before constructing the
+descriptor.
 
 ```python
 # NOT supported: tt.addptr result as descriptor base (e.g. batched matmul)
@@ -619,9 +622,9 @@ desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],
 
 Expected diagnostics:
 
-- `tt.addptr`
-- `must be ptr`
-- `got 'index'`
+- `cannot convert function signature`
+- `!tt.ptr argument #0`
+- `getBasePtrAsIndex`
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2490` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
