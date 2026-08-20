@@ -39,8 +39,8 @@ def resolve_dbo_opt(required: bool = True) -> Optional[str]:
 
 # Pointer argument i is based at i * 16 GiB, matching the assignment
 # torch-spyre's Inductor path makes, so the two producers of a Spyre binary agree
-# by construction. Slot 7 holds the program, which is why only 7 pointers fit.
-_SLOT_BYTES = 16 * 1024 ** 3
+# by construction. Segment 7 holds the program, which is why only 7 pointers fit.
+_SEGMENT_BYTES = 16 * 1024 ** 3
 _MAX_POINTER_ARGS = 7
 
 # Width of an MLIR element type, read off its own spelling: i8/i32, f16/f32,
@@ -62,17 +62,17 @@ def _elem_bytes(pointee: str) -> int:
     return bits // 8
 
 
-def _slot_addresses(signature_types) -> Tuple[int, ...]:
-    """Slot addresses in ELEMENTS for the ``*``-prefixed entries, in order."""
+def _segment_addresses(signature_types) -> Tuple[int, ...]:
+    """Segment addresses in ELEMENTS for the ``*``-prefixed entries, in order."""
     ptr_types = [ty for ty in signature_types
                  if isinstance(ty, str) and ty.startswith("*")]
     if len(ptr_types) > _MAX_POINTER_ARGS:
         raise ValueError(
             f"Spyre supports at most {_MAX_POINTER_ARGS} pointer arguments "
-            f"(slot {_MAX_POINTER_ARGS} holds the program itself); this kernel "
+            f"(segment {_MAX_POINTER_ARGS} holds the program itself); this kernel "
             f"has {len(ptr_types)}: {ptr_types}"
         )
-    return tuple(i * _SLOT_BYTES // _elem_bytes(ty[1:])
+    return tuple(i * _SEGMENT_BYTES // _elem_bytes(ty[1:])
                  for i, ty in enumerate(ptr_types))
 
 
@@ -80,11 +80,11 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     """The default base addresses, from ``mod``'s entry-function pointer types.
 
     "Infer" because this is the fallback when nobody set
-    ``SpyreOptions.base_addresses``: it applies the fixed slot policy rather than
+    ``SpyreOptions.base_addresses``: it applies the fixed segment policy rather than
     reporting where any buffer really lives.
 
-    Both the *count* and the *widths* matter. The count decides how many slots
-    are handed out; the address of slot i is ``i * 16 GiB`` in *elements*, so it
+    Both the *count* and the *widths* matter. The count decides how many segments
+    are handed out; the address of segment i is ``i * 16 GiB`` in *elements*, so it
     also depends on that pointer's own pointee type — ``["*f32", "*f32"]`` and
     ``["*f16", "*f16"]`` have the same number of arguments and different
     addresses.
@@ -99,7 +99,7 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
             "module has no kernel entry function, so its pointer arguments "
             "cannot be located; Spyre needs them to assign HBM base addresses"
         )
-    return _slot_addresses(mod.get_function_signature(mod.get_function(entry)))
+    return _segment_addresses(mod.get_function_signature(mod.get_function(entry)))
 
 
 # The TTIR→KTIR core pass sequence, as binding names on
@@ -138,8 +138,8 @@ class SpyreOptions:
     # i is the address for the i-th `index` argument of the lowered function,
     # which ConvertFunctions produced from the i-th !tt.ptr argument. Empty (the
     # default) means the backend derives them from the TTIR pointer types with
-    # the fixed i * 16 GiB slot policy — that is the right answer for
-    # a Triton launch, where the runtime binds buffers to those slots.
+    # the fixed i * 16 GiB segment policy — that is the right answer for
+    # a Triton launch, where the runtime binds buffers to those segments.
     #
     # It stays an option because a caller may want to specify addresses.
     #
