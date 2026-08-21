@@ -134,7 +134,11 @@ Current upstream touch points:
 ```bash
 uv run pytest third_party/spyre/test                    # full suite
 uv run pytest third_party/spyre/test -k "not numerical" # structural only
-lit build/cmake.*/third_party/spyre/test -v             # lit/FileCheck tests
+uv run lit build/cmake.*/third_party/spyre/test -v      # lit/FileCheck tests
+
+# fast loop on one python-driven lit test -- no cmake, no re-configure
+T=third_party/spyre/test/python/segment-addresses.py
+PYTHONPATH=python:third_party/spyre uv run python $T | ./python/triton/FileCheck $T
 ```
 
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
@@ -144,7 +148,10 @@ missing oracles skip, so the suite stays green while catching regressions.
 
 `spyre-triton-opt` registers both Triton (TTIR) and KTDP dialects/passes.
 It lives in `third_party/spyre/bin/` and is built by default. Lit tests
-live in `third_party/spyre/test/` alongside the pytest suite (`.mlir` suffix).
+live in `third_party/spyre/test/` alongside the pytest suite: `.mlir` for IR, and
+`.py` under `test/python/` for what is Python rather than IR (the address policy,
+the option surface). `test/python/lit.local.cfg` adds the suffix and sets the
+`PYTHONPATH` those need, since lit does not load `conftest.py`.
 
 **Generating FileCheck patterns** — use `utils/generate-test-checks.py`
 (from upstream LLVM) to auto-generate CHECK lines from printed IR:

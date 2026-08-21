@@ -144,6 +144,15 @@ class SpyreOptions:
     # It stays an option because a caller may want to specify addresses.
     #
     # Values are ELEMENT indices, not byte addresses.
+    #
+    # SOON TO BE DEPRECATED, along with baked addresses generally. A baked address
+    # is only correct if torch-spyre binds the buffers to those segments at launch,
+    # which it does only in the non-symbolic mode of the BUNDLE_SYMBOLIC_ARGS
+    # environment variable. How long that variable stays respected is not settled --
+    # the SDSC codegen path has already stopped requiring it to be off -- and once
+    # it is not, addresses have to arrive symbolically and be patched through the
+    # correction table (see symbolic_args). Treat this field as the current
+    # mechanism, not the intended one.
     base_addresses: Tuple[int, ...] = ()
 
     # How the kernel's buffer addresses reach the entry function.
@@ -346,6 +355,16 @@ class SpyreBackend(BaseBackend):
         """
         parsed = {k: v for k, v in options.items()
                   if k in SpyreOptions.__dataclass_fields__}
+        # Read from the environment rather than through knobs, unlike every
+        # setting this backend owns. BUNDLE_SYMBOLIC_ARGS is torch-spyre's
+        # variable: it describes how *that* runtime will bind buffers at launch,
+        # and declaring it as a Triton knob would have Triton publishing another
+        # project's contract as though it were stable and ours to define.
+        #
+        # `== "1"` and not a truthy test, because that is torch-spyre's own rule
+        # (prepare_kernel.cpp: bind_io_addresses_ = env != "1"). Accepting
+        # "true"/"on" here would compile symbolically while torch-spyre bound the
+        # addresses -- a compile/launch disagreement with no diagnostic.
         parsed.setdefault("symbolic_args",
                           os.environ.get("BUNDLE_SYMBOLIC_ARGS") == "1")
         return SpyreOptions(**parsed)
