@@ -196,28 +196,21 @@ class SpyreOptions:
     debug: bool = False
     allowed_dot_input_precisions: tuple = ("ieee",)
 
-    # --- Fields Triton's runtime requires but Spyre has no analogue for ---
+    # num_warps and shared are deliberately NOT options. Nothing reads them from
+    # here -- the only reader is CompiledKernel._init_handles, which takes them
+    # from metadata, so _make_spyrecode reports them there. That comment explains
+    # the values.
     #
-    # Both are fictions, chosen so the ceiling checks in
-    # CompiledKernel._init_handles become no-ops rather than false floors. The
-    # third value in the same set, n_max_threads, is reported by
-    # SpyreUtils.load_binary in driver.py:
+    # Two things follow from leaving them out. They cannot reach options.hash(),
+    # so they cannot make the cache key differ for an artifact that would be
+    # identical either way. And `kernel[grid](..., num_warps=4)` now fails with
+    # "Keyword argument num_warps was specified but unrecognised", rather than
+    # being accepted and quietly having no effect -- which is the truthful answer
+    # on a device with no warps.
     #
-    #   num_warps  -- compared as `num_warps * warp_size > n_max_threads`
-    #                 (python/triton/compiler/compiler.py). With
-    #                 warp_size = 1 from SpyreDriver.get_current_target() and
-    #                 n_max_threads = 1 from SpyreUtils.load_binary, 1*1 > 1 is
-    #                 false. Spyre has no warps.
-    #   shared     -- compared as `shared > max_shared_mem`, and
-    #                 SpyreUtils.get_device_properties reports 0, so 0 > 0 is
-    #                 false. Spyre's LX scratchpad is not Triton shared memory;
-    #                 it is sized by the device description and allocated by
-#                 the scheduler.
-    #
-    # An upstream refactor of _init_handles breaks these silently, hence the
-    # explicit note here and at each reported value.
-    num_warps: int = 1
-    shared: int = 0
+    # debug and instrumentation_mode cannot move the same way: JITFunction.run
+    # adds both to the launch kwargs every time, and _pack_args rejects any kwarg
+    # that is not an option, so they have to stay fields.
 
     # JITFunction.run injects instrumentation_mode into kwargs unconditionally
     # (python/triton/runtime/jit.py) and _pack_args rejects any launch kwarg
@@ -697,4 +690,36 @@ class SpyreBackend(BaseBackend):
                     archive.writestr(info, path.read_bytes())
 
         metadata["stage"] = "spyrecode"
+
+        # Before the first launch, CompiledKernel._init_handles refuses to run a
+        # kernel that asks for more than the device has. It makes two such checks,
+        # and needs a number from us for each:
+        #
+        #   shared > max_shared_mem                  how much shared memory the
+        #                                            kernel needs, vs how much
+        #                                            the device reports
+        #   num_warps * warp_size > n_max_threads    how many threads it wants,
+        #                                            vs how many are allowed
+        #
+        # Spyre has neither warps nor Triton's shared memory. Its LX scratchpad is
+        # a different thing: the device description sizes it and the scheduler
+        # allocates it, with nothing for Triton to bound. So we report zero need,
+        # both comparisons come out false, and the launch goes ahead. Reporting
+        # anything larger would invent a limit that does not exist and refuse a
+        # kernel that runs perfectly well.
+        #
+        # Reported here, and not carried as options a caller could set, because
+        # nothing about a Spyre kernel changes them. In *this* stage specifically
+        # because it is the only one certain to run: a compile may start partway
+        # down the pipeline (first_stage = stages.index(src.ext), +1 for an
+        # IRSource), so a .ttir input skips _make_ttir and a .ktir input skips
+        # _make_ktir as well. Setting them in either would leave some compiles
+        # without them, and _init_handles would then fail with AttributeError at
+        # the first launch. This stage produces the artifact, so if there is a
+        # kernel to launch at all, this ran.
+        #
+        # If _init_handles ever changes upstream, these go stale silently -- hence
+        # the reasoning here and beside each value the driver reports.
+        metadata["num_warps"] = 1
+        metadata["shared"] = 0
         return buffer.getvalue()

@@ -402,22 +402,35 @@ class TestSymbolicArgs:
 
 
 class TestSpyreOptionsFictions:
-    """``num_warps`` and ``shared`` are inert; ``instrumentation_mode`` is not."""
+    """``num_warps`` and ``shared`` are not options at all; ``instrumentation_mode``
+    has to be one."""
 
-    def test_num_warps_and_shared_defaults(self):
-        options = SpyreBackend(_TARGET).parse_options({})
-        # num_warps * warp_size (1*1) must not exceed n_max_threads (1), and
-        # shared (0) must not exceed max_shared_mem (0).
-        assert options.num_warps == 1
-        assert options.shared == 0
+    def test_num_warps_and_shared_are_not_options(self):
+        # They are read only from metadata, by CompiledKernel._init_handles, so
+        # _make_ttir reports them there instead. Keeping them out of the options
+        # keeps them out of options.hash(), so they cannot key an artifact they
+        # cannot change.
+        fields = set(SpyreOptions.__dataclass_fields__)
+        assert "num_warps" not in fields
+        assert "shared" not in fields
 
-    def test_a_non_default_num_warps_is_tolerated(self):
-        # Deliberately NOT an error. num_warps is the standard portable Triton
-        # knob -- every triton.Config in an autotune list carries one -- and
-        # nothing in the Spyre pipeline reads it, so rejecting it would break
-        # portable kernels for no correctness gain. warp_size = 1 makes it vacuous.
-        options = SpyreBackend(_TARGET).parse_options({"num_warps": 4})
-        assert options.num_warps == 4
+    def test_num_warps_at_a_call_site_is_rejected(self):
+        # Spyre has no warps, and nothing in the pipeline reads this. Refusing it
+        # says so, where accepting and ignoring it would not. triton.autotune,
+        # which is where a portable kernel would sweep num_warps, cannot run on
+        # this backend anyway -- get_benchmarker raises.
+        with pytest.raises(TypeError, match="num_warps"):
+            SpyreOptions(num_warps=4)
+
+    def test_only_the_terminal_stage_reports_them(self):
+        # Reported by _make_spyrecode, not by an earlier stage: a compile can
+        # start partway down (an IRSource of a .ttir skips _make_ttir, one of a
+        # .ktir skips _make_ktir too), and metadata without them means an
+        # AttributeError inside _init_handles at the first launch. So the ttir+ktir
+        # stages alone must NOT be what supplies them.
+        _, metadata = _lower_to_ktir(**_compile_options())
+        assert "num_warps" not in metadata
+        assert "shared" not in metadata
 
     def test_the_default_instrumentation_mode_is_tolerated(self):
         # JITFunction.run injects this into kwargs unconditionally, and
