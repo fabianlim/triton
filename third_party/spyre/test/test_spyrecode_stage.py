@@ -4,24 +4,21 @@
 Stays in pytest because every test here needs ``dbo-opt``: the stage shells out to
 it, so there is nothing to assert without one. The option surface and the
 base-address policy, which need neither a tool nor a device, are python-driven lit
-tests in ``test/python/backend-options.py``.
+tests in ``test/python/backend-options-test.py``.
+
+The kernel comes from whichever fixture variants declare ``compiles_to_binary`` in
+their ``meta.py`` -- today one, the loop-free single-tile add, because dbo-opt
+refuses the loop the others outline from their program-id distribution. The
+``binary_example`` fixture parametrizes over them and ``compiled`` takes one
+through every stage; a test that needs the tool takes that fixture and so skips
+when there is none.
 
 Every setting these need is a knob -- ``knobs.spyre.dbo_opt`` and
 ``knobs.spyre.device`` -- and the backend reads them only through ``knobs``, never
-from the environment. Override them the way any Triton knob is overridden, in
-process or from the environment via their ``TRITON_SPYRE_*`` names; the tests do
-not read the environment either.
+from the environment. Override them the way any Triton knob is overridden.
 """
 
-from backend_utils import *  # noqa: F401,F403  (shared kernels + helpers)
-from backend_utils import (
-    _CONSTEXPRS,
-    _SIGNATURE,
-    _TARGET,
-    _add_kernel_1core,
-    _compile_options,
-)
-
+import hashlib
 import io
 import zipfile
 
@@ -29,17 +26,30 @@ import pytest
 from triton import knobs
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 
+from conftest import EXAMPLES
+from utils import spyre_target
+
 from backend.compiler import SpyreBackend, resolve_dbo_opt, resolve_device
+
+
+def _source(key):
+    """An ASTSource for a fixture variant, for the tests that recompile it."""
+    entry = EXAMPLES[key]
+    constexprs = {k: v[0] for k, v in entry["params"].items()
+                  if k in entry["constexpr"]}
+    return ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
+                     constexprs=constexprs)
+
 
 class TestSpyrecodeStage:
 
     def test_binary_ext_is_set_on_the_instance(self):
         # CompiledKernel builds a fresh backend via make_backend(), so this has
         # to come from __init__ rather than add_stages.
-        assert SpyreBackend(_TARGET).binary_ext == "spyrecode"
+        assert SpyreBackend(spyre_target()).binary_ext == "spyrecode"
 
     def test_stage_is_registered_last(self):
-        backend = SpyreBackend(_TARGET)
+        backend = SpyreBackend(spyre_target())
         stages = {}
         backend.add_stages(stages, backend.parse_options({}))
         assert list(stages) == ["ttir", "ktir", "spyrecode"]
@@ -60,37 +70,57 @@ class TestSpyrecodeStage:
         exts = {p.rsplit(".", 1)[-1] for p in compiled.metadata_group}
         assert {"ttir", "ktir", "spyrecode", "json"} <= exts
 
-    def test_recompile_hits_the_cache(self, compiled):
-        src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
-                        constexprs=dict(_CONSTEXPRS))
-        again = triton_compile(src, target=_TARGET, options=_compile_options())
+    def test_recompile_hits_the_cache(self, compiled, spyrecode_options, binary_example):
+        again = triton_compile(compiled.src, target=spyre_target(),
+                               options=spyrecode_options)
         assert again.hash == compiled.hash
         assert again.kernel == compiled.kernel
 
-    def test_artifact_bytes_are_deterministic(self, compiled, monkeypatch):
+    def test_artifact_bytes_are_deterministic(self, compiled, spyrecode_options,
+                                              monkeypatch, binary_example):
         # The artifact digest is what SpyreUtils.load_binary unpacks under, so
         # identical inputs must give identical bytes. Real ZIP mtimes would make
         # every recompile look like a new binary.
         monkeypatch.setattr(knobs.compilation, "always_compile", True)
-        src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
-                        constexprs=dict(_CONSTEXPRS))
-        rebuilt = triton_compile(src, target=_TARGET, options=_compile_options())
+        rebuilt = triton_compile(compiled.src, target=spyre_target(),
+                                 options=spyrecode_options)
         assert hashlib.sha256(rebuilt.kernel).hexdigest() == \
             hashlib.sha256(compiled.kernel).hexdigest()
+
+    def test_derived_addresses_reach_the_artifact(self, spyrecode_options, dbo_opt, binary_example):
+        # The one surviving assertion on the *value* _make_ktir derives from the
+        # TTIR pointer types: three fp16 pointers land on the i * 16 GiB segments,
+        # counted in elements. It runs through a whole compile because metadata is
+        # the only place the derivation is observable, and only a compile produces
+        # metadata -- the tool-free lowering the option tests use
+        # (utils.make_ktir_mod) returns the module alone. The rest of what used to
+        # be asserted here -- widths per pointer, the seven-pointer ceiling,
+        # non-pointer arguments, sub-byte rejection -- is asserted directly on
+        # _segment_addresses in backend-options-test.py::TestBaseAddresses, which
+        # needs neither a module nor this tool, so only one test needs to pay for
+        # a compile.
+        #
+        # symbolic_args=False is explicit: symbolic is the default, and nothing is
+        # derived in that mode.
+        src = _source(binary_example)
+        baked = triton_compile(src, target=spyre_target(),
+                               options={**spyrecode_options, "symbolic_args": False})
+        assert tuple(baked.metadata.base_addresses) == (
+            0, 8589934592, 17179869184)
 
     def test_missing_dbo_opt_raises_actionably(self, monkeypatch):
         monkeypatch.setattr(knobs.spyre, "dbo_opt", "definitely-not-on-path")
         with pytest.raises(RuntimeError, match="TRITON_SPYRE_DBO_OPT"):
             resolve_dbo_opt()
 
-    def test_missing_device_file_raises(self, monkeypatch, tmp_path, dbo_opt):
+    def test_missing_device_file_raises(self, monkeypatch, tmp_path, dbo_opt,
+                                       spyrecode_options, binary_example):
         # Through the stage, so the resolver is reached the way a compile reaches
         # it, not just called directly.
         monkeypatch.setattr(knobs.spyre, "device", str(tmp_path / "nope.mlir"))
-        src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
-                        constexprs=dict(_CONSTEXPRS))
+        src = _source(binary_example)
         with pytest.raises(FileNotFoundError, match="TRITON_SPYRE_DEVICE"):
-            triton_compile(src, target=_TARGET, options=_compile_options())
+            triton_compile(src, target=spyre_target(), options=spyrecode_options)
 
     def test_resolve_device_reports_unset_as_no_file(self, monkeypatch):
         # Unset is a real configuration, not a failure: dbo-opt falls back to its
@@ -114,5 +144,3 @@ class TestSpyrecodeStage:
         assert resolve_device(required=False) is None
         with pytest.raises(FileNotFoundError, match="TRITON_SPYRE_DEVICE"):
             resolve_device()
-
-

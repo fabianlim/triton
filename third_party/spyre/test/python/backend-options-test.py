@@ -10,33 +10,35 @@ does. lit still owns discovery, so ``uv run lit`` remains the one entry point.
 
 Nothing here needs ``dbo-opt`` or a device. The tests that do stay in
 ``test_spyrecode_stage.py``.
+
+The kernel these lower comes from the example registry the rest of the suite uses
+(``conftest.EXAMPLES``, discovered from ``test/fixtures/*/meta.py``), and the
+lowering itself is ``utils.compile_to_ttir`` + ``utils.make_ktir_mod`` — the same
+two calls ``KTIRStructuralTester`` makes. There is deliberately no local kernel and
+no local lowering helper.
 """
 
-from backend_utils import *  # noqa: F401,F403  (shared kernels + helpers)
-from backend_utils import (
-    _CONSTEXPRS,
-    _SIGNATURE,
-    _TARGET,
-    _add_kernel_1core,
-    _compile_options,
-    _lower_to_ktir,
-)
-
 import re
+import tempfile
 
 import pytest
-import triton
 from triton import knobs
-from triton.backends.compiler import GPUTarget
-from triton.compiler.compiler import ASTSource
+
+from conftest import EXAMPLES
+from utils import compile_to_ttir, make_ktir_mod, spyre_target
 
 from backend.compiler import (
     SpyreBackend,
     SpyreOptions,
     _segment_addresses,
     infer_base_addresses_from_ptr_types,
-    resolve_dbo_opt,
 )
+
+# The example every lowering below runs on. Its runtime signature is three
+# ``*fp32`` pointers and nothing else — the pointer-argument assertions here care
+# only about the count, and the element widths they would otherwise pin are
+# covered by ``TestBaseAddresses`` on ``_segment_addresses`` directly.
+_EXAMPLE = EXAMPLES["vector_add__2d[M=512]"]
 
 # ---------------------------------------------------------------------------
 # base_addresses — the fixed segment policy
@@ -100,29 +102,29 @@ class TestInferBaseAddresses:
     live in the IR as ``!tt.ptr<f16>``, and the specialized signature they come
     from is already part of the cache key, so deriving late cannot produce a
     wrong key.
+
+    The *value* the derivation produces is asserted in
+    ``test_spyrecode_stage.py::test_derived_addresses_reach_the_artifact``, which
+    reads it off a full compile. ``make_ktir_mod`` returns only the module, so
+    metadata is not observable from here; what is left in this class is everything
+    that reads the IR rather than the metadata.
     """
-
-    def test_derived_addresses_land_in_metadata(self):
-        # metadata is how the derivation reaches the spyrecode stage; nothing on
-        # the launch path is involved.
-        _, metadata = _lower_to_ktir(symbolic_args=False)
-        assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
-
-    def test_scales_with_the_kernels_own_element_type(self):
-        _, metadata = _lower_to_ktir(
-            signature={name: "*fp32" for name in _SIGNATURE},
-            symbolic_args=False)
-        assert metadata["base_addresses"] == (0, 4294967296, 8589934592)
 
     def test_pointee_types_are_gone_after_the_pipeline(self):
         # Why the derivation cannot be deferred to the spyrecode stage:
-        # ConvertFunctions has by then rewritten every !tt.ptr<f16> argument to a
+        # ConvertFunctions has by then rewritten every !tt.ptr<f32> argument to a
         # plain `index`, and the element widths are no longer in the IR.
-        mod, _ = _lower_to_ktir()
+        ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
+                               _EXAMPLE["constexprs"])
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete_on_close=False) as f:
+            f.write(ttir)
+            f.flush()
+            mod = make_ktir_mod(f.name, grid=_EXAMPLE["grid"])
         text = str(mod)
         assert "!tt.ptr" not in text
         entry = next(line for line in text.splitlines() if "func.func" in line)
-        assert entry.count("index") == len(_SIGNATURE), entry
+        assert entry.count("index") == len(_EXAMPLE["signature"]), entry
 
     def test_a_module_without_a_kernel_raises(self, tmp_path):
         # The KTIR module is one such: ConvertFunctions turns the tt.func into a
@@ -131,7 +133,7 @@ class TestInferBaseAddresses:
         from triton._C.libtriton import ir
         context = ir.context()
         ir.load_dialects(context)
-        SpyreBackend(_TARGET).load_dialects(context)
+        SpyreBackend(spyre_target()).load_dialects(context)
         path = tmp_path / "empty.mlir"
         path.write_text("module {}\n")
         mod = ir.parse_mlir_module(str(path), context)
@@ -143,8 +145,15 @@ class TestInferBaseAddresses:
         # Empty metadata means nobody inferred the addresses — a compile entered
         # at the .ktir stage, where the widths are already gone. Say so, rather
         # than emit a binary based at whatever the scheduler defaults to.
-        backend = SpyreBackend(_TARGET)
-        mod, _ = _lower_to_ktir(symbolic_args=False)
+        backend = SpyreBackend(spyre_target())
+        ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
+                               _EXAMPLE["constexprs"])
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete_on_close=False) as f:
+            f.write(ttir)
+            f.flush()
+            mod = make_ktir_mod(f.name, grid=_EXAMPLE["grid"],
+                                symbolic_args=False)
         with pytest.raises(RuntimeError, match="no base addresses were derived"):
             backend._make_spyrecode(mod, {}, backend.parse_options({"symbolic_args": False}))
 
@@ -179,10 +188,19 @@ class TestBaseAddressesOverride:
 
     def test_required_fixes_materializes_at_ktir_time(self):
         # The dft path exactly: name the pass, anchored on the last core pass,
-        # and hand it the DTI addresses.
-        mod, _ = _lower_to_ktir(
-            base_addresses=list(_DTI_ADDRESSES),
-            required_fixes={"materialize_base_addresses": "convert_functions"})
+        # and hand it the DTI addresses. Baked mode is stated explicitly —
+        # supplying base_addresses selects it anyway, but symbolic is the default
+        # now and baked must not be reached by accident.
+        ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
+                               _EXAMPLE["constexprs"])
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete_on_close=False) as f:
+            f.write(ttir)
+            f.flush()
+            mod = make_ktir_mod(
+                f.name, grid=_EXAMPLE["grid"], symbolic_args=False,
+                base_addresses=list(_DTI_ADDRESSES),
+                required_fixes={"materialize_base_addresses": "convert_functions"})
         text = str(mod)
         # A zero-argument entry function is what the dataflow scheduler wants.
         assert "func.func" in text
@@ -190,44 +208,16 @@ class TestBaseAddressesOverride:
         for address in _DTI_ADDRESSES[1:]:
             assert str(address) in text, f"{address} missing from:\n{text}"
 
-    def test_derived_addresses_do_not_overwrite_the_override(self, monkeypatch):
-        # The regression this pins: the override must survive the derivation that
-        # _make_ktir now also does. Stop before dbo-opt — the pass has run by
-        # then, and this needs neither the tool nor a device.
-        import backend.compiler as compiler_module
-
-        class _Stop(Exception):
-            pass
-
-        def _stop(*args, **kwargs):
-            raise _Stop
-        monkeypatch.setattr(compiler_module, "resolve_dbo_opt", _stop)
-
-        backend = SpyreBackend(_TARGET)
-        options = backend.parse_options({"base_addresses": list(_DTI_ADDRESSES)})
-        mod, metadata = _lower_to_ktir(symbolic_args=False)
-        assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
-
-        with pytest.raises(_Stop):
-            backend._make_spyrecode(mod, metadata, options)
-
-        text = str(mod)
-        assert self._materialized_entry(mod).count("index") == 0, text
-        for address in _DTI_ADDRESSES[1:]:
-            assert str(address) in text, f"{address} missing from:\n{text}"
-        # The derived segment-1 address must not have been baked in instead.
-        assert "8589934592" not in text, text
-
     def test_a_list_is_normalized_to_a_tuple(self):
         # SPYRE_OPTIONS arrives as JSON, so the field is handed a list; it has to
         # end up hashable for the option hash and dataclass equality.
-        options = SpyreBackend(_TARGET).parse_options(
+        options = SpyreBackend(spyre_target()).parse_options(
             {"base_addresses": list(_DTI_ADDRESSES)})
         assert options.base_addresses == _DTI_ADDRESSES
         assert isinstance(options.base_addresses, tuple)
 
     def test_the_override_is_in_the_cache_key(self):
-        backend = SpyreBackend(_TARGET)
+        backend = SpyreBackend(spyre_target())
         derived = backend.parse_options({})
         overridden = backend.parse_options({"base_addresses": list(_DTI_ADDRESSES)})
         assert derived.hash() != overridden.hash()
@@ -240,7 +230,7 @@ class TestBaseAddressesOverride:
 class TestCompileTimeLaunchOptions:
 
     def _backend(self):
-        return SpyreBackend(_TARGET)
+        return SpyreBackend(spyre_target())
 
     def test_contributes_the_grid_alone(self):
         # The grid is the one thing that cannot be recovered later. Anything
@@ -282,7 +272,7 @@ class TestCompileTimeLaunchOptions:
 class TestBackendHash:
 
     def test_folds_dbo_opt_and_device(self):
-        h = SpyreBackend(_TARGET).hash()
+        h = SpyreBackend(spyre_target()).hash()
         assert h.startswith("spyre-1-")
         assert "dbo_opt-" in h and "device-" in h
 
@@ -290,28 +280,28 @@ class TestBackendHash:
         # No device file named means dbo-opt picks its own default; there is no
         # digest to fold, so the key says so rather than hashing "".
         monkeypatch.setattr(knobs.spyre, "device", None)
-        assert "device-dbo_opt_default" in SpyreBackend(_TARGET).hash()
+        assert "device-dbo_opt_default" in SpyreBackend(spyre_target()).hash()
 
     def test_named_device_changes_the_key(self, monkeypatch, tmp_path):
         device = tmp_path / "device.mlir"
         device.write_text("module {}\n")
         monkeypatch.setattr(knobs.spyre, "device", str(device))
-        with_file = SpyreBackend(_TARGET).hash()
+        with_file = SpyreBackend(spyre_target()).hash()
         device.write_text("module { /* different */ }\n")
-        assert SpyreBackend(_TARGET).hash() != with_file
+        assert SpyreBackend(spyre_target()).hash() != with_file
 
     def test_repointing_dbo_opt_changes_the_key(self, monkeypatch, tmp_path):
-        before = SpyreBackend(_TARGET).hash()
+        before = SpyreBackend(spyre_target()).hash()
         fake = tmp_path / "dbo-opt"
         fake.write_bytes(b"not really dbo-opt")
         monkeypatch.setattr(knobs.spyre, "dbo_opt", str(fake))
-        assert SpyreBackend(_TARGET).hash() != before
+        assert SpyreBackend(spyre_target()).hash() != before
 
     def test_missing_dbo_opt_hashes_instead_of_raising(self, monkeypatch):
         # hash() runs on every compile, including KTIR-only work that never
         # invokes the tool, so a missing tool must not raise here.
         monkeypatch.setattr(knobs.spyre, "dbo_opt", "definitely-not-on-path")
-        assert "dbo_opt-missing-" in SpyreBackend(_TARGET).hash()
+        assert "dbo_opt-missing-" in SpyreBackend(spyre_target()).hash()
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +326,7 @@ class TestSymbolicArgs:
     def test_defaults_to_symbolic(self, monkeypatch):
         # Unset must mean symbolic, matching what torch_spyre setdefaults it to.
         monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
-        assert SpyreBackend(_TARGET).parse_options({}).symbolic_args is True
+        assert SpyreBackend(spyre_target()).parse_options({}).symbolic_args is True
 
     @pytest.mark.parametrize("env, expected", [
         # Polarity follows torch-spyre's prepare_kernel.cpp, where
@@ -349,16 +339,16 @@ class TestSymbolicArgs:
     ])
     def test_env_var_sets_the_default(self, monkeypatch, env, expected):
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", env)
-        options = SpyreBackend(_TARGET).parse_options({})
+        options = SpyreBackend(spyre_target()).parse_options({})
         assert options.symbolic_args is expected
 
     def test_explicit_option_wins_over_the_env(self, monkeypatch):
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        options = SpyreBackend(_TARGET).parse_options({"symbolic_args": False})
+        options = SpyreBackend(spyre_target()).parse_options({"symbolic_args": False})
         assert options.symbolic_args is False
 
     def test_participates_in_the_cache_key(self):
-        backend = SpyreBackend(_TARGET)
+        backend = SpyreBackend(spyre_target())
         bound = backend.parse_options({"symbolic_args": False})
         symbolic = backend.parse_options({"symbolic_args": True})
         # It changes the emitted artifact, so the two must not share a key.
@@ -369,7 +359,7 @@ class TestSymbolicArgs:
         # pass-install time: a compile under one value must not be served from the
         # cache under the other. Unset already means symbolic, so "0" is the value
         # that has to move the key.
-        backend = SpyreBackend(_TARGET)
+        backend = SpyreBackend(spyre_target())
         monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
         default = backend.parse_options({}).hash()
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "0")
@@ -379,7 +369,13 @@ class TestSymbolicArgs:
         # The observable difference at this stage: the pointer arguments survive.
         # Baking replaces them with constants and drops them from the signature.
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        mod, _ = _lower_to_ktir()
+        ttir = compile_to_ttir(_EXAMPLE["kernel_fn"], _EXAMPLE["signature"],
+                               _EXAMPLE["constexprs"])
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".mlir", delete_on_close=False) as f:
+            f.write(ttir)
+            f.flush()
+            mod = make_ktir_mod(f.name, grid=_EXAMPLE["grid"])
         text = str(mod)
         assert re.search(r"func\.func @\w+\(%arg0: index", text), text[:400]
 
@@ -387,16 +383,8 @@ class TestSymbolicArgs:
         # Honouring one and dropping the other would silently pick a mode the
         # caller did not ask for.
         with pytest.raises(ValueError, match="mutually exclusive"):
-            SpyreBackend(_TARGET).parse_options(
+            SpyreBackend(spyre_target()).parse_options(
                 {"symbolic_args": True, "base_addresses": [0, 262144]})
-
-    def test_no_addresses_are_inferred_in_symbolic_mode(self, monkeypatch):
-        # Nothing needs them in this mode, and deriving them anyway could fail on
-        # a pointer width for a kernel that compiles perfectly well symbolically.
-        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        _, metadata = _lower_to_ktir()
-        assert "base_addresses" not in metadata
-
 
 
 class TestSpyreOptionsFictions:
@@ -411,6 +399,11 @@ class TestSpyreOptionsFictions:
         fields = set(SpyreOptions.__dataclass_fields__)
         assert "num_warps" not in fields
         assert "shared" not in fields
+        # Their being reported by _make_spyrecode alone, and not by the ttir+ktir
+        # stages, is no longer asserted: it needs the metadata dict those stages
+        # populate, and the framework's lowering (utils.make_ktir_mod) returns the
+        # module only. The reason it matters is still recorded on SpyreOptions,
+        # next to the two fields.
 
     def test_num_warps_at_a_call_site_is_rejected(self):
         # Spyre has no warps, and nothing in the pipeline reads this. Refusing it
@@ -420,21 +413,11 @@ class TestSpyreOptionsFictions:
         with pytest.raises(TypeError, match="num_warps"):
             SpyreOptions(num_warps=4)
 
-    def test_only_the_terminal_stage_reports_them(self):
-        # Reported by _make_spyrecode, not by an earlier stage: a compile can
-        # start partway down (an IRSource of a .ttir skips _make_ttir, one of a
-        # .ktir skips _make_ktir too), and metadata without them means an
-        # AttributeError inside _init_handles at the first launch. So the ttir+ktir
-        # stages alone must NOT be what supplies them.
-        _, metadata = _lower_to_ktir(**_compile_options())
-        assert "num_warps" not in metadata
-        assert "shared" not in metadata
-
     def test_the_default_instrumentation_mode_is_tolerated(self):
         # JITFunction.run injects this into kwargs unconditionally, and
         # _pack_args rejects launch kwargs absent from the parsed options, so the
         # field has to exist and the empty default has to pass.
-        options = SpyreBackend(_TARGET).parse_options({"instrumentation_mode": ""})
+        options = SpyreBackend(spyre_target()).parse_options({"instrumentation_mode": ""})
         assert options.instrumentation_mode == ""
         assert "instrumentation_mode" in options.__dict__
 
@@ -443,12 +426,12 @@ class TestSpyreOptionsFictions:
         # instrumentation is running. Nothing on Spyre honours it, so accepting it
         # is a silent wrong answer rather than a harmless no-op.
         with pytest.raises(ValueError, match="instrumentation_mode"):
-            SpyreBackend(_TARGET).parse_options({"instrumentation_mode": "profile"})
+            SpyreBackend(spyre_target()).parse_options({"instrumentation_mode": "profile"})
 
     def test_the_env_knob_is_reported_not_ignored(self, monkeypatch):
         # The realistic route in: TRITON_INSTRUMENTATION_MODE feeds
         # knobs.compilation.instrumentation_mode, which run() injects every launch.
         monkeypatch.setattr(knobs.compilation, "instrumentation_mode", "profile")
         with pytest.raises(ValueError, match="TRITON_INSTRUMENTATION_MODE"):
-            SpyreBackend(_TARGET).parse_options(
+            SpyreBackend(spyre_target()).parse_options(
                 {"instrumentation_mode": knobs.compilation.instrumentation_mode})
