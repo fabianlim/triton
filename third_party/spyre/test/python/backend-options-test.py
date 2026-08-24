@@ -12,8 +12,8 @@ Nothing here needs ``dbo-opt`` or a device. The tests that do stay in
 ``test_spyrecode_stage.py``.
 """
 
-from spyre_backend_fixtures import *  # noqa: F401,F403  (shared kernels + helpers)
-from spyre_backend_fixtures import (
+from backend_utils import *  # noqa: F401,F403  (shared kernels + helpers)
+from backend_utils import (
     _CONSTEXPRS,
     _SIGNATURE,
     _TARGET,
@@ -21,6 +21,8 @@ from spyre_backend_fixtures import (
     _compile_options,
     _lower_to_ktir,
 )
+
+import re
 
 import pytest
 import triton
@@ -103,12 +105,13 @@ class TestInferBaseAddresses:
     def test_derived_addresses_land_in_metadata(self):
         # metadata is how the derivation reaches the spyrecode stage; nothing on
         # the launch path is involved.
-        _, metadata = _lower_to_ktir()
+        _, metadata = _lower_to_ktir(symbolic_args=False)
         assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
 
     def test_scales_with_the_kernels_own_element_type(self):
         _, metadata = _lower_to_ktir(
-            signature={name: "*fp32" for name in _SIGNATURE})
+            signature={name: "*fp32" for name in _SIGNATURE},
+            symbolic_args=False)
         assert metadata["base_addresses"] == (0, 4294967296, 8589934592)
 
     def test_pointee_types_are_gone_after_the_pipeline(self):
@@ -141,9 +144,9 @@ class TestInferBaseAddresses:
         # at the .ktir stage, where the widths are already gone. Say so, rather
         # than emit a binary based at whatever the scheduler defaults to.
         backend = SpyreBackend(_TARGET)
-        mod, _ = _lower_to_ktir()
+        mod, _ = _lower_to_ktir(symbolic_args=False)
         with pytest.raises(RuntimeError, match="no base addresses were derived"):
-            backend._make_spyrecode(mod, {}, backend.parse_options({}))
+            backend._make_spyrecode(mod, {}, backend.parse_options({"symbolic_args": False}))
 
     def test_the_count_alone_does_not_determine_the_addresses(self):
         # Guards the function's name as much as its behaviour: same number of
@@ -202,7 +205,7 @@ class TestBaseAddressesOverride:
 
         backend = SpyreBackend(_TARGET)
         options = backend.parse_options({"base_addresses": list(_DTI_ADDRESSES)})
-        mod, metadata = _lower_to_ktir()
+        mod, metadata = _lower_to_ktir(symbolic_args=False)
         assert metadata["base_addresses"] == (0, 8589934592, 17179869184)
 
         with pytest.raises(_Stop):
@@ -318,15 +321,22 @@ class TestBackendHash:
 class TestSymbolicArgs:
     """The argument-passing mode, as an explicit compile option.
 
-    ``symbolic_args=False`` bakes the fixed HBM base addresses in and lets
-    torch-spyre bind the buffers positionally from the tensor list;
-    ``symbolic_args=True`` would leave them symbolic for a runtime that patches
-    them through the correction table, which nothing here emits yet.
+    ``symbolic_args=True`` -- the default -- leaves the pointer arguments alone;
+    dbo-opt records a correction table and the runtime patches the real addresses
+    in at launch. ``symbolic_args=False`` bakes the fixed HBM base addresses in
+    instead, and torch-spyre then binds the buffers positionally from the tensor
+    list.
+
+    The default is True because that is what torch-spyre does: importing it runs
+    ``os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")``, so a launching process
+    has it set and prepare_kernel does not bind from the tensor list. Compiling
+    baked by default would emit addresses nobody binds and nobody corrects.
     """
 
-    def test_defaults_to_false(self, monkeypatch):
+    def test_defaults_to_symbolic(self, monkeypatch):
+        # Unset must mean symbolic, matching what torch_spyre setdefaults it to.
         monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
-        assert SpyreBackend(_TARGET).parse_options({}).symbolic_args is False
+        assert SpyreBackend(_TARGET).parse_options({}).symbolic_args is True
 
     @pytest.mark.parametrize("env, expected", [
         # Polarity follows torch-spyre's prepare_kernel.cpp, where
@@ -356,25 +366,22 @@ class TestSymbolicArgs:
 
     def test_the_env_var_reaches_the_key_too(self, monkeypatch):
         # The point of reading the env in parse_options rather than at
-        # pass-install time: a compile under one value must not be served from
-        # the cache under the other.
+        # pass-install time: a compile under one value must not be served from the
+        # cache under the other. Unset already means symbolic, so "0" is the value
+        # that has to move the key.
         backend = SpyreBackend(_TARGET)
         monkeypatch.delenv("BUNDLE_SYMBOLIC_ARGS", raising=False)
-        unset = backend.parse_options({}).hash()
-        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        assert backend.parse_options({}).hash() != unset
+        default = backend.parse_options({}).hash()
+        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "0")
+        assert backend.parse_options({}).hash() != default
 
-    def test_symbolic_mode_raises_rather_than_skipping(self, monkeypatch):
-        # Skipping MaterializeBaseAddresses alone would leave the entry function
-        # taking `index` pointer arguments, which the scheduler rejects deep
-        # inside dbo-opt with an operand-type error. Fail here instead, and
-        # without needing dbo-opt at all.
+    def test_symbolic_mode_installs_no_baking_pass(self, monkeypatch):
+        # The observable difference at this stage: the pointer arguments survive.
+        # Baking replaces them with constants and drops them from the signature.
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
-                        constexprs=dict(_CONSTEXPRS))
-        with pytest.raises(NotImplementedError,
-                           match="BUNDLE_SYMBOLIC_ARGS=1"):
-            triton_compile(src, target=_TARGET, options=_compile_options())
+        mod, _ = _lower_to_ktir()
+        text = str(mod)
+        assert re.search(r"func\.func @\w+\(%arg0: index", text), text[:400]
 
     def test_mutually_exclusive_with_base_addresses(self):
         # Honouring one and dropping the other would silently pick a mode the
@@ -384,21 +391,12 @@ class TestSymbolicArgs:
                 {"symbolic_args": True, "base_addresses": [0, 262144]})
 
     def test_no_addresses_are_inferred_in_symbolic_mode(self, monkeypatch):
-        # Inferring them anyway would surface a pointer-width or pointer-count
-        # complaint instead of the NotImplementedError the caller is about to get.
+        # Nothing needs them in this mode, and deriving them anyway could fail on
+        # a pointer width for a kernel that compiles perfectly well symbolically.
         monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
         _, metadata = _lower_to_ktir()
         assert "base_addresses" not in metadata
 
-    def test_symbolic_mode_reports_itself_not_a_width_problem(self, monkeypatch):
-        # The ordering that guard buys: a kernel whose pointee type has no usable
-        # width must still report the mode, not the width.
-        monkeypatch.setenv("BUNDLE_SYMBOLIC_ARGS", "1")
-        backend = SpyreBackend(_TARGET)
-        options = backend.parse_options({})
-        mod, metadata = _lower_to_ktir(symbolic_args=True)
-        with pytest.raises(NotImplementedError):
-            backend._make_spyrecode(mod, metadata, options)
 
 
 class TestSpyreOptionsFictions:

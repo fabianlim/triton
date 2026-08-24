@@ -13,8 +13,8 @@ process or from the environment via their ``TRITON_SPYRE_*`` names; the tests do
 not read the environment either.
 """
 
-from spyre_backend_fixtures import *  # noqa: F401,F403  (shared kernels + helpers)
-from spyre_backend_fixtures import (
+from backend_utils import *  # noqa: F401,F403  (shared kernels + helpers)
+from backend_utils import (
     _CONSTEXPRS,
     _SIGNATURE,
     _TARGET,
@@ -29,7 +29,7 @@ import pytest
 from triton import knobs
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 
-from backend.compiler import SpyreBackend, resolve_dbo_opt
+from backend.compiler import SpyreBackend, resolve_dbo_opt, resolve_device
 
 class TestSpyrecodeStage:
 
@@ -84,10 +84,35 @@ class TestSpyrecodeStage:
             resolve_dbo_opt()
 
     def test_missing_device_file_raises(self, monkeypatch, tmp_path, dbo_opt):
+        # Through the stage, so the resolver is reached the way a compile reaches
+        # it, not just called directly.
         monkeypatch.setattr(knobs.spyre, "device", str(tmp_path / "nope.mlir"))
         src = ASTSource(fn=_add_kernel_1core, signature=dict(_SIGNATURE),
                         constexprs=dict(_CONSTEXPRS))
         with pytest.raises(FileNotFoundError, match="TRITON_SPYRE_DEVICE"):
             triton_compile(src, target=_TARGET, options=_compile_options())
+
+    def test_resolve_device_reports_unset_as_no_file(self, monkeypatch):
+        # Unset is a real configuration, not a failure: dbo-opt falls back to its
+        # own default. The resolver has to say "no file" rather than raise, or a
+        # compile with the knob unset could never run.
+        monkeypatch.setattr(knobs.spyre, "device", None)
+        assert resolve_device() is None
+        assert resolve_device(required=False) is None
+
+    def test_resolve_device_returns_an_absolute_path(self, monkeypatch, tmp_path):
+        f = tmp_path / "dev.mlir"
+        f.write_text("// device")
+        monkeypatch.setattr(knobs.spyre, "device", str(f))
+        assert resolve_device() == str(f.resolve())
+
+    def test_resolve_device_tolerates_a_missing_file_when_not_required(
+            self, monkeypatch, tmp_path):
+        # What SpyreBackend.hash() needs: describing the setting must not raise,
+        # because a cache key has to exist even for a misconfigured device.
+        monkeypatch.setattr(knobs.spyre, "device", str(tmp_path / "nope.mlir"))
+        assert resolve_device(required=False) is None
+        with pytest.raises(FileNotFoundError, match="TRITON_SPYRE_DEVICE"):
+            resolve_device()
 
 

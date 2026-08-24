@@ -37,6 +37,35 @@ def resolve_dbo_opt(required: bool = True) -> Optional[str]:
     return os.path.realpath(path)
 
 
+def resolve_device(required: bool = True) -> Optional[str]:
+    """Absolute path to the device description named by ``knobs.spyre.device``.
+
+    Returns ``None`` when the knob is unset, which is a legitimate configuration
+    and not an error: dbo-opt then falls back to its own default device under
+    ``$DEEPTOOLS_PATH``. A knob pointing at a file that does not exist *is* an
+    error, and gets an actionable one -- unless ``required`` is False, which lets a
+    caller that only needs to describe the setting (rather than read the file)
+    proceed.
+
+    The counterpart of :func:`resolve_dbo_opt`, and for the same reason: these two
+    settings are what a caller has to get right together, so turning each knob into
+    a usable value belongs in one place that the stage and the tests can share.
+    """
+    device = knobs.spyre.device
+    if not device:
+        return None
+    path = Path(device)
+    if not path.is_file():
+        if not required:
+            return None
+        raise FileNotFoundError(
+            f"knobs.spyre.device / TRITON_SPYRE_DEVICE points at {device!r}, "
+            "which does not exist. Leave it unset to let dbo-opt use its own "
+            "default device under $DEEPTOOLS_PATH."
+        )
+    return str(path.resolve())
+
+
 # Pointer argument i is based at i * 16 GiB, matching the assignment
 # torch-spyre's Inductor path makes, so the two producers of a Spyre binary agree
 # by construction. Segment 7 holds the program, which is why only 7 pointers fit.
@@ -318,6 +347,10 @@ class SpyreBackend(BaseBackend):
         default under ``$DEEPTOOLS_PATH``. In that case there is no file to
         digest, so we say so instead of hashing an empty string as though it
         were a device — a real device file must never collide with "default".
+
+        Reads the knob directly rather than going through :func:`resolve_device`,
+        which cannot serve this: the resolver returns one value for both "unset"
+        and "set but missing", and those two have to key differently here.
         """
         device = knobs.spyre.device
         if not device:
@@ -354,12 +387,27 @@ class SpyreBackend(BaseBackend):
         # and declaring it as a Triton knob would have Triton publishing another
         # project's contract as though it were stable and ours to define.
         #
+        # This expression is copied from torch_spyre/_inductor/config.py, and the
+        # default of "1" is the load-bearing part: importing torch_spyre does
+        # `os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")`, so any process that
+        # launches has it set, and prepare_kernel.cpp then does NOT bind addresses
+        # from the tensor list. Defaulting the compile to baked instead would emit
+        # addresses nobody corrects and nobody binds -- wrong data, no diagnostic.
+        #
         # `== "1"` and not a truthy test, because that is torch-spyre's own rule
         # (prepare_kernel.cpp: bind_io_addresses_ = env != "1"). Accepting
-        # "true"/"on" here would compile symbolically while torch-spyre bound the
-        # addresses -- a compile/launch disagreement with no diagnostic.
+        # "true"/"on" here would disagree with the runtime in the other direction.
         parsed.setdefault("symbolic_args",
-                          os.environ.get("BUNDLE_SYMBOLIC_ARGS") == "1")
+                          os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1")
+
+        # Supplying base_addresses selects the baked mode. They only mean anything
+        # there, and with symbolic the default, a caller that passes addresses and
+        # nothing else would otherwise trip the mutual-exclusion check against a
+        # mode it never asked for -- dataflow-test-framework's `dft triton-lower`
+        # passes exactly that. An EXPLICIT symbolic_args=True alongside them is
+        # still a contradiction, and __post_init__ still refuses it.
+        if parsed.get("base_addresses") and "symbolic_args" not in options:
+            parsed["symbolic_args"] = False
         return SpyreOptions(**parsed)
 
     def compile_time_launch_options(self, grid, specialization) -> dict:
@@ -580,30 +628,17 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes, spyre
 
         if options.symbolic_args:
-            # Deliberately a raise, not a skip. Skipping MaterializeBaseAddresses
-            # leaves the entry function taking `index` pointer arguments, which
-            # the scheduler rejects deep inside dbo-opt with an operand-type
-            # error rather than anything a caller could act on. Making the mode
-            # work needs a pass that emits the symbols plus a populated
-            # correction table, neither of which exists yet; when they land, this
-            # becomes the second install branch right here.
-            raise NotImplementedError(
-                "symbolic_args=True (BUNDLE_SYMBOLIC_ARGS=1) is not supported "
-                "by the Triton Spyre backend: nothing here emits the argument "
-                "symbols or the correction table a runtime would patch, and an "
-                "entry function whose pointer arguments survive as `index` is "
-                "rejected by the dataflow scheduler inside dbo-opt. Leave "
-                "BUNDLE_SYMBOLIC_ARGS unset (or \"0\") so the fixed HBM base "
-                "addresses are baked in and torch-spyre binds the buffers "
-                "positionally from the tensor list."
-            )
-
+            # Symbolic mode: leave the pointer arguments alone. The addresses are
+            # not known at compile time -- dbo-opt records a correction table in
+            # the artifact and the runtime patches the real ones in at launch.
+            # Nothing to install, so fall straight through to dbo-opt.
+            pass
         # required_fixes may have installed MaterializeBaseAddresses already, at
         # the anchor the caller chose, in which case the pointer arguments are
         # gone. Installing it a second time would hand the pass more addresses
         # than there are `index` arguments left to put them in, and it fails on
         # exactly that (MaterializeBaseAddresses.cpp, step 2a).
-        if "materialize_base_addresses" not in options.required_fixes:
+        elif "materialize_base_addresses" not in options.required_fixes:
             # options.base_addresses is an override; without one, use the fixed
             # policy _make_ktir derived from the TTIR pointer types.
             base_addresses = options.base_addresses or metadata.get("base_addresses")
@@ -627,13 +662,7 @@ class SpyreBackend(BaseBackend):
             pm.run(mod, "make_spyrecode")
 
         dbo_opt = resolve_dbo_opt()
-        device = knobs.spyre.device
-        if device and not Path(device).is_file():
-            raise FileNotFoundError(
-                f"knobs.spyre.device / TRITON_SPYRE_DEVICE points at {device!r}, "
-                "which does not exist. Leave it unset to let dbo-opt use its "
-                "own default device under $DEEPTOOLS_PATH."
-            )
+        device = resolve_device()
 
         with tempfile.TemporaryDirectory(prefix="spyrecode_") as tmp:
             tmp = Path(tmp)

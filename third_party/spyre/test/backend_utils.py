@@ -1,10 +1,15 @@
-"""Shared fixtures for the Spyre backend tests.
+"""Shared setup for the Spyre backend tests. Contains no tests itself.
 
-Imported by both the pytest suite (``test_spyrecode_stage.py``) and the
-python-driven lit tests under ``test/python/``, so the kernels, the signature and
-the ttir+ktir lowering helper exist once rather than twice. Not itself a test
-module: lit only collects ``.py`` under ``test/python/``, and pytest only collects
-``test_*.py``, so neither picks this up.
+The kernel, its signature and constexprs, the ttir+ktir lowering helper, and the
+three pytest fixtures -- imported by both ``test_spyrecode_stage.py`` (pytest) and
+``python/backend-options-test.py`` (lit), so they exist once rather than twice.
+
+Named ``*_utils`` to match ``utils.py`` / ``utils_pattern.py``, and deliberately
+not ``*_fixtures``: ``test/fixtures/`` already means the kernel *examples*
+(vector_add, softmax, matmul, gather), which is a different thing entirely.
+
+Collected by neither runner: pytest takes ``test_*.py`` and lit takes ``.py`` only
+under ``test/python/``.
 """
 
 import hashlib
@@ -24,6 +29,7 @@ from backend.compiler import (
     _segment_addresses,
     infer_base_addresses_from_ptr_types,
     resolve_dbo_opt,
+    resolve_device,
 )
 
 _TARGET = GPUTarget(backend="spyre", arch=1, warp_size=1)
@@ -99,12 +105,27 @@ def _lower_to_ktir(signature=None, **options):
 
 @pytest.fixture(scope="module")
 def dbo_opt():
-    """Resolved dbo-opt path, or skip the test."""
+    """Resolved dbo-opt path, or skip the test.
+
+    Uses the backend's own resolver rather than repeating how a knob becomes a
+    path, so a test skips for exactly the reason a compile would fail.
+    """
     path = resolve_dbo_opt(required=False)
     if path is None:
         pytest.skip(f"dbo-opt not resolvable from knobs.spyre.dbo_opt="
                     f"{knobs.spyre.dbo_opt!r}")
     return path
+
+
+@pytest.fixture(scope="module")
+def device():
+    """Resolved device description, or None to let dbo-opt use its default.
+
+    The counterpart of the dbo_opt fixture, through resolve_device for the same
+    reason. Unset is legitimate and not a skip; a knob pointing at a file that is
+    not there is the caller's mistake and should surface as one.
+    """
+    return resolve_device(required=False)
 
 
 @pytest.fixture(scope="module")
