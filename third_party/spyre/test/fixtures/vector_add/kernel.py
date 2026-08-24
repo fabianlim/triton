@@ -14,6 +14,10 @@ Multi-axis grid kernels — each axis of the grid maps to one tensor
 - :func:`add_kernel_2d_grid` — 2D grid: pid_0 → M-tile, pid_1 → N-tile
 - :func:`add_kernel_3d_grid` — 3D grid: pid_0 → M-tile, pid_1 → N-tile,
                                          pid_2 → P-tile
+
+No-grid kernel — one tile, no distribution loop at all:
+- :func:`add_kernel_1core` — 2D, single tile; the only variant here that
+  dbo-opt can lower all the way to a binary.
 """
 
 import triton
@@ -273,3 +277,39 @@ def add_kernel_3d_grid(
                 x = x_desc.load([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P])
                 y = y_desc.load([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P])
                 out_desc.store([m * BLOCK_M, n * BLOCK_N, p * BLOCK_P], x + y)
+
+
+@triton.jit
+def add_kernel_1core(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """2D elementwise add over exactly one tile, with no distribution loop.
+
+    The odd one out in this file: no ``tl.program_id``, no ``tl.num_programs``,
+    no loop -- one ``BLOCK_M x BLOCK_N`` tile that is the whole tensor. Every
+    other kernel here carves work across the grid with an ``scf.for`` over the
+    program id, and dbo-opt rejects the loop it outlines from that, so this is
+    the only variant in the suite that reaches a Spyre *binary* rather than
+    stopping at KTIR.
+
+    Elementwise on purpose: a reduction would additionally need the
+    DropReductionInitFill fix pass.
+    """
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    y_desc = tl.make_tensor_descriptor(
+        y_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    x = x_desc.load([0, 0])
+    y = y_desc.load([0, 0])
+    out_desc.store([0, 0], x + y)
