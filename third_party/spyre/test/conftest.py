@@ -713,3 +713,76 @@ class SinglePassTester(StructuralAssertions):
         self.ops = walk_module(self.mod)
         self._def_map = None
         return self.ops
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for the spyrecode stage (a compiled Spyre binary)
+# ---------------------------------------------------------------------------
+
+#: Variants that reach a Spyre *binary*, not just KTIR -- declared per variant in
+#: meta.py as ``compiles_to_binary``, the same way ``parallel`` is. Most kernels
+#: distribute tiles with an scf.for over the program id and dbo-opt refuses the
+#: loop it outlines from that, so today exactly one qualifies. The fixtures below
+#: parametrize over whatever is declared, so adding a second extends the
+#: spyrecode-stage coverage with no change here.
+COMPILES_TO_BINARY = sorted(
+    k for k, v in EXAMPLES.items() if v.get("compiles_to_binary"))
+
+
+@pytest.fixture(scope="module")
+def dbo_opt():
+    """Resolved dbo-opt path, or skip.
+
+    Through the backend's own resolver rather than repeating how a knob becomes a
+    path, so a test skips for exactly the reason a compile would fail. Existence
+    only: a tool too old to consume the IR this backend emits should fail loudly
+    with its own diagnostic, not vanish into a skip.
+    """
+    from backend.compiler import resolve_dbo_opt
+    from triton import knobs
+    path = resolve_dbo_opt(required=False)
+    if path is None:
+        pytest.skip(f"dbo-opt not resolvable from knobs.spyre.dbo_opt="
+                    f"{knobs.spyre.dbo_opt!r}")
+    return path
+
+
+@pytest.fixture(scope="module", params=COMPILES_TO_BINARY)
+def binary_example(request):
+    """One variant key per compilable fixture. Parametrized, so this scales."""
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def spyrecode_options(binary_example):
+    """Compile options for the variant under test.
+
+    The two fixes are required, not optional: the scheduler inside dbo-opt wants
+    the compute to be a ``linalg`` op whose ``outs`` is a fresh ``tensor.empty``.
+    Tensor-level ``arith`` leaves the memref as ``strided<..., offset: ?>`` and
+    dbo-opt rejects the ``ktdp.load`` operand; an aliased ``outs`` fails later the
+    same way. Both must anchor on a *core* pass -- ``_make_ktir`` silently ignores
+    any other anchor -- and dict order decides which runs first, so
+    unalias_linalg_outs is second.
+    """
+    entry = EXAMPLES[binary_example]
+    return {
+        "grid": tuple(entry["grid"]),
+        "required_fixes": {
+            "convert_elementwise_to_linalg": "lower_compute_ops",
+            "unalias_linalg_outs": "lower_compute_ops",
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def compiled(dbo_opt, spyrecode_options, binary_example):
+    """A compilable variant taken through every stage, including spyrecode."""
+    from triton.compiler.compiler import ASTSource, compile as triton_compile
+    from utils import spyre_target
+    entry = EXAMPLES[binary_example]
+    constexprs = {k: v[0] for k, v in entry["params"].items()
+                  if k in entry["constexpr"]}
+    src = ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
+                    constexprs=constexprs)
+    return triton_compile(src, target=spyre_target(), options=spyrecode_options)
