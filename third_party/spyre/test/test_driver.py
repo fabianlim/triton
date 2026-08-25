@@ -251,12 +251,12 @@ class TestSubscriptLaunch:
 
     def test_reaches_the_launcher_not_an_attribute_error(self, dbo_opt,
                                                         spyrecode_options,
-                                                        binary_example):
+                                                        compilable_example):
         # Kernel, constexprs and fixes all come from the fixture registry via
         # conftest, so there is one definition of "the kernel that reaches a
         # binary" and this test follows it. Taking ``dbo_opt`` is what skips when
         # the tool is absent -- the fixture does it, so no hand-rolled check here.
-        entry = EXAMPLES[binary_example]
+        entry = EXAMPLES[compilable_example]
         constexprs = {k: v[0] for k, v in entry["params"].items()
                       if k in entry["constexpr"]}
         pointers = [n for n in entry["signature"] if n.endswith("_ptr")]
