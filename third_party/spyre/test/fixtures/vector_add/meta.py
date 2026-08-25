@@ -160,18 +160,13 @@ _SIG_2D_LAYOUT = {
 _SIG_2D_FP16 = {**_SIG_2D, "x_ptr": "*fp16", "y_ptr": "*fp16",
                 "output_ptr": "*fp16"}
 
-_SIG_2D_SPYRE = {
-    "x_ptr":      "*fp16",
-    "y_ptr":      "*fp16",
-    "output_ptr": "*fp16",
-    "M":          "i32",
-    "N":          "i32",
-    "BLOCK_M":    "i32",
-    "BLOCK_N":    "i32",
-    "X_LAYOUT":   "constexpr",
-    "Y_LAYOUT":   "constexpr",
-    "OUT_LAYOUT": "constexpr",
-}
+# The layout signature in fp16 -- the union of the two above, which is all it has
+# ever been. Spelled as a merge so a change to the shape arguments or the layout
+# constexprs reaches it, instead of leaving it silently behind. The pointer
+# overrides come last but the key order is _SIG_2D_LAYOUT's, since re-assigning an
+# existing key keeps its position, and for a signature that order is the argument
+# order.
+_SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_2D_FP16}
 
 
 _S2 = functools.partial(sticksize, _SIG_2D_SPYRE)
