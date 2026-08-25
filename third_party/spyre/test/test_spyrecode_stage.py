@@ -89,18 +89,18 @@ class TestStageThroughARealCompile:
     the first compile used. The conftest fixtures are a chain, not a checklist --
     each depends on the one above, so asking for a later one brings the earlier:
 
-    ===================== ===============================================
-    ``binary_example``    the variant key; ``params=COMPILES_TO_BINARY``, so
-                          requesting it, directly or not, is what parametrizes
-    ``spyrecode_options`` compile options for that variant. Pure data -- it
-                          never skips
-    ``dbo_opt``           the resolved tool path, or ``pytest.skip``. This, and
-                          only this, is what makes a test skip
-    ``binary_source``     an ASTSource for the variant, not yet compiled
-    ``compiled``          that source through every stage, symbolic addresses
-    ``compiled_baked``    the same, with addresses baked in -- the non-default
-                          mode, where the backend derives them
-    ===================== ===============================================
+    ======================= =============================================
+    ``compilable_example``  the variant key; ``params=COMPILES_TO_BINARY``,
+                            so requesting it, directly or not, parametrizes
+    ``spyrecode_options``   compile options for that variant. Pure data --
+                            it never skips
+    ``dbo_opt``             the resolved tool path, or ``pytest.skip``. This,
+                            and only this, is what makes a test skip
+    ``binary_source``       an ASTSource for the variant, not yet compiled
+    ``compiled``            that source through every stage, symbolic
+    ``compiled_baked``      the same, with addresses baked in -- the
+                            non-default mode, where the backend derives them
+    ======================= =============================================
 
     So ``compiled`` or ``compiled_baked`` alone is already both parametrized and
     gated: one input, not three. Ask for nothing the body does not use.
@@ -113,7 +113,7 @@ class TestStageThroughARealCompile:
 
     Subsets are safe, with one trap. Because these are module-scoped and pytest
     caches each per parameter, a partial request can never hand back a different
-    variant than its siblings -- there is one ``binary_example`` value per run
+    variant than its siblings -- there is one ``compilable_example`` value per run
     either way. The trap is taking ``spyrecode_options`` (or ``binary_source``) and
     compiling *without* ``dbo_opt``: parametrized but not gated, so where no tool
     exists it fails instead of skipping. Anything that compiles takes ``dbo_opt``,

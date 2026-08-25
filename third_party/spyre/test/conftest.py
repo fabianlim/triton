@@ -748,13 +748,13 @@ def dbo_opt():
 
 
 @pytest.fixture(scope="module", params=COMPILES_TO_BINARY)
-def binary_example(request):
+def compilable_example(request):
     """One variant key per compilable fixture. Parametrized, so this scales."""
     return request.param
 
 
 @pytest.fixture(scope="module")
-def spyrecode_options(binary_example):
+def spyrecode_options(compilable_example):
     """Compile options for the variant under test.
 
     The two fixes are required, not optional: the scheduler inside dbo-opt wants
@@ -765,7 +765,7 @@ def spyrecode_options(binary_example):
     any other anchor -- and dict order decides which runs first, so
     unalias_linalg_outs is second.
     """
-    entry = EXAMPLES[binary_example]
+    entry = EXAMPLES[compilable_example]
     return {
         "grid": tuple(entry["grid"]),
         "required_fixes": {
@@ -776,7 +776,7 @@ def spyrecode_options(binary_example):
 
 
 @pytest.fixture(scope="module")
-def binary_source(binary_example):
+def binary_source(compilable_example):
     """An ASTSource for the variant under test.
 
     Separate from ``compiled`` so that a test needing the compile to *fail* has
@@ -784,7 +784,7 @@ def binary_source(binary_example):
     or taking a fixture whose entire value is a compile that succeeded.
     """
     from triton.compiler.compiler import ASTSource
-    entry = EXAMPLES[binary_example]
+    entry = EXAMPLES[compilable_example]
     constexprs = {k: v[0] for k, v in entry["params"].items()
                   if k in entry["constexpr"]}
     return ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
