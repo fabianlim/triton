@@ -8,8 +8,10 @@ keys, none of which is IR, so there is no pass to run and nothing for FileCheck 
 match; pytest's own asserts report a mismatch far better than a failed pattern
 does. lit still owns discovery, so ``uv run lit`` remains the one entry point.
 
-Nothing here needs ``dbo-opt`` or a device. The tests that do stay in
-``test_spyrecode_stage.py``.
+Nothing here needs ``dbo-opt`` or a device, so this file carries no feature
+requirement. The tests that do need one are in ``spyrecode-compile-test.py``, gated
+on the ``dbo-opt`` lit feature; the stage's tool-free surface is in
+``spyrecode-surface-test.py``.
 
 The kernel these lower comes from the example registry the rest of the suite uses
 (``conftest.EXAMPLES``, discovered from ``test/fixtures/*/meta.py``), and the
@@ -104,7 +106,7 @@ class TestInferBaseAddresses:
     wrong key.
 
     The *value* the derivation produces is asserted in
-    ``test_spyrecode_stage.py::test_derived_addresses_reach_the_artifact``, which
+    ``spyrecode-compile-test.py::test_derived_addresses_reach_the_artifact``, which
     reads it off a full compile. ``make_ktir_mod`` returns only the module, so
     metadata is not observable from here; what is left in this class is everything
     that reads the IR rather than the metadata.

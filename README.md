@@ -167,6 +167,27 @@ uv run pytest third_party/spyre/test/test_distribute_work.py -s --tb=short
 uv run pytest third_party/spyre/test/test_ktir_examples.py -s --tb=short
 ```
 
+`pytest` does not run everything. The `.mlir` FileCheck tests, and the Python
+tests under `third_party/spyre/test/python/`, are discovered by `lit`:
+
+```bash
+uv run lit build/cmake.*/third_party/spyre/test -v
+```
+
+Those include the `spyrecode` compile stage — Triton compile → `dbo-opt` → a
+loadable Spyre binary. That stage needs a `dbo-opt` new enough to consume the KTIR
+this backend emits, so point `TRITON_SPYRE_DBO_OPT` at one (and optionally
+`TRITON_SPYRE_DEVICE` at a device `.mlir`); `lit` forwards both:
+
+```bash
+TRITON_SPYRE_DBO_OPT=/path/to/dbo-opt uv run lit build/cmake.*/third_party/spyre/test
+```
+
+With no such tool, `lit` reports those tests as **`Unsupported`** rather than
+passing them silently. If instead you see a failure naming an unknown `ktdp`
+attribute, an older `dbo-opt` was found on `PATH` — the error says which binary ran
+and how it was chosen.
+
 ## KTIR CPU Dependency
 
 The optional `spyre-test` extra installs `ktir-cpu` from
