@@ -20,14 +20,12 @@ import io
 import zipfile
 
 import pytest
-import triton
-import triton.language as tl
 from triton import knobs
 from triton.backends.driver import DriverBase
 
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
 
-from test_spyrecode_stage import _REQUIRED_FIXES, resolve_dbo_opt
+from conftest import EXAMPLES
 
 
 # ---------------------------------------------------------------------------
@@ -54,18 +52,6 @@ class FakeTensor:
 
     def data_ptr(self):
         return self._address
-
-
-@triton.jit
-def _add_kernel_1core(x_ptr, y_ptr, output_ptr, M: tl.constexpr, N: tl.constexpr,
-                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    x_desc = tl.make_tensor_descriptor(x_ptr, shape=[M, N], strides=[N, 1],
-                                       block_shape=[BLOCK_M, BLOCK_N])
-    y_desc = tl.make_tensor_descriptor(y_ptr, shape=[M, N], strides=[N, 1],
-                                       block_shape=[BLOCK_M, BLOCK_N])
-    out_desc = tl.make_tensor_descriptor(output_ptr, shape=[M, N], strides=[N, 1],
-                                        block_shape=[BLOCK_M, BLOCK_N])
-    out_desc.store([0, 0], x_desc.load([0, 0]) + y_desc.load([0, 0]))
 
 
 def _zip_bytes(entries):
@@ -263,13 +249,22 @@ class TestSpyreLauncher:
 
 class TestSubscriptLaunch:
 
-    def test_reaches_the_launcher_not_an_attribute_error(self):
-        if resolve_dbo_opt(required=False) is None:
-            pytest.skip("dbo-opt not resolvable")
-        tensors = [FakeTensor(slot * (1 << 34)) for slot in range(3)]
+    def test_reaches_the_launcher_not_an_attribute_error(self, dbo_opt,
+                                                        spyrecode_options,
+                                                        binary_example):
+        # Kernel, constexprs and fixes all come from the fixture registry via
+        # conftest, so there is one definition of "the kernel that reaches a
+        # binary" and this test follows it. Taking ``dbo_opt`` is what skips when
+        # the tool is absent -- the fixture does it, so no hand-rolled check here.
+        entry = EXAMPLES[binary_example]
+        constexprs = {k: v[0] for k, v in entry["params"].items()
+                      if k in entry["constexpr"]}
+        pointers = [n for n in entry["signature"] if n.endswith("_ptr")]
+        tensors = [FakeTensor(i * (1 << 34)) for i in range(len(pointers))]
         with pytest.raises(NotImplementedError) as excinfo:
-            _add_kernel_1core[(1, )](*tensors, M=1, N=64, BLOCK_M=1, BLOCK_N=64,
-                                     required_fixes=dict(_REQUIRED_FIXES))
+            entry["kernel_fn"][tuple(spyrecode_options["grid"])](
+                *tensors, **constexprs,
+                required_fixes=dict(spyrecode_options["required_fixes"]))
         # The program path in the message is the unpacked spyreCodeDir, so
         # reaching here proves compile + load + launcher dispatch all ran.
         from pathlib import Path
