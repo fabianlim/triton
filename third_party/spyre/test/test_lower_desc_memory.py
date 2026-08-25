@@ -2467,10 +2467,10 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
     Current state: ``LowerDescriptorMemory`` lowers the descriptor ops
     via ``getBasePtrAsIndex``, which casts the base ``!tt.ptr`` operand
     to ``index``. The ``tt.addptr`` that computes that base is left
-    intact. When ``ConvertFunctions`` subsequently rewrites function
-    signatures (``!tt.ptr`` args → ``index``), ``tt.addptr``'s operand
-    becomes ``index`` but its verifier still demands ``!tt.ptr`` —
-    verification fails.
+    intact, still reading the ``!tt.ptr`` function argument.
+    ``ConvertFunctions`` can only fix up ``unrealized_conversion_cast``
+    users of that argument, so it rejects the module and the pipeline
+    fails.
 
     Fix plan: ``LowerDescriptorMemory`` should fold ``tt.addptr`` into
     the base/offset it passes to ``construct_memory_view`` (or
@@ -2497,12 +2497,15 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
         """`tt.addptr` result feeding `tt.make_tensor_descriptor`.
 
         When a `tt.addptr` result is the base pointer for a tensor
-        descriptor, `ConvertFunctions` rewrites the `!tt.ptr` argument
-        to `index` before `LowerDescriptorMemory` can fold the pointer
-        arithmetic, and the op's verifier then rejects the now-illegal
-        operand type. This is the underlying reason batched matmul is
-        currently disabled: each batch step wants to offset the base
-        pointer before constructing the descriptor.
+        descriptor, `LowerDescriptorMemory` lowers the descriptor ops but
+        leaves the `tt.addptr` reading the `!tt.ptr` function argument
+        directly. `ConvertFunctions` only knows how to fold
+        `unrealized_conversion_cast` users of a pointer argument, so it
+        rejects the module up front — before any retype — and names the
+        missing `getBasePtrAsIndex` consumption as the cause. This is the
+        underlying reason batched matmul is currently disabled: each batch
+        step wants to offset the base pointer before constructing the
+        descriptor.
         """
         with pytest.raises(RuntimeError, match="PassManager::run failed"):
             self.run("""
@@ -2526,11 +2529,11 @@ class TestAddptrIntoDescriptor(LowerDescMemoryTester):
               }
             }
             """)
-        # Pin the exact verifier diagnostic: tt.addptr's !tt.ptr operand
-        # was rewritten to index by ConvertFunctions, but the op's
-        # verifier still demands ptr. A drift in the error text or in
-        # which pass raises it will flag here.
+        # Pin ConvertFunctions' rejection, which names the real cause.
+        # Without its precondition check the pass succeeds and tt.addptr's own
+        # verifier complains ("must be ptr ... got 'index'") about an op that
+        # did nothing wrong; that text must not reappear here.
         self.assert_stderr(capfd,
-                           "tt.addptr",
-                           "must be ptr",
-                           "got 'index'")
+                           "cannot convert function signature",
+                           "!tt.ptr argument #0",
+                           "getBasePtrAsIndex")

@@ -558,6 +558,11 @@ tile = tl.descriptor_load(desc, [pid * BLOCK])
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:331` (`TestDescriptorLoad.test_dynamic_shape_from_scalar_load`)</sup>
 
+**Round-trip evidence**
+
+- `vector_add::dynamic_from_scalar_load` — BLOCK_SIZE=1024 (also demonstrates: descriptor-store-dynamic, program-id-1d, num-programs-fold)
+- `vector_add::2d_dynamic_from_scalar_load` — N=32, BLOCK_M=16, BLOCK_N=16 (also demonstrates: descriptor-store-dynamic, program-id-2d, num-programs-fold)
+
 ## descriptor-load-static
 
 ### Supported
@@ -598,12 +603,15 @@ _+ 15 more variants_
 _`tt.addptr` result feeding `tt.make_tensor_descriptor`_
 
 When a `tt.addptr` result is the base pointer for a tensor
-descriptor, `ConvertFunctions` rewrites the `!tt.ptr` argument
-to `index` before `LowerDescriptorMemory` can fold the pointer
-arithmetic, and the op's verifier then rejects the now-illegal
-operand type. This is the underlying reason batched matmul is
-currently disabled: each batch step wants to offset the base
-pointer before constructing the descriptor.
+descriptor, `LowerDescriptorMemory` lowers the descriptor ops but
+leaves the `tt.addptr` reading the `!tt.ptr` function argument
+directly. `ConvertFunctions` only knows how to fold
+`unrealized_conversion_cast` users of a pointer argument, so it
+rejects the module up front — before any retype — and names the
+missing `getBasePtrAsIndex` consumption as the cause. This is the
+underlying reason batched matmul is currently disabled: each batch
+step wants to offset the base pointer before constructing the
+descriptor.
 
 ```python
 # NOT supported: tt.addptr result as descriptor base (e.g. batched matmul)
@@ -614,9 +622,9 @@ desc = tl.make_tensor_descriptor(base, shape=[M, K], strides=[K, 1],
 
 Expected diagnostics:
 
-- `tt.addptr`
-- `must be ptr`
-- `got 'index'`
+- `cannot convert function signature`
+- `!tt.ptr argument #0`
+- `getBasePtrAsIndex`
 
 <sup>Source: `third_party/spyre/test/test_lower_desc_memory.py:2490` (`TestAddptrIntoDescriptor.test_addptr_into_descriptor_fails`)</sup>
 
@@ -808,7 +816,7 @@ tl.descriptor_store(desc, tile, [pid * BLOCK])
 - `matmul::bmm_3d_grid_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-3d)
 - `matmul::spyre_stick_parallel_dynamic` (also demonstrates: descriptor-load-dynamic, dot, program-id-1d, spyre-tensor-layout)
 
-_+ 6 more variants_
+_+ 8 more variants_
 
 ## descriptor-store-static
 
@@ -836,4 +844,4 @@ _+ 15 more variants_
 
 ---
 
-_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-load-dynamic-from-scalar-load`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
+_Patterns without round-trip evidence: `descriptor-gather-2d-indices-subscripts`, `descriptor-gather-5d`, `descriptor-gather-nd-permuted-strides`, `descriptor-gather-nd-subscripts`, `descriptor-gather-nd-trailing-one`, `descriptor-placement-conditional`, `descriptor-placement-nested`, `descriptor-placement-top-level`. Add a tagged fixture variant to verify end-to-end._
