@@ -776,13 +776,40 @@ def spyrecode_options(binary_example):
 
 
 @pytest.fixture(scope="module")
-def compiled(dbo_opt, spyrecode_options, binary_example):
-    """A compilable variant taken through every stage, including spyrecode."""
-    from triton.compiler.compiler import ASTSource, compile as triton_compile
-    from utils import spyre_target
+def binary_source(binary_example):
+    """An ASTSource for the variant under test.
+
+    Separate from ``compiled`` so that a test needing the compile to *fail* has
+    something to hand to triton_compile, without either building a source by hand
+    or taking a fixture whose entire value is a compile that succeeded.
+    """
+    from triton.compiler.compiler import ASTSource
     entry = EXAMPLES[binary_example]
     constexprs = {k: v[0] for k, v in entry["params"].items()
                   if k in entry["constexpr"]}
-    src = ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
-                    constexprs=constexprs)
-    return triton_compile(src, target=spyre_target(), options=spyrecode_options)
+    return ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
+                     constexprs=constexprs)
+
+
+@pytest.fixture(scope="module")
+def compiled(dbo_opt, spyrecode_options, binary_source):
+    """A compilable variant taken through every stage, including spyrecode."""
+    from triton.compiler.compiler import compile as triton_compile
+    from utils import spyre_target
+    return triton_compile(binary_source, target=spyre_target(),
+                          options=spyrecode_options)
+
+
+@pytest.fixture(scope="module")
+def compiled_baked(dbo_opt, spyrecode_options, binary_source):
+    """The same variant with addresses baked in rather than symbolic.
+
+    The non-default mode, and the only one in which the backend derives anything
+    from the pointer types -- so it is what a test asserting a derived address has
+    to compile. A fixture rather than a compile written inside the test, so that
+    class takes its binary the same way throughout.
+    """
+    from triton.compiler.compiler import compile as triton_compile
+    from utils import spyre_target
+    return triton_compile(binary_source, target=spyre_target(),
+                          options={**spyrecode_options, "symbolic_args": False})

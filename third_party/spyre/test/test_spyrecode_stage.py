@@ -30,21 +30,11 @@ import zipfile
 
 import pytest
 from triton import knobs
-from triton.compiler.compiler import ASTSource, compile as triton_compile
+from triton.compiler.compiler import compile as triton_compile
 
-from conftest import EXAMPLES
 from utils import spyre_target
 
 from backend.compiler import SpyreBackend, resolve_dbo_opt, resolve_device
-
-
-def _source(key):
-    """An ASTSource for a fixture variant, for the tests that recompile it."""
-    entry = EXAMPLES[key]
-    constexprs = {k: v[0] for k, v in entry["params"].items()
-                  if k in entry["constexpr"]}
-    return ASTSource(fn=entry["kernel_fn"], signature=dict(entry["signature"]),
-                     constexprs=constexprs)
 
 
 class TestStageWithoutTheTool:
@@ -93,31 +83,41 @@ class TestStageWithoutTheTool:
 class TestStageThroughARealCompile:
     """Tests that need a binary, and so a resolvable ``dbo-opt``.
 
-    Three conftest fixtures serve this class, and they are not three things you
-    must remember to ask for -- they form a chain, so asking for the last one
-    brings the others:
+    Every test here gets its binary from a fixture; none builds an ASTSource of its
+    own. Two do call triton_compile a second time, because recompiling is precisely
+    what they assert, and take ``spyrecode_options`` to do it with the same options
+    the first compile used. The conftest fixtures are a chain, not a checklist --
+    each depends on the one above, so asking for a later one brings the earlier:
 
-    ==================== ================================================
-    ``binary_example``   the variant key; ``params=COMPILES_TO_BINARY``, so
-                         requesting it (directly or not) is what parametrizes
-    ``spyrecode_options`` compile options for that variant. Depends on
-                         ``binary_example``. Pure data -- it never skips
-    ``dbo_opt``          the resolved tool path, or ``pytest.skip``. This, and
-                         only this, is what makes a test skip
-    ==================== ================================================
+    ===================== ===============================================
+    ``binary_example``    the variant key; ``params=COMPILES_TO_BINARY``, so
+                          requesting it, directly or not, is what parametrizes
+    ``spyrecode_options`` compile options for that variant. Pure data -- it
+                          never skips
+    ``dbo_opt``           the resolved tool path, or ``pytest.skip``. This, and
+                          only this, is what makes a test skip
+    ``binary_source``     an ASTSource for the variant, not yet compiled
+    ``compiled``          that source through every stage, symbolic addresses
+    ``compiled_baked``    the same, with addresses baked in -- the non-default
+                          mode, where the backend derives them
+    ===================== ===============================================
 
-    ``compiled`` depends on all three, so a test taking ``compiled`` alone is
-    already both parametrized and skipped -- one input, not three. Take a fixture
-    only where the body uses it: ``binary_example`` appears below just in the two
-    tests that build their own ``ASTSource`` from it.
+    So ``compiled`` or ``compiled_baked`` alone is already both parametrized and
+    gated: one input, not three. Ask for nothing the body does not use.
 
-    Subsets are safe, with one exception. Because the fixtures are module-scoped
-    and pytest caches each per parameter, a partial request can never hand back a
-    different variant than its siblings -- there is one ``binary_example`` value
-    per test run either way. The exception is asking for ``spyrecode_options``
-    (or ``binary_example``) and then compiling *without* ``dbo_opt``: that is
-    parametrized but not gated, so on a machine with no tool it fails instead of
-    skipping. If a test compiles, it takes ``dbo_opt`` or it takes ``compiled``.
+    ``test_missing_device_file_raises`` is the one exception, and it is not an
+    inconsistency worth removing: it asserts that a compile *fails*, so a fixture
+    whose value is a compile that succeeded cannot serve it. It takes
+    ``binary_source`` plus ``dbo_opt``, which is the subset rule below applied
+    rather than broken.
+
+    Subsets are safe, with one trap. Because these are module-scoped and pytest
+    caches each per parameter, a partial request can never hand back a different
+    variant than its siblings -- there is one ``binary_example`` value per run
+    either way. The trap is taking ``spyrecode_options`` (or ``binary_source``) and
+    compiling *without* ``dbo_opt``: parametrized but not gated, so where no tool
+    exists it fails instead of skipping. Anything that compiles takes ``dbo_opt``,
+    or takes a fixture that already did.
     """
 
     def test_artifact_holds_the_spyre_code_dir(self, compiled):
@@ -153,8 +153,7 @@ class TestStageThroughARealCompile:
         assert hashlib.sha256(rebuilt.kernel).hexdigest() == \
             hashlib.sha256(compiled.kernel).hexdigest()
 
-    def test_derived_addresses_reach_the_artifact(self, dbo_opt, spyrecode_options,
-                                                 binary_example):
+    def test_derived_addresses_reach_the_artifact(self, compiled_baked):
         # The one surviving assertion on the *value* _make_ktir derives from the
         # TTIR pointer types: three fp16 pointers land on the i * 16 GiB segments,
         # counted in elements. It runs through a whole compile because metadata is
@@ -167,22 +166,19 @@ class TestStageThroughARealCompile:
         # needs neither a module nor this tool, so only one test needs to pay for
         # a compile.
         #
-        # It builds its own source rather than taking ``compiled``, because it
-        # compiles in the non-default mode: symbolic_args=False is explicit, since
-        # symbolic is the default and nothing is derived in that mode.
-        src = _source(binary_example)
-        baked = triton_compile(src, target=spyre_target(),
-                               options={**spyrecode_options,
-                                        "symbolic_args": False})
-        assert tuple(baked.metadata.base_addresses) == (
+        # ``compiled_baked`` rather than ``compiled`` because nothing is derived in
+        # the default symbolic mode; baking is what makes the value exist.
+        assert tuple(compiled_baked.metadata.base_addresses) == (
             0, 8589934592, 17179869184)
 
-    def test_missing_device_file_raises(self, dbo_opt, spyrecode_options,
-                                        binary_example, monkeypatch, tmp_path):
-        # Through the stage, so the resolver is reached the way a compile reaches
-        # it, not just called directly. Its own source again, because ``compiled``
-        # is module-scoped and would have been built before this monkeypatch.
+    def test_missing_device_file_raises(self, dbo_opt, binary_source,
+                                        spyrecode_options, monkeypatch, tmp_path):
+        # The one test here that does not take a compile, and cannot: it asserts a
+        # compile *fails*, so a fixture returning one that succeeded is the wrong
+        # input -- taking it would compile twice and assert on neither. It takes the
+        # source instead, and ``dbo_opt`` directly for the skip that ``compiled``
+        # would otherwise have carried.
         monkeypatch.setattr(knobs.spyre, "device", str(tmp_path / "nope.mlir"))
-        src = _source(binary_example)
         with pytest.raises(FileNotFoundError, match="TRITON_SPYRE_DEVICE"):
-            triton_compile(src, target=spyre_target(), options=spyrecode_options)
+            triton_compile(binary_source, target=spyre_target(),
+                           options=spyrecode_options)
