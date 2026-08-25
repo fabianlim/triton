@@ -56,6 +56,40 @@ class TestStageWithoutTheTool:
         with pytest.raises(RuntimeError, match="TRITON_SPYRE_DBO_OPT"):
             resolve_dbo_opt()
 
+    def test_a_failing_tool_is_reported_with_its_origin(self, binary_source,
+                                                        spyrecode_options,
+                                                        monkeypatch):
+        # Takes binary_source without dbo_opt, which the other class calls a trap.
+        # It is not one here: the tool is /bin/false, so no real dbo-opt is wanted
+        # and nothing is being left ungated.
+        #
+        # The case this covers is a tool that runs and fails, not one that is
+        # absent -- an old dbo-opt on PATH, which resolves fine and then rejects
+        # the IR. Without the origin in the message that reads as a broken branch,
+        # so the message has to say both which binary ran and why it was chosen.
+        monkeypatch.setattr(knobs.spyre, "dbo_opt", "/bin/false")
+        with pytest.raises(RuntimeError) as excinfo:
+            triton_compile(binary_source, target=spyre_target(),
+                           options=spyrecode_options)
+        message = str(excinfo.value)
+        assert "/bin/false" in message
+        assert "knobs.spyre.dbo_opt='/bin/false'" in message
+        assert "TRITON_SPYRE_DBO_OPT" in message
+
+    def test_a_bare_tool_name_is_reported_as_coming_from_path(self, binary_source,
+                                                             spyrecode_options,
+                                                             monkeypatch, tmp_path):
+        # The dangerous half: a bare name means PATH picked the binary, and the
+        # message must say so, since that is the case nobody chose deliberately.
+        failing = tmp_path / "dbo-opt"
+        failing.write_text("#!/bin/sh\nexit 1\n")
+        failing.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setattr(knobs.spyre, "dbo_opt", "dbo-opt")
+        with pytest.raises(RuntimeError, match="PATH, since knobs.spyre.dbo_opt"):
+            triton_compile(binary_source, target=spyre_target(),
+                           options=spyrecode_options)
+
     def test_resolve_device_reports_unset_as_no_file(self, monkeypatch):
         # Unset is a real configuration, not a failure: dbo-opt falls back to its
         # own default. The resolver has to say "no file" rather than raise, or a

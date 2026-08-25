@@ -684,9 +684,23 @@ class SpyreBackend(BaseBackend):
             # writes under --export-dir matter here.
             result = subprocess.run(argv, capture_output=True, text=True, env=env)
             if result.returncode != 0:
+                # Say which dbo-opt this was and how it was chosen. A bare knob
+                # value is looked up on PATH, so an old system install wins
+                # without anyone selecting it, and its dialect errors read as a
+                # broken branch rather than as a stale tool.
+                configured = knobs.spyre.dbo_opt
+                origin = (f"PATH, since knobs.spyre.dbo_opt is the default "
+                          f"{configured!r}" if os.sep not in configured
+                          else f"knobs.spyre.dbo_opt={configured!r}")
                 raise RuntimeError(
                     f"dbo-opt failed (exit {result.returncode}):\n"
-                    f"  argv: {' '.join(argv)}\n{result.stderr}"
+                    f"  tool: {dbo_opt}\n"
+                    f"  from: {origin}\n"
+                    f"  argv: {' '.join(argv)}\n"
+                    "If the diagnostics below name an unknown attribute or "
+                    "dialect, this dbo-opt is older than the KTIR this backend "
+                    "emits: set TRITON_SPYRE_DBO_OPT to a newer one.\n"
+                    f"{result.stderr}"
                 )
 
             code_dir = export_dir / "spyreCodeDir"
