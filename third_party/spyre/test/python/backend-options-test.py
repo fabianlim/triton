@@ -20,7 +20,6 @@ two calls ``KTIRStructuralTester`` makes. There is deliberately no local kernel 
 no local lowering helper.
 """
 
-import re
 import tempfile
 
 import pytest
@@ -378,8 +377,17 @@ class TestSymbolicArgs:
             f.write(ttir)
             f.flush()
             mod = make_ktir_mod(f.name, grid=_EXAMPLE["grid"])
-        text = str(mod)
-        assert re.search(r"func\.func @\w+\(%arg0: index", text), text[:400]
+        signature = next(line for line in str(mod).splitlines()
+                         if "func.func" in line)
+        # One index argument per pointer. The count is the claim; the SSA names are
+        # not. This asserted ``%arg0: index`` until ConvertFunctions started naming
+        # arguments after the kernel's parameters (``%x_ptr: index``, #96), which
+        # broke the test without changing anything about the mode it covers. The
+        # failure message is the signature line rather than the first 400 characters
+        # of the module, which were all locations and never reached the func.
+        pointers = [name for name, ty in _EXAMPLE["signature"].items()
+                    if str(ty).startswith("*")]
+        assert signature.count(": index") == len(pointers), signature
 
     def test_mutually_exclusive_with_base_addresses(self):
         # Honouring one and dropping the other would silently pick a mode the
