@@ -528,6 +528,26 @@ class amd_knobs(base_knobs):
     swap_mir_enable_misched: env_bool = env_bool("TRITON_SWAP_MIR_ENABLE_MISCHED", False)
 
 
+# --- START --- added for spyre
+class spyre_knobs(base_knobs):
+    # The dbo-opt driver that turns KTIR into a loadable SpyreCode directory.
+    # A bare name is resolved on PATH. Folded into SpyreBackend.hash() (see
+    # third_party/spyre/backend/compiler.py) so repointing or rebuilding the
+    # tool invalidates the compile cache -- the analogue of NVIDIA folding
+    # get_ptxas_version() into its options hash.
+    dbo_opt: env_str = env_str("TRITON_SPYRE_DBO_OPT", "dbo-opt")
+
+    # Device architecture description for dbo-opt's scheduler. Optional on
+    # purpose: unset lets dbo-opt fall back to the default
+    device: env_opt_str = env_opt_str("TRITON_SPYRE_DEVICE")
+
+    # DBO_DEBUG=1 makes dbo-opt dump a debug/ tree (ktir.mlir, dfir.mlir, the
+    # per-schedule init packets) beside the spyreCodeDir. On by default because
+    # that tree is the only on-disk record of what was actually scheduled; it
+    # is packed into the artifact and unpacked beside spyrecode.json.
+    dbo_debug: env_bool = env_bool("TRITON_SPYRE_DBO_DEBUG", True)
+# --- END --- added for spyre
+
 class proton_knobs(base_knobs):
     disable: env_bool = env_bool("TRITON_PROTON_DISABLE", False)
     cupti_lib_dir: env_str = env_str(
@@ -568,6 +588,7 @@ runtime = runtime_knobs()
 language = language_knobs()
 nvidia = nvidia_knobs()
 amd = amd_knobs()
+spyre = spyre_knobs()  # added for spyre
 proton = proton_knobs()
 
 

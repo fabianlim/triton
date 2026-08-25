@@ -37,6 +37,20 @@ DTYPE_MAP = {
 STICK_BYTES = 128
 
 
+def spyre_target():
+    """The Spyre compile target, built on demand.
+
+    A function rather than a module constant because this module imports
+    ``GPUTarget`` inside its functions, not at the top -- so a constant here would
+    need a module-level triton import that the rest of the file avoids.
+
+    ``warp_size=1`` is load-bearing: CompiledKernel compares
+    ``num_warps * warp_size`` against ``n_max_threads``, and Spyre has no warps.
+    """
+    from triton.backends.compiler import GPUTarget
+    return GPUTarget(backend="spyre", arch=1, warp_size=1)
+
+
 def np_dtype(signature, key):
     """Map a ``SIGNATURE`` entry to its NumPy dtype.
 
