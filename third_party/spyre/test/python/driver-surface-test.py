@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
-"""Tests for the Spyre driver skeleton — ``SpyreUtils`` / ``SpyreLauncher``.
+# RUN: %python -m pytest %s -q
+
+"""The Spyre driver's surface — ``SpyreUtils`` / ``SpyreLauncher``.
 
 ``utils`` and ``launcher_cls`` are an *undeclared* convention: they do not
 appear on ``DriverBase``, but ``compiler.py`` reaches for them by name at four
@@ -7,17 +8,24 @@ sites, and ``JITFunction.run`` calls ``get_current_device()`` /
 ``get_current_stream()`` unconditionally. Before this skeleton existed,
 ``kernel[grid](...)`` died with ``AttributeError: launcher_cls``.
 
-No device is needed. The end-to-end test drives ``kernel[grid](...)`` with a
-duck-typed tensor — ``specialize.cc`` falls back to its tensor handler for any
-object carrying ``data_ptr()`` (``python/src/specialize.cc``) — so the whole
-compile-and-load path runs and the launch stops *inside*
-``SpyreLauncher.__call__``. That is the whole point of the issue: the failure
-must be ours and about the launch, not Triton's plumbing about a missing member.
+Nothing here needs ``dbo-opt`` or a device, so this file carries no ``REQUIRES``
+line and runs everywhere, CI included. That is the whole reason it is a lit test
+rather than a pytest module: a test that needs nothing should not sit in the suite
+that serializes the device.
+
+What that costs, stated rather than discovered: the launcher is constructed
+directly here, so nothing in this file proves that a subscript call *arrives* at
+it through real ``jit.py`` plumbing — the one thing the compile-driven end-to-end
+test it replaced did prove. ``test/test_device_launch.py`` walks that path with
+real tensors, subscript through launcher to device, so the coverage exists; but it
+is gated on hardware, so on a machine without a device that link is not checked at
+all. The decomposition is not free.
 """
 
 import hashlib
 import io
 import zipfile
+from pathlib import Path
 
 import pytest
 from triton import knobs
@@ -25,14 +33,12 @@ from triton.backends.driver import DriverBase
 
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
 
-from conftest import EXAMPLES
-
 
 # ---------------------------------------------------------------------------
-# A duck-typed tensor. specialize.cc dispatches on type() first and falls back
-# to "has a data_ptr attribute", so this is enough to reach the compile path
-# without torch installed. .dtype must str() to something
-# triton._utils.canonicalize_dtype knows.
+# A duck-typed tensor that is not on the Spyre device: what a plain torch CPU
+# tensor presents to the launcher. .dtype must str() to something
+# triton._utils.canonicalize_dtype knows, so the rejection is about the *device*
+# and not about a member the object failed to have.
 # ---------------------------------------------------------------------------
 
 class _FakeDType:
@@ -69,8 +75,9 @@ class _Src:
 class _SpyreTensor:
     """Enough of a Spyre tensor for the launcher's device check: ``device.type``.
 
-    Not a FakeTensor subclass — that one exists to reach Triton's compile path and
-    needs ``data_ptr`` / ``dtype``; this one never leaves the launcher.
+    Not a FakeTensor subclass — that one stands in for a tensor on the wrong
+    device and carries ``data_ptr`` / ``dtype``; this one never leaves the
+    launcher.
     """
 
     class _Device:
@@ -232,7 +239,6 @@ class TestLoadBinary:
         utils.unload_module(module)
         # Deliberate: content-addressed, so a cache rather than a leak, and
         # debug/dfir.mlir is the only on-disk record of what ran.
-        from pathlib import Path
         assert (Path(module) / "spyrecode.json").is_file()
 
 
@@ -285,28 +291,74 @@ class TestSpyreLauncher:
 
 
 # ---------------------------------------------------------------------------
-# End to end: kernel[grid](...) reaches the launcher
+# _address_args, called directly
+#
+# The launcher's only decision: which arguments carry an address, and in which
+# order. Reached without a compile because it reads nothing but ``src.signature``
+# and the arguments handed to it, so a stub source is the whole setup.
 # ---------------------------------------------------------------------------
 
-class TestSubscriptLaunch:
+class TestAddressArgs:
 
-    def test_reaches_the_launcher_not_an_attribute_error(self, dbo_opt,
-                                                        spyrecode_options,
-                                                        compilable_example):
-        # Kernel, constexprs and fixes all come from the fixture registry via
-        # conftest, so there is one definition of "the kernel that reaches a
-        # binary" and this test follows it. Taking ``dbo_opt`` is what skips when
-        # the tool is absent -- the fixture does it, so no hand-rolled check here.
-        entry = EXAMPLES[compilable_example]
-        constexprs = {k: v[0] for k, v in entry["params"].items()
-                      if k in entry["constexpr"]}
-        pointers = [n for n in entry["signature"] if n.endswith("_ptr")]
-        tensors = [FakeTensor(i * (1 << 34)) for i in range(len(pointers))]
-        # A FakeTensor is not on the Spyre device, so the launch stops on that --
-        # inside SpyreLauncher, naming the first pointer. Which is the point: the
-        # failure is ours and about the launch, not Triton's plumbing about a
-        # missing member, and it needs no device to demonstrate.
-        with pytest.raises(TypeError, match=f"{pointers[0]!r}"):
-            entry["kernel_fn"][tuple(spyrecode_options["grid"])](
-                *tensors, **constexprs,
-                required_fixes=dict(spyrecode_options["required_fixes"]))
+    def test_names_the_parameter_of_a_tensor_on_the_wrong_device(self):
+        # The name and the type are both in the message: the name says which
+        # argument to move, the type says what was passed instead.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), object())
+        with pytest.raises(TypeError) as excinfo:
+            launcher._address_args((FakeTensor(0), ))
+        message = str(excinfo.value)
+        assert "'x_ptr'" in message
+        assert "FakeTensor" in message
+
+    def test_names_the_offending_pointer_not_the_first_one(self):
+        # A hardcoded first name would pass the test above and mislead every
+        # caller whose second buffer is the one still on the host.
+        launcher = SpyreLauncher(
+            _Src({"x_ptr": "*fp16", "y_ptr": "*fp16"}), object())
+        with pytest.raises(TypeError, match="'y_ptr'"):
+            launcher._address_args((_SpyreTensor(), FakeTensor(0)))
+
+    def test_a_scalar_where_a_pointer_is_declared_is_rejected(self):
+        # An int has no .device either, and the check is on the declared type, so
+        # this must be the device error rather than a silent drop.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), object())
+        with pytest.raises(TypeError, match="'x_ptr'"):
+            launcher._address_args((4096, ))
+
+    def test_too_few_arguments_for_the_signature(self):
+        launcher = SpyreLauncher(
+            _Src({"x_ptr": "*fp16", "n": "i32", "y_ptr": "*fp16"}), object())
+        with pytest.raises(RuntimeError, match="2 launch argument"):
+            launcher._address_args((_SpyreTensor(), 4096))
+
+    def test_too_many_arguments_for_the_signature(self):
+        # Checked in both directions: the length is compared, not bounded, so an
+        # extra argument is as unguessable as a missing one.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), object())
+        with pytest.raises(RuntimeError, match="2 launch argument"):
+            launcher._address_args((_SpyreTensor(), _SpyreTensor()))
+
+    def test_constexprs_and_runtime_scalars_leave_nothing_behind(self):
+        # A kernel with no pointers at all patches no addresses. The empty list
+        # is the answer, not an error: _prepare compares it against the count the
+        # artifact declares, and that is where a disagreement is caught.
+        launcher = SpyreLauncher(
+            _Src({"n": "i32", "BLOCK": "constexpr"}), object())
+        assert launcher._address_args((4096, 64)) == []
+
+    def test_a_constexpr_pointer_is_not_an_address(self):
+        # The filter is on the signature entry, not on the argument: "constexpr"
+        # does not start with "*", so a pointer baked in at compile time is
+        # already in the binary and is not patched again.
+        tensor = _SpyreTensor()
+        launcher = SpyreLauncher(
+            _Src({"x_ptr": "constexpr", "y_ptr": "*fp16"}), object())
+        assert launcher._address_args((object(), tensor)) == [tensor]
+
+    def test_declaration_order_is_preserved_not_sorted(self):
+        # Segment i belongs to argument i, so the returned order has to be the
+        # signature's. Names that sort the other way, to catch a stray sorted().
+        z, a = _SpyreTensor(), _SpyreTensor()
+        launcher = SpyreLauncher(
+            _Src({"z_ptr": "*fp16", "a_ptr": "*fp16"}), object())
+        assert launcher._address_args((z, a)) == [z, a]
