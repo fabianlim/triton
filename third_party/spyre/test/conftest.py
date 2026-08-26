@@ -755,20 +755,21 @@ def compilable_example(request):
 def spyrecode_options(compilable_example):
     """Compile options for the variant under test.
 
-    The two fixes are required, not optional: the scheduler inside dbo-opt wants
-    the compute to be a ``linalg`` op whose ``outs`` is a fresh ``tensor.empty``.
-    Tensor-level ``arith`` leaves the memref as ``strided<..., offset: ?>`` and
+    The grid, and the two fix passes the scheduler inside dbo-opt requires. It wants
+    the compute to be a ``linalg`` op whose ``outs`` is a fresh ``tensor.empty``:
+    tensor-level ``arith`` leaves the memref as ``strided<..., offset: ?>`` and
     dbo-opt rejects the ``ktdp.load`` operand; an aliased ``outs`` fails later the
-    same way. Both must anchor on a *core* pass -- ``_make_ktir`` silently ignores
-    any other anchor -- and dict order decides which runs first, so
-    unalias_linalg_outs is second.
+    same way. Both must anchor after ``rewrite_descriptor_layout``: anchoring on
+    ``lower_compute_ops`` builds a ``linalg.generic`` with logical types, and the
+    layout pass then physicalizes the descriptor to a stickified shape -- the types
+    disagree and the pipeline aborts.
     """
     entry = EXAMPLES[compilable_example]
     return {
         "grid": tuple(entry["grid"]),
         "required_fixes": {
-            "convert_elementwise_to_linalg": "lower_compute_ops",
-            "unalias_linalg_outs": "lower_compute_ops",
+            "convert_elementwise_to_linalg": "rewrite_descriptor_layout",
+            "unalias_linalg_outs": "rewrite_descriptor_layout",
         },
     }
 

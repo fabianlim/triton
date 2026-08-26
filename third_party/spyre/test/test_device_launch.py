@@ -56,8 +56,8 @@ class TestDeviceLaunch:
         args = [staged.get(name, entry["param_values"].get(name))
                 for name in entry["kernel_fn"].arg_names]
 
-        # The grid is meta.py's, and the required_fixes come from the fixture that
-        # explains why they are required rather than optional.
+        # Grid and required_fixes come from spyrecode_options -- dbo-opt's
+        # requirements, not this test's.
         options = dict(spyrecode_options)
         entry["kernel_fn"][options.pop("grid")](*args, **options)
 
