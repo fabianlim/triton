@@ -192,8 +192,12 @@ class SpyreLauncher:
     A launch is two torch-spyre calls — ``prepare_kernel(spyreCodeDir)`` for the
     JobPlan, then ``launch_jobplan(plan, tensors)`` — and this process is the one
     that makes them. That means the process running Triton is also the process
-    holding the device, which a Spyre device grants to exactly one opener; see
-    ``test/lit.cfg.py`` for what that costs the test suite.
+    holding the device, which a Spyre device grants to exactly one opener — from the
+    first ``.to("spyre")`` until that process exits, not until the tensors are
+    dropped. What it costs the test suite: the launch test lives in the pytest suite
+    (``test/test_device_launch.py``) rather than under lit, because pytest runs one
+    process sequentially and that is what serializes device access, where lit runs
+    one process per file in parallel.
     """
 
     def __init__(self, src, metadata):

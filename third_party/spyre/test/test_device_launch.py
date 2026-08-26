@@ -1,6 +1,3 @@
-# RUN: %python -m pytest %s -q
-# REQUIRES: dbo-opt, spyre-device
-
 """Launch a compiled fixture on the Spyre device and check it numerically.
 
 The last link, and it is an ordinary Triton launch: inputs go over with
@@ -15,27 +12,30 @@ against two backends.
 
 The variants covered are whatever declares ``compiles_to_binary`` -- the
 ``compilable_example`` fixture parametrizes over them, so a second one extends this
-with no change here. Today exactly one qualifies.
+with no change here.
 
-Two features gate this file, and both are needed: ``dbo-opt`` to produce the
-binary, ``spyre-device`` for a machine that can launch it. Absent either, lit
-reports Unsupported, which is visible -- unlike a pytest skip inside a passing RUN
-line, which is not. See ``test/lit.cfg.py``, which also records why exactly one lit
-file may require ``spyre-device``: this process holds the device for its whole
-lifetime, and lit runs files in parallel.
+The consequence, accepted: a plain ``pytest third_party/spyre/test`` on a machine
+with a device opens it and holds it for the session, the same posture upstream has
+with a GPU.
 """
 
 import json
 from pathlib import Path
 
 import numpy as np
-import torch
-# After torch, not before: torch auto-loads torch_spyre as a device-backend
-# extension, so importing it first re-enters a half-built module. See
-# ``_import_torch_spyre`` in backend/driver.py.
-import torch_spyre  # noqa: F401  -- registers the "spyre" device with torch
+import pytest
 
 from conftest import EXAMPLES
+
+# torch BEFORE torch_spyre, and that order is a finding rather than a style
+# choice: torch auto-loads torch_spyre as a device-backend extension, so reaching
+# for it first re-enters a half-built module and the caller gets ``Failed to load
+# the backend extension`` -- or, further along, a duplicate ``TORCH_LIBRARY`` for
+# the ``triton`` namespace -- rather than anything about a launch. See
+# ``_import_torch_spyre`` in backend/driver.py, which documents the same trap.
+# importorskip preserves the order because it is two statements, in order.
+torch = pytest.importorskip("torch")
+pytest.importorskip("torch_spyre")  # registers the "spyre" device with torch
 
 
 def _step_plan(directory):

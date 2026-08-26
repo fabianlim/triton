@@ -206,14 +206,19 @@ ordinary `ImportError`.
 
 Point the test suite at an existing install with `PYTHONPATH`, and at the runtime
 libraries its `_C.so` dlopens with `LD_LIBRARY_PATH` — `ld.so` reads the latter at
-`exec`, so it must be set before the interpreter starts. `lit` forwards both.
+`exec`, so it must be set before the interpreter starts, in the environment
+`pytest` is launched from.
 
-The tests that launch are gated on a `spyre-device` lit feature: a numbered
-`/dev/vfio` group must exist and `torch_spyre` must be resolvable. Absent either,
-`lit` reports **`Unsupported`** rather than failing. Exactly one lit file may
-require that feature — a Spyre device admits one opener, the launching process
-holds it for its whole lifetime, and `lit` runs test files in parallel. See
-`third_party/spyre/test/lit.cfg.py`.
+The test that launches is `third_party/spyre/test/test_device_launch.py`, part of
+the ordinary pytest suite.  It is a **pytest** test rather than a `lit` one because of how the device is held: a
+Spyre device admits exactly one opener, the launch is in-process, and the hold
+starts at the first `.to("spyre")` and lasts the process's lifetime. pytest runs one
+process, sequentially, so that runner *is* the serialization, for any number of
+device tests in any number of files. `lit` runs one process per file in parallel, so
+there the same safety rested on a convention — exactly one file carrying the feature
+— that nothing enforced. The accepted consequence: on a machine with a device, a
+plain `pytest third_party/spyre/test` opens it and holds it for the session, the
+same posture upstream Triton has with a GPU.
 
 ## KTIR CPU Dependency
 

@@ -144,6 +144,11 @@ PYTHONPATH=python:third_party/spyre uv run python $T | ./python/triton/FileCheck
 Numerical coverage is a work in progress; known gaps are strict-xfail'd and
 missing oracles skip, so the suite stays green while catching regressions.
 
+`test_device_launch.py` launches on hardware, in the pytest process itself, and a
+Spyre device admits one opener for that process's whole lifetime. It is in the
+pytest suite rather than under lit precisely because pytest runs one process
+sequentially — that is what serializes device access. 
+
 ### Lit tests and `spyre-triton-opt`
 
 `spyre-triton-opt` registers both Triton (TTIR) and KTDP dialects/passes.
