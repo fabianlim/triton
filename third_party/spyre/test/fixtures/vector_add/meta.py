@@ -33,18 +33,6 @@ def _make_2d_checks(M, N, **_):
         t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}xf32>")
     return checks
 
-
-def _make_1core_checks(M, N, **_):
-    def checks(t):
-        # fp16, and the whole tensor in one view.
-        t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}xf16>")
-        # The point of this variant: no distribution loop was synthesized. Every
-        # other kernel here carves work with an scf.for over the program id, and
-        # that loop is what dbo-opt refuses.
-        t.assert_absent("scf.for", "ktdp.get_compute_tile_id")
-    return checks
-
-
 def _make_3d_checks(M, N, P, **_):
     def checks(t):
         t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}x{P}xf32>")
@@ -89,7 +77,8 @@ def _make_2d_scalar_dim_checks(N, **_):
 # Reference (NumPy oracle) + input maker
 # ---------------------------------------------------------------------------
 
-def make_inputs(n_elements: int, BLOCK_SIZE: int, dtype: str = "f32") -> dict:
+def make_inputs(n_elements: int, BLOCK_SIZE: int, 
+                *, dtype="f32", **_unused) -> dict:
     """Build pointer-tensor inputs for the kernel.
 
     Takes the same parameter names as ``VARIANTS[...]["params"]`` so the
@@ -219,11 +208,11 @@ _SIG_2D_LAYOUT = {
     "OUT_LAYOUT": "constexpr",
 }
 
-# The 2D signature in fp16. Same shape arguments as _SIG_2D -- only the pointer
-# element type differs -- and no layout constexprs, because add_kernel_1core takes
-# none.
-_SIG_2D_FP16 = {**_SIG_2D, "x_ptr": "*fp16", "y_ptr": "*fp16",
-                "output_ptr": "*fp16"}
+_SIG_TENSORS_FP16 = {
+    "x_ptr":      "*fp16",
+    "y_ptr":      "*fp16",
+    "output_ptr": "*fp16",
+}
 
 # The layout signature in fp16 -- the union of the two above, which is all it has
 # ever been. Spelled as a merge so a change to the shape arguments or the layout
@@ -231,10 +220,9 @@ _SIG_2D_FP16 = {**_SIG_2D, "x_ptr": "*fp16", "y_ptr": "*fp16",
 # overrides come last but the key order is _SIG_2D_LAYOUT's, since re-assigning an
 # existing key keeps its position, and for a signature that order is the argument
 # order.
-_SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_2D_FP16}
+_SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_TENSORS_FP16}
 
-
-_S2 = functools.partial(sticksize, _SIG_2D_SPYRE)
+_S2 = functools.partial(sticksize, _SIG_TENSORS_FP16)
 
 _SIG_3D = {
     "x_ptr":      "*fp32",
@@ -426,7 +414,7 @@ VARIANTS = {
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
         },
     },
-    "2d_1core": {
+    "1d_device": {
         # The only variant in the suite that reaches a Spyre binary. Everything
         # else distributes tiles with an scf.for over the program id, and dbo-opt
         # rejects the loop it outlines from that; this kernel has no loop and no
@@ -434,24 +422,33 @@ VARIANTS = {
         #
         # That makes it the fixture the spyrecode-stage tests compile, which is
         # why it lives here rather than inline in a test module.
-        "tags": ["descriptor-load-static", "descriptor-store-static"],
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-grid"
+        ],
         "summary": (
-            "2D elementwise add over a single tile, with no grid distribution "
+            "Elementwise add over a single tile, with no grid distribution "
             "loop -- the one variant dbo-opt can lower to a binary."
         ),
         "doc": (
-            "Takes two `M x N` fp16 matrices and writes `C = A + B` in one "
-            "`BLOCK_M x BLOCK_N` tile covering the whole tensor. No "
-            "`tl.program_id`, no `tl.num_programs`, no loop.\n\n"
-            "`parallel: False` because there is nothing to distribute: "
-            "`test_work_distribution` asserts a per-core carve-up that this "
-            "kernel deliberately does not have."
+            "Takes two `M` fp16 inputs in spyre tensor 2D layouts " 
+            "and writes `C = A + B` in one "
+            "`tl.program_id`, no `tl.num_programs`, no loop."
         ),
-        "kernel_fn":    kernel.add_kernel_1core,
-        "SIGNATURE":    _SIG_2D_FP16,
-        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N"],
+        "kernel_fn":    kernel.add_kernel_device,
+        "SIGNATURE":    _SIG_TENSORS_FP16,
+        "constexpr":    ["n_elements", "LAYOUT"],
         "params":       {
-            "M": [1], "N": [64], "BLOCK_M": [1], "BLOCK_N": [64],
+            "n_elements": [128],
+            # LAYOUT is a constexpr that enters the Triton cache key, so it
+            # must be hashable -- a list is not. Stored as tuple of tuples.
+            # A labelled ("name", value) pair is required: the framework's
+            # tuple-detection sees any tuple element in the values list and
+            # would misread the raw inner tuple as a (label, value) pair. The
+            # label also becomes the suffix when sweeping: adding a second
+            # layout produces vector_add__1d_device[LAYOUT=stick] and
+            # vector_add__1d_device[LAYOUT=other].
+            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
         },
         "grid":         [1],
         "parallel":     False,
@@ -460,11 +457,12 @@ VARIANTS = {
         # conftest so the property travels with the variant, like `parallel`.
         "compiles_to_binary": True,
         "reference":    run,
-        "inputs":       functools.partial(make_inputs_2d, dtype=np.float16),
+        # BLOCK_SIZE is actually not useds, stub it out
+        "inputs":       functools.partial(make_inputs, dtype="f16", BLOCK_SIZE=None),
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": _make_1core_checks,
+        "extra_checks": None,
     },
     "2d_spyre_stick": {
         # Elementwise add with all three operands stick-on-N. Every operand
