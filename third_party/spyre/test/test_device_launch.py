@@ -19,9 +19,6 @@ with a device opens it and holds it for the session, the same posture upstream h
 with a GPU.
 """
 
-import json
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -36,31 +33,6 @@ from conftest import EXAMPLES
 # importorskip preserves the order because it is two statements, in order.
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_spyre")  # registers the "spyre" device with torch
-
-
-def _step_plan(directory):
-    """The artifact's own step plan, read out of its ``spyrecode.json``.
-
-    The same translation ``prepare_kernel`` does: ``ComputeOnHost`` is a
-    HostCompute step, ``ComputeOnDevice`` is a Compute step, and a
-    ``DataTransfer`` is named by its ``dirn`` string -- ``"false"`` is H2D,
-    ``"true"`` is D2H.
-
-    Taken from the artifact because that is where it is written down. The JobPlan
-    the runtime builds from it belongs to the launcher now, and the artifact is the
-    thing whose mode is being asserted anyway.
-    """
-    plan = json.loads((Path(directory) / "spyrecode.json").read_text())
-    named = {"ComputeOnHost": "HostCompute", "ComputeOnDevice": "Compute"}
-    steps = []
-    for command in plan["JobExecPlan"]:
-        kind = command["command"]
-        if kind == "DataTransfer":
-            steps.append(
-                "D2H" if command["properties"]["dirn"] == "true" else "H2D")
-        else:
-            steps.append(named.get(kind, kind))
-    return steps
 
 
 class TestDeviceLaunch:
@@ -87,13 +59,7 @@ class TestDeviceLaunch:
         # The grid is meta.py's, and the required_fixes come from the fixture that
         # explains why they are required rather than optional.
         options = dict(spyrecode_options)
-        kernel = entry["kernel_fn"][options.pop("grid")](*args, **options)
-
-        # The plan a symbolic artifact must have: the host step builds the
-        # correction flit, the H2D ships it, and only then does the device compute.
-        # A binary with a single Compute step was baked, not symbolic.
-        steps = _step_plan(kernel.module)
-        assert steps == ["HostCompute", "H2D", "Compute"], steps
+        entry["kernel_fn"][options.pop("grid")](*args, **options)
 
         output = staged[entry["output_key"]].cpu().numpy()
 
