@@ -24,7 +24,6 @@ Quick-reference
                                   from ``test/fixtures/*/meta.py``
 - :class:`KTIRStructuralTester` — EXAMPLE-based setup + structural assertions
 - :class:`KTIRCpuTester`        — extends with numerical CPU execution
-- :class:`SpyreDeviceTester`    — the same, on the device, from a compiled binary
 - :class:`SinglePassTester`     — run one pass on inline MLIR text
 
 Most shared machinery (``OpInfo``, ``walk_module``, ``make_ktir_mod``,
@@ -57,13 +56,10 @@ Fixes, in order of preference:
 
 import importlib.util
 import itertools
-import os
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import NamedTuple
 
 import pytest
 
@@ -634,179 +630,6 @@ class KTIRCpuTester:
         # Rename argN back to caller's source-level names.
         arg_to_name = {v: k for k, v in name_to_arg.items()}
         return {arg_to_name[k]: v for k, v in raw_outputs.items() if k in arg_to_name}
-
-
-# ---------------------------------------------------------------------------
-# SpyreDeviceTester — adds numerical execution on the device
-# ---------------------------------------------------------------------------
-
-#: The device half of a device run: ``scripts/device_runner.py``, relative to this
-#: file (test/ -> spyre/scripts).
-#:
-#: It cannot live under ``test/python/`` beside the test that drives it, because
-#: ``lit.local.cfg`` adds ``.py`` as a suffix there and a helper with no RUN line is
-#: then discovered as a test and reported Unresolved.
-_DEVICE_RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "device_runner.py"
-
-
-class DeviceResult(NamedTuple):
-    """What one device launch produced.
-
-    ``output`` and ``nonzero`` are separate on purpose: an all-zero output would
-    satisfy ``assert_allclose`` against an all-zero reference while proving only
-    that nothing ran, so a caller asserts the write and the values apart.
-    """
-
-    output: object            # np.ndarray read back from device memory
-    steps: list               # the artifact's step plan, e.g. HostCompute/H2D/Compute
-    nonzero: int              # elements the device actually wrote
-    size: int                 # elements in the output buffer
-    device_state: str         # the runtime's own view of the device afterwards
-    stages: dict              # every stage record, for diagnosis
-
-
-class SpyreDeviceTester:
-    """Mixin that adds numerical execution on the Spyre device.
-
-    The device peer of :class:`KTIRCpuTester`, and the same shape: a subprocess
-    behind one method, the fixture's own inputs in, an array out, and a
-    ``pytest.fail`` carrying the child's streams when it does not get there::
-
-        class TestDeviceLaunch(SpyreDeviceTester):
-            def test_numerical(self, compiled, compilable_example, tmp_path):
-                entry = EXAMPLES[compilable_example]
-                inputs = entry["inputs"](**entry["param_values"])
-                res = self.run_device(compiled.kernel, directory=tmp_path,
-                                      signature=entry["signature"],
-                                      output_key=entry["output_key"], inputs=inputs)
-                np.testing.assert_allclose(res.output, entry["reference"](inputs))
-
-    Where ``KTIRCpuTester`` needs a live ``self.mod``, this needs a compiled
-    artifact — so it takes one, from the ``compiled`` fixture, rather than
-    ``setup_method``.
-
-    The launch runs in a **child process**, and that is structural rather than
-    stylistic:
-
-    * ``torch_spyre/_C.so`` is dlopen'd at import and ``ld.so`` reads
-      ``LD_LIBRARY_PATH`` at exec, so it must be set before the interpreter starts;
-    * a Spyre device opens exclusively per process, so the pytest parent must not
-      hold one — nothing here, or anywhere in the parent, imports ``torch_spyre``;
-    * the triton venv has no ``torch``, and the interpreter that does also carries a
-      pip ``triton`` that would fight the editable one.
-
-    That last point is why the interpreter is named by
-    ``TRITON_SPYRE_LAUNCH_PYTHON`` and not discovered: which venv carries
-    torch-spyre is a property of the machine. :meth:`run_device` skips when it is
-    unset, exactly as ``run_cpu`` skips without ``ktir_cpu``. The same variable
-    decides lit's ``spyre-device`` feature, so a lit run and a bare pytest run
-    agree.
-
-    Serialization rests on one fact, and it is not the obvious one: **exactly one
-    lit test file requires the ``spyre-device`` feature.** lit runs test files in
-    parallel, one worker per test, so lit is not what serializes this; pytest only
-    serializes *within* a file (no ``pytest-xdist`` is installed and nothing sets
-    ``-n``). Those two together give one device child at a time only for as long as
-    that one-file invariant holds.
-
-    So the thing that breaks it is a second device-requiring lit *file*, not a
-    second test inside this one. At that point this needs a real lock — an
-    ``fcntl.flock`` on a well-known path around the ``subprocess.run`` below —
-    because the device does not forgive a second opener: it fails with
-    ``RAS::VFIO::DeviceOpenFail`` / ``Device or resource busy``, and the loser is
-    whichever process asked second, which may be somebody else's run rather than
-    ours.
-    """
-
-    def run_device(self, artifact, *, directory, signature, output_key, inputs):
-        """Launch *artifact* on the device and read the output back.
-
-        ``artifact`` is a compiled kernel's spyreCodeDir ZIP — i.e.
-        ``compiled.kernel`` from the ``compiled`` fixture. It is unpacked through
-        the driver's own :meth:`SpyreUtils.load_binary`, so the child sees the
-        layout a real launch would see rather than a second interpretation of the
-        ZIP.
-
-        ``signature`` is the variant's runtime signature; the pointer arguments are
-        taken from it **in kernel order**, which is the address binding: the
-        correction flit is built by walking the launch arguments positionally, so
-        segment *i* belongs to pointer *i* and a reordering silently patches the
-        wrong segments. ``inputs`` supplies one array per pointer, keyed by the same
-        source-level names, and ``output_key`` names the one read back. A pointer
-        with no array, or an ``output_key`` that is not a pointer, raises
-        ``ValueError`` here rather than surfacing as a crash in the child.
-
-        *directory* is the handoff (use ``tmp_path``): this writes ``spyrecode/``
-        and one ``<name>.npy`` per pointer into it, and the child writes the result
-        beside them.
-
-        Returns a :class:`DeviceResult`.
-        """
-        import json
-        import shutil
-        import numpy as np
-        import pytest
-
-        launch_python = os.environ.get("TRITON_SPYRE_LAUNCH_PYTHON")
-        if not launch_python or not os.access(launch_python, os.X_OK):
-            pytest.skip("TRITON_SPYRE_LAUNCH_PYTHON is unset or not executable "
-                        "— skipping device check")
-
-        pointers = [n for n, t in signature.items() if str(t).startswith("*")]
-        if output_key not in pointers:
-            raise ValueError(
-                f"run_device: output_key {output_key!r} is not a pointer argument "
-                f"— pointers, in kernel order, are {pointers}")
-        missing = [n for n in pointers if n not in inputs]
-        if missing:
-            raise ValueError(
-                f"run_device: no input array for pointer(s) {missing} — inputs "
-                f"supplies {sorted(inputs)}")
-
-        directory = Path(directory)
-        from backend.driver import SpyreUtils
-        module, _, _, _, _ = SpyreUtils().load_binary("", artifact, 0, 0)
-        shutil.copytree(module, directory / "spyrecode")
-        for name in pointers:
-            np.save(directory / f"{name}.npy", inputs[name])
-
-        env = dict(os.environ)
-        # Explicit rather than inherited. torch_spyre's import sets this by
-        # setdefault, but an inherited "0" would win and silently switch the child
-        # to binding addresses — wrong for the symbolic artifact the backend emits.
-        # The child asserts the value rather than setting it, for the same reason.
-        env["BUNDLE_SYMBOLIC_ARGS"] = "1"
-
-        proc = subprocess.run(
-            [launch_python, str(_DEVICE_RUNNER), "--dir", str(directory),
-             "--pointers", ",".join(pointers), "--output", output_key],
-            capture_output=True, text=True, env=env)
-        # The child's stdout is one JSON object per stage; on failure both streams
-        # are reported, because the useful line is as often a dlopen error on
-        # stderr as it is a Python traceback.
-        if proc.returncode != 0:
-            pytest.fail(f"device_runner failed (exit {proc.returncode})\n"
-                        f"--- stdout ---\n{proc.stdout}\n"
-                        f"--- stderr ---\n{proc.stderr}")
-
-        stages = {}
-        for line in proc.stdout.splitlines():
-            if line.startswith("{"):
-                record = json.loads(line)
-                stages[record["stage"]] = record
-        if "done" not in stages:
-            pytest.fail(f"device_runner reported no 'done' stage\n"
-                        f"--- stdout ---\n{proc.stdout}\n"
-                        f"--- stderr ---\n{proc.stderr}")
-
-        return DeviceResult(
-            output=np.load(directory / stages["done"]["output"]),
-            steps=stages["prepare"]["steps"],
-            nonzero=stages["done"]["nonzero"],
-            size=stages["done"]["size"],
-            device_state=stages.get("launch", {}).get("device_state", "unknown"),
-            stages=stages,
-        )
 
 
 # ---------------------------------------------------------------------------

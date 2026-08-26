@@ -54,6 +54,31 @@ class FakeTensor:
         return self._address
 
 
+class _Src:
+    """The one member ``SpyreLauncher`` reads off its source: ``signature``.
+
+    Keyed by parameter name in declaration order, with ``"constexpr"`` where a
+    value was baked in — the shape ``JITFunction._pack_args`` builds, which is
+    what makes it positionally paired with the launch arguments.
+    """
+
+    def __init__(self, signature):
+        self.signature = signature
+
+
+class _SpyreTensor:
+    """Enough of a Spyre tensor for the launcher's device check: ``device.type``.
+
+    Not a FakeTensor subclass — that one exists to reach Triton's compile path and
+    needs ``data_ptr`` / ``dtype``; this one never leaves the launcher.
+    """
+
+    class _Device:
+        type = "spyre"
+
+    device = _Device()
+
+
 def _zip_bytes(entries):
     """Deterministic ZIP, matching what ``_make_spyrecode`` emits."""
     buffer = io.BytesIO()
@@ -228,19 +253,35 @@ class TestSpyreLauncher:
 
         SpyreLauncher(object(), Bare())
 
-    def test_call_raises_not_implemented(self):
-        launcher = SpyreLauncher(object(), object())
-        with pytest.raises(NotImplementedError, match="not implemented yet"):
-            launcher(1, 1, 1, 0, "/some/dir", (), None, None, None, "a", "b")
+    def test_call_rejects_a_non_spyre_tensor_by_name(self):
+        # Every launch argument must be a Spyre tensor -- SpyreStream::launch
+        # checks is_privateuseone -- and this is where that gets said, while the
+        # parameter still has a name. From C++ it is an index into a list the
+        # caller never built. Rejected before torch_spyre is imported, so the
+        # message is the same on a machine that has no torch-spyre at all.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16", "BLOCK": "constexpr"}),
+                                 object())
+        with pytest.raises(TypeError, match="'x_ptr'"):
+            launcher(1, 1, 1, 0, "/some/dir", (), None, None, None,
+                     FakeTensor(0), 64)
 
-    def test_call_message_names_the_program(self):
-        launcher = SpyreLauncher(object(), object())
-        with pytest.raises(NotImplementedError) as excinfo:
-            launcher(4, 1, 1, 0, "/some/dir", (), None, None, None, "a")
-        message = str(excinfo.value)
-        assert "/some/dir" in message
-        # The grid is a tile count, not an axis partition (issue #100).
-        assert "tile count" in message
+    def test_call_rejects_an_argument_count_the_signature_does_not_match(self):
+        # The pairing is positional, so a length disagreement has no safe guess.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16", "y_ptr": "*fp16"}),
+                                 object())
+        with pytest.raises(RuntimeError, match="1 launch argument"):
+            launcher(1, 1, 1, 0, "/some/dir", (), None, None, None,
+                     _SpyreTensor())
+
+    def test_address_args_keeps_pointers_in_kernel_order(self):
+        # Only the pointers carry an address, and their order IS the binding: the
+        # correction flit is built by walking them positionally. Constexprs and
+        # runtime scalars are dropped -- a constexpr is already in the binary.
+        x, y = _SpyreTensor(), _SpyreTensor()
+        launcher = SpyreLauncher(
+            _Src({"x_ptr": "*fp16", "n": "i32", "y_ptr": "*fp16",
+                  "BLOCK": "constexpr"}), object())
+        assert launcher._address_args((x, 4096, y, 64)) == [x, y]
 
 
 # ---------------------------------------------------------------------------
@@ -261,15 +302,11 @@ class TestSubscriptLaunch:
                       if k in entry["constexpr"]}
         pointers = [n for n in entry["signature"] if n.endswith("_ptr")]
         tensors = [FakeTensor(i * (1 << 34)) for i in range(len(pointers))]
-        with pytest.raises(NotImplementedError) as excinfo:
+        # A FakeTensor is not on the Spyre device, so the launch stops on that --
+        # inside SpyreLauncher, naming the first pointer. Which is the point: the
+        # failure is ours and about the launch, not Triton's plumbing about a
+        # missing member, and it needs no device to demonstrate.
+        with pytest.raises(TypeError, match=f"{pointers[0]!r}"):
             entry["kernel_fn"][tuple(spyrecode_options["grid"])](
                 *tensors, **constexprs,
                 required_fixes=dict(spyrecode_options["required_fixes"]))
-        # The program path in the message is the unpacked spyreCodeDir, so
-        # reaching here proves compile + load + launcher dispatch all ran.
-        from pathlib import Path
-        program = Path(str(excinfo.value).split("program at ")[1]
-                       .split(". The launch")[0])
-        assert (program / "spyrecode.json").is_file()
-        assert (program / "init_binary.bin").is_file()
-        assert (program / "debug").is_dir()
