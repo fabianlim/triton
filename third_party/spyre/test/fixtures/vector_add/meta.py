@@ -38,7 +38,6 @@ def _make_3d_checks(M, N, P, **_):
         t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{N}x{P}xf32>")
     return checks
 
-
 def _make_1d_scalar_dim_checks(**_):
     def checks(t):
         # Single-element 1-D scalar-read chain: construct_memory_view
@@ -424,7 +423,7 @@ VARIANTS = {
         # why it lives here rather than inline in a test module.
         "tags": [
             "descriptor-load-static", "descriptor-store-static",
-            "simplified:no-grid"
+            "simplified:no-loop", "spyre-tensor-layout"
         ],
         "summary": (
             "Elementwise add over a single tile, with no grid distribution "
@@ -437,9 +436,10 @@ VARIANTS = {
         ),
         "kernel_fn":    kernel.add_kernel_device,
         "SIGNATURE":    _SIG_TENSORS_FP16,
-        "constexpr":    ["n_elements", "LAYOUT"],
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT"],
         "params":       {
             "n_elements": [128],
+            "BLOCK_SIZE": [128],
             # LAYOUT is a constexpr that enters the Triton cache key, so it
             # must be hashable -- a list is not. Stored as tuple of tuples.
             # A labelled ("name", value) pair is required: the framework's
@@ -458,11 +458,39 @@ VARIANTS = {
         "compiles_to_binary": True,
         "reference":    run,
         # BLOCK_SIZE is actually not useds, stub it out
-        "inputs":       functools.partial(make_inputs, dtype="f16", BLOCK_SIZE=None),
+        "inputs":       functools.partial(make_inputs, dtype="f16"),
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": None,
+        "extra_checks": None, # for the device examples we disable the checks
+    },
+    "1d_device_grid2": {
+        # The multi-core counterpart of 1d_device: still one tile per corelet and
+        # still no distribution loop, but two corelets each taking half the
+        # vector.  n_elements=128 over BLOCK_SIZE=64 is exactly two fp16 sticks,
+        # one per corelet, so corelet i owns stick i.
+        "base": "1d_device",
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout"
+        ],
+        "summary": (
+            "Elementwise add distributed over two corelets, one stick each, "
+            "with no distribution loop."
+        ),
+        "doc": (
+            "Takes two 128-element fp16 vectors in a 2-stick spyre tensor "
+            "layout and writes `C = A + B` across a `grid = [2]`.  Each corelet "
+            "reads `tl.program_id(0)` and offsets by `pid * BLOCK_SIZE`, so it "
+            "owns exactly one 64-element stick; there is no `tl.num_programs` "
+            "and no `scf.for`.\n\n"
+        ),
+        "grid": [2],
+        "params":       {
+            "n_elements": [128],
+            "BLOCK_SIZE": [64],
+            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
+        },
     },
     "2d_spyre_stick": {
         # Elementwise add with all three operands stick-on-N. Every operand

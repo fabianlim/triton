@@ -383,6 +383,7 @@ def add_kernel_device(
     y_ptr,
     output_ptr,
     n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
 ):
     """Elementwise add over exactly one tile, with no distribution loop.
@@ -394,18 +395,21 @@ def add_kernel_device(
     the only variant in the suite that reaches a Spyre *binary* rather than
     stopping at KTIR.
     """
+    pid = tl.program_id(0)
+
     x_desc = tl.make_tensor_descriptor(
-        x_ptr, shape=[n_elements], strides=[1], block_shape=[n_elements],
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
     y_desc = tl.make_tensor_descriptor(
-        y_ptr, shape=[n_elements], strides=[1], block_shape=[n_elements],
+        y_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
     out_desc = tl.make_tensor_descriptor(
-        output_ptr, shape=[n_elements], strides=[1], block_shape=[n_elements],
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
     )
     tl.spyre_tensor_layout(x_desc, LAYOUT)
     tl.spyre_tensor_layout(y_desc, LAYOUT)
     tl.spyre_tensor_layout(out_desc, LAYOUT)
-    x = x_desc.load([0])
-    y = y_desc.load([0])
-    out_desc.store([0], x + y)
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    y = y_desc.load([offset])
+    out_desc.store([offset], x + y)

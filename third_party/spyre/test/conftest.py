@@ -788,17 +788,3 @@ def compiled(dbo_opt, spyrecode_options, binary_source):
     return triton_compile(binary_source, target=spyre_target(),
                           options=spyrecode_options)
 
-
-@pytest.fixture(scope="module")
-def compiled_baked(dbo_opt, spyrecode_options, binary_source):
-    """The same variant with addresses baked in rather than symbolic.
-
-    The non-default mode, and the only one in which the backend derives anything
-    from the pointer types -- so it is what a test asserting a derived address has
-    to compile. A fixture rather than a compile written inside the test, so that
-    class takes its binary the same way throughout.
-    """
-    from triton.compiler.compiler import compile as triton_compile
-    from utils import spyre_target
-    return triton_compile(binary_source, target=spyre_target(),
-                          options={**spyrecode_options, "symbolic_args": False})
