@@ -65,6 +65,14 @@ namespace {
 using namespace mlir;
 using namespace mlir::triton::ktdp;
 
+/// True for a cast that only changes the width (or index-ness) of an integer,
+/// never its value: transparent when following a def-chain back to what the
+/// index really derives from.
+bool isWidthPreservingIntCast(Operation *op) {
+  return isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::TruncIOp,
+             arith::ExtSIOp, arith::ExtUIOp>(op);
+}
+
 /// Walk a def-chain of index arithmetic back to the single BlockArgument it
 /// derives from.
 BlockArgument traceToMLIRBlockArg(Value v) {
@@ -74,8 +82,7 @@ BlockArgument traceToMLIRBlockArg(Value v) {
     auto *op = v.getDefiningOp();
     if (!op)
       return nullptr;
-    if (isa<arith::IndexCastOp, arith::IndexCastUIOp,
-            arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp>(op)) {
+    if (isWidthPreservingIntCast(op)) {
       v = op->getOperand(0);
       continue;
     }
@@ -85,6 +92,123 @@ BlockArgument traceToMLIRBlockArg(Value v) {
     }
     return nullptr;
   }
+}
+
+/// The integer arithmetic `rebuildInIndexDomain` re-emits. Deliberately not
+/// shared with traceToMLIRBlockArg's list: that walk drops a constant RHS on
+/// the assumption that scaleDownIVMuls compensates for it, so widening its op
+/// set would change which loops get rescaled.
+bool isRebuildableIntArith(Operation *op) {
+  return isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp,
+             arith::SubIOp>(op);
+}
+
+/// True if `v`'s expression can be re-materialised in the index domain
+/// value-preservingly — every leaf is an integer constant or a grid-coordinate
+/// query, joined only by casts and `isRebuildableIntArith` operations.
+///
+/// This is the whole safety argument for the rewrite. `index` is 64-bit, so
+/// lifting an expression out of `i32` stops it wrapping, and only for grid
+/// coordinates scaled by tile sizes is the non-wrapping reading provably the
+/// intended one. A genuine run-time `i32` scalar — a kernel argument, or a
+/// dimension read from memory — must reach the subscript exactly as it is.
+bool canRebuildInIndexDomain(Value v) {
+  if (getConstantInt(v))
+    return true;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (isa<mlir::ktdp::GetComputeTileIdOp, triton::GetProgramIdOp>(op))
+    return true;
+  if (isWidthPreservingIntCast(op))
+    return canRebuildInIndexDomain(op->getOperand(0));
+  if (!isRebuildableIntArith(op))
+    return false;
+  return canRebuildInIndexDomain(op->getOperand(0)) &&
+         canRebuildInIndexDomain(op->getOperand(1));
+}
+
+/// True if `v` is computed by arithmetic performed outside the index domain.
+/// A cast on its own does not count: the scheduler reads through a cast of a
+/// constant, and through a cast pair with no arithmetic between them.
+bool hasFixedWidthIntArith(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (isWidthPreservingIntCast(op))
+    return hasFixedWidthIntArith(op->getOperand(0));
+  if (!isRebuildableIntArith(op))
+    return false;
+  if (!v.getType().isIndex())
+    return true;
+  return hasFixedWidthIntArith(op->getOperand(0)) ||
+         hasFixedWidthIntArith(op->getOperand(1));
+}
+
+/// Emit `v`'s expression with every step performed in `index`. Requires
+/// canRebuildInIndexDomain(v).
+Value emitInIndexDomain(OpBuilder &b, Location loc, Value v) {
+  if (auto cst = getConstantInt(v)) {
+    if (v.getType().isIndex())
+      return v;
+    return arith::ConstantOp::create(b, loc, b.getIndexAttr(*cst)).getResult();
+  }
+
+  Operation *op = v.getDefiningOp();
+
+  // A grid coordinate is index-valued at the source; `tt.get_program_id` only
+  // spells it as i32 because Triton has no index type. DistributeWork has not
+  // run yet at this point in the pipeline, so both spellings occur. Casting
+  // the i32 form back leaves an adjacent cast pair once DistributeWork
+  // rewrites the query to `index_cast(ktdp.get_compute_tile_id)`, which the
+  // canonicalizer that follows it folds away.
+  if (isa<mlir::ktdp::GetComputeTileIdOp, triton::GetProgramIdOp>(op)) {
+    if (v.getType().isIndex())
+      return v;
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), v).getResult();
+  }
+
+  if (isWidthPreservingIntCast(op))
+    return emitInIndexDomain(b, loc, op->getOperand(0));
+
+  Value lhs = emitInIndexDomain(b, loc, op->getOperand(0));
+  Value rhs = emitInIndexDomain(b, loc, op->getOperand(1));
+
+  // Already native `index` arithmetic over the same operands — reuse it
+  // rather than emitting a duplicate chain.
+  if (v.getType().isIndex() && lhs == op->getOperand(0) &&
+      rhs == op->getOperand(1))
+    return v;
+
+  if (isa<arith::MulIOp>(op))
+    return arith::MulIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::DivSIOp>(op))
+    return arith::DivSIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::RemSIOp>(op))
+    return arith::RemSIOp::create(b, loc, lhs, rhs).getResult();
+  if (isa<arith::AddIOp>(op))
+    return arith::AddIOp::create(b, loc, lhs, rhs).getResult();
+  return arith::SubIOp::create(b, loc, lhs, rhs).getResult();
+}
+
+/// Re-materialise `v` with every step performed in `index`, or return `v`
+/// itself when that cannot be done value-preservingly, or when there is
+/// nothing to lift.
+///
+/// Triton computes offsets in `i32` (its scalar domain by language
+/// definition), so a `pid`-derived subscript reaches this pass as
+/// `index_cast(muli(index_cast(pid), c) : i32)`. The scheduler's symbolic
+/// start-address analysis reads only a closed set of `index` arithmetic and
+/// treats the cast as opaque, so it rejects the address as run-time-varying
+/// even though every term is a compile-time-known per-corelet constant.
+/// Re-emitting the expression natively in `index` keeps it readable.
+///
+/// Deciding before emitting anything keeps the two failure modes free of
+/// side effects: a kernel this cannot help gets byte-identical IR.
+Value rebuildInIndexDomain(OpBuilder &b, Location loc, Value v) {
+  if (!hasFixedWidthIntArith(v) || !canRebuildInIndexDomain(v))
+    return v;
+  return emitInIndexDomain(b, loc, v);
 }
 
 /// Apply a single coordinate-map operation to an SSA index value.
@@ -398,7 +522,11 @@ struct RewriteDescriptorLayoutPass
         }
       }
 
-      physIdx.push_back(applyCoordOp(b, loc, logI, op, arg));
+      // The split itself is built in `index`; lift its input there too, so no
+      // fixed-width arithmetic is left between the subscript and the values it
+      // derives from.
+      physIdx.push_back(
+          applyCoordOp(b, loc, rebuildInIndexDomain(b, loc, logI), op, arg));
     }
 
     Value newTileResult = mlir::triton::ktdp::buildAccessTile(
