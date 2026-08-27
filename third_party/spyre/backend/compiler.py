@@ -408,6 +408,22 @@ class SpyreBackend(BaseBackend):
         # still a contradiction, and __post_init__ still refuses it.
         if parsed.get("base_addresses") and "symbolic_args" not in options:
             parsed["symbolic_args"] = False
+
+        # The two fix passes the scheduler inside dbo-opt requires of every kernel
+        # it will lower to a binary.  Merged under the caller's own entries so an
+        # explicit override of a specific anchor still wins, but a caller that
+        # passes nothing still gets them.
+        #
+        # The anchor is rewrite_descriptor_layout, not lower_compute_ops.
+        # lower_compute_ops builds a linalg.generic with logical types before the
+        # layout pass physicalizes the descriptor to its stick shape; the types then
+        # disagree and the pipeline aborts.  rewrite_descriptor_layout runs after
+        # that physicalization, so the fixes see consistent types.
+        parsed["required_fixes"] = {
+            "convert_elementwise_to_linalg": "rewrite_descriptor_layout",
+            "unalias_linalg_outs":           "rewrite_descriptor_layout",
+            **parsed.get("required_fixes", {}),
+        }
         return SpyreOptions(**parsed)
 
     def compile_time_launch_options(self, grid, specialization) -> dict:

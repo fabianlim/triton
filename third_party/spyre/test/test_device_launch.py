@@ -56,10 +56,9 @@ class TestDeviceLaunch:
         args = [staged.get(name, entry["param_values"].get(name))
                 for name in entry["kernel_fn"].arg_names]
 
-        # Grid and required_fixes come from spyrecode_options -- dbo-opt's
-        # requirements, not this test's.
-        options = dict(spyrecode_options)
-        entry["kernel_fn"][options.pop("grid")](*args, **options)
+        # Grid comes from spyrecode_options. The fixes dbo-opt requires are
+        # injected automatically by parse_options.
+        entry["kernel_fn"][spyrecode_options["grid"]](*args)
 
         output = staged[entry["output_key"]].cpu().numpy()
 

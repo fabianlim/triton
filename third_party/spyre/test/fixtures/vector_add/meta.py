@@ -115,7 +115,7 @@ def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int 
     x/y/output buffers and adds the scalar read as a rank-1 buffer of
     length 1.
     """
-    inputs = make_inputs(n_elements, BLOCK_SIZE, dtype)
+    inputs = make_inputs(n_elements, BLOCK_SIZE, dtype=dtype)
     inputs["seqlen_ptr"] = np.array([n_elements], dtype=np.int32)
     return inputs
 
