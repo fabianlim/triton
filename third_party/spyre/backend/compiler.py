@@ -665,8 +665,13 @@ class SpyreBackend(BaseBackend):
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()
 
-        with tempfile.TemporaryDirectory(prefix="spyrecode_") as tmp:
-            tmp = Path(tmp)
+        # Debug mode: leave the directory on disk so kernel.ktir and the
+        # per-stage artifacts under export/debug/ survive the call, whether it
+        # succeeds or fails.  Non-debug cleans up automatically.
+        with tempfile.TemporaryDirectory(
+            prefix="spyrecode_", delete=not knobs.spyre.dbo_debug,
+        ) as _tmp_str:
+            tmp = Path(_tmp_str)
             ktir_path = tmp / "kernel.ktir"
             ktir_path.write_text(str(mod))
             export_dir = tmp / "export"
@@ -693,11 +698,13 @@ class SpyreBackend(BaseBackend):
                 origin = (f"PATH, since knobs.spyre.dbo_opt is the default "
                           f"{configured!r}" if os.sep not in configured
                           else f"knobs.spyre.dbo_opt={configured!r}")
+                debug_note = (f"\n  debug files at: {tmp}"
+                              if knobs.spyre.dbo_debug else "")
                 raise RuntimeError(
                     f"dbo-opt failed (exit {result.returncode}):\n"
                     f"  tool: {dbo_opt}\n"
                     f"  from: {origin}\n"
-                    f"  argv: {' '.join(argv)}\n"
+                    f"  argv: {' '.join(argv)}{debug_note}\n"
                     "If the diagnostics below name an unknown attribute or "
                     "dialect, this dbo-opt is older than the KTIR this backend "
                     "emits: set TRITON_SPYRE_DBO_OPT to a newer one.\n"
