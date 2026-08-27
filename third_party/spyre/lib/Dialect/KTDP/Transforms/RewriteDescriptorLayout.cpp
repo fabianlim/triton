@@ -65,12 +65,33 @@ namespace {
 using namespace mlir;
 using namespace mlir::triton::ktdp;
 
-/// True for a cast that only changes the width (or index-ness) of an integer,
-/// never its value: transparent when following a def-chain back to what the
-/// index really derives from.
-bool isWidthPreservingIntCast(Operation *op) {
+/// True for a cast that is transparent when following a def-chain back to
+/// *which* value an index derives from. Only the identity of the root matters
+/// here, not the value that reaches it, so a truncation is transparent too.
+/// NOT usable for deciding whether an expression can be re-materialised in a
+/// wider domain -- see isValuePreservingIntCast.
+bool isIdentityTracingIntCast(Operation *op) {
   return isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::TruncIOp,
              arith::ExtSIOp, arith::ExtUIOp>(op);
+}
+
+/// True for a cast that widens an integer while preserving its value *under a
+/// signed reading*, so re-emitting the expression in the 64-bit `index` domain
+/// cannot change what it denotes.
+///
+/// Deliberately narrower than isIdentityTracingIntCast on two counts, both
+/// load-bearing for the rewrite's safety argument:
+///
+///   * arith.trunci is excluded. It discards high bits by definition, so it
+///     is not value-preserving. Treating it as transparent would let the
+///     rebuild *drop* the truncation -- emitting the untruncated wide product
+///     and addressing a different tile than the i32 expression did.
+///   * arith.extui / arith.index_castui are excluded. A zero-extended
+///     negative i32 is a large positive i64, so the signed divsi/remsi that
+///     isRebuildableIntArith re-emits would disagree with the original.
+///     Sign-extending forms only.
+bool isValuePreservingIntCast(Operation *op) {
+  return isa<arith::IndexCastOp, arith::ExtSIOp>(op);
 }
 
 /// Walk a def-chain of index arithmetic back to the single BlockArgument it
@@ -82,7 +103,7 @@ BlockArgument traceToMLIRBlockArg(Value v) {
     auto *op = v.getDefiningOp();
     if (!op)
       return nullptr;
-    if (isWidthPreservingIntCast(op)) {
+    if (isIdentityTracingIntCast(op)) {
       v = op->getOperand(0);
       continue;
     }
@@ -92,6 +113,18 @@ BlockArgument traceToMLIRBlockArg(Value v) {
     }
     return nullptr;
   }
+}
+
+/// True for any integer arithmetic op in the arith dialect, whether or not
+/// this pass can re-emit it. Used to tell "arithmetic happened at a fixed
+/// width" (which motivates a lift) apart from "this is a bare root or cast"
+/// (which does not) -- independent of whether the lift turns out to be safe.
+bool isArithIntOp(Operation *op) {
+  return isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::DivSIOp,
+             arith::DivUIOp, arith::RemSIOp, arith::RemUIOp, arith::AndIOp,
+             arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp,
+             arith::ShRUIOp, arith::MaxSIOp, arith::MaxUIOp, arith::MinSIOp,
+             arith::MinUIOp>(op);
 }
 
 /// The integer arithmetic `rebuildInIndexDomain` re-emits. Deliberately not
@@ -120,9 +153,15 @@ bool canRebuildInIndexDomain(Value v) {
     return false;
   if (isa<mlir::ktdp::GetComputeTileIdOp, triton::GetProgramIdOp>(op))
     return true;
-  if (isWidthPreservingIntCast(op))
+  if (isValuePreservingIntCast(op))
     return canRebuildInIndexDomain(op->getOperand(0));
   if (!isRebuildableIntArith(op))
+    return false;
+  // Every op in isRebuildableIntArith is binary today, and emitInIndexDomain
+  // reconstructs them as binary. Bail rather than index out of bounds if that
+  // list ever grows a unary or variadic member (arith.select, say) -- matching
+  // the defensive arity check in traceToMLIRBlockArg.
+  if (op->getNumOperands() != 2)
     return false;
   return canRebuildInIndexDomain(op->getOperand(0)) &&
          canRebuildInIndexDomain(op->getOperand(1));
@@ -135,12 +174,21 @@ bool hasFixedWidthIntArith(Value v) {
   Operation *op = v.getDefiningOp();
   if (!op)
     return false;
-  if (isWidthPreservingIntCast(op))
+  if (isValuePreservingIntCast(op))
     return hasFixedWidthIntArith(op->getOperand(0));
-  if (!isRebuildableIntArith(op))
+  // Any integer arithmetic whose result is not `index` is what we are looking
+  // for -- including an op outside isRebuildableIntArith (arith.shli, say).
+  // Testing rebuildability first would report "no fixed-width arithmetic" for
+  // those and skip a subscript that does need lifting; canRebuildInIndexDomain
+  // is what decides whether the lift is *safe*, and it still rejects them.
+  // A non-arithmetic root (a bare grid query) must NOT answer true here: that
+  // is the bare-cast case this predicate exists to leave alone.
+  if (!isArithIntOp(op))
     return false;
   if (!v.getType().isIndex())
     return true;
+  if (!isRebuildableIntArith(op) || op->getNumOperands() != 2)
+    return false;
   return hasFixedWidthIntArith(op->getOperand(0)) ||
          hasFixedWidthIntArith(op->getOperand(1));
 }
@@ -168,7 +216,7 @@ Value emitInIndexDomain(OpBuilder &b, Location loc, Value v) {
     return arith::IndexCastOp::create(b, loc, b.getIndexType(), v).getResult();
   }
 
-  if (isWidthPreservingIntCast(op))
+  if (isValuePreservingIntCast(op))
     return emitInIndexDomain(b, loc, op->getOperand(0));
 
   Value lhs = emitInIndexDomain(b, loc, op->getOperand(0));
