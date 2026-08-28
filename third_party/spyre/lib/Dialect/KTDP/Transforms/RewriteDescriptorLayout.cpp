@@ -25,6 +25,7 @@
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
+#include "RewriteDescriptorLayout/IndexDomain.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -64,28 +65,6 @@ namespace {
 
 using namespace mlir;
 using namespace mlir::triton::ktdp;
-
-/// Walk a def-chain of index arithmetic back to the single BlockArgument it
-/// derives from.
-BlockArgument traceToMLIRBlockArg(Value v) {
-  while (true) {
-    if (auto ba = dyn_cast<BlockArgument>(v))
-      return ba;
-    auto *op = v.getDefiningOp();
-    if (!op)
-      return nullptr;
-    if (isa<arith::IndexCastOp, arith::IndexCastUIOp,
-            arith::TruncIOp, arith::ExtSIOp, arith::ExtUIOp>(op)) {
-      v = op->getOperand(0);
-      continue;
-    }
-    if (isa<arith::MulIOp, arith::DivSIOp, arith::RemSIOp, arith::AddIOp>(op)) {
-      if (op->getNumOperands() == 2 && getConstantInt(op->getOperand(1)))
-        { v = op->getOperand(0); continue; }
-    }
-    return nullptr;
-  }
-}
 
 /// Apply a single coordinate-map operation to an SSA index value.
 /// Returns the transformed index (identity / divsi / remsi).
@@ -398,7 +377,11 @@ struct RewriteDescriptorLayoutPass
         }
       }
 
-      physIdx.push_back(applyCoordOp(b, loc, logI, op, arg));
+      // The split itself is built in `index`; lift its input there too, so no
+      // fixed-width arithmetic is left between the subscript and the values it
+      // derives from.
+      physIdx.push_back(
+          applyCoordOp(b, loc, rebuildInIndexDomain(b, loc, logI), op, arg));
     }
 
     Value newTileResult = mlir::triton::ktdp::buildAccessTile(
