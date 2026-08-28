@@ -80,6 +80,13 @@ OpTrait::impl::verifySameOperandsAndResultEncoding(Operation *op) {
 }
 
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
+  // --- START --- changed for spyre
+  // Gated as a unit: the pow2 limit below is a GPU artifact too. Mirrors the
+  // is_spyre() early return in validate_block_shape (triton/_utils.py).
+#ifdef TRITON_BUILD_TTIR_ONLY
+  (void)op;
+  return success();
+#else
   for (auto opType : op->getOperandTypes()) {
     if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
       int64_t numElements = 1;
@@ -89,16 +96,10 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-#ifndef TRITON_BUILD_TTIR_ONLY // --- added for spyre
-      // The power-of-two requirement is a GPU LinearLayout / warp-tiling
-      // artifact. Spyre (TTIR-only) lowers tensors to KTIR/KTDP descriptors that
-      // handle arbitrary sizes, so skip the pow2 check; the numel cap above
-      // still applies. Mirrors the is_spyre() frontend relaxations.
       if ((numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
-#endif
     }
   }
   for (auto opType : op->getResultTypes()) {
@@ -110,19 +111,15 @@ LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
         return op->emitError("Maximum allowed number of elements is ")
                << maxTensorNumElements << ", but " << *op
                << " has more than that";
-#ifndef TRITON_BUILD_TTIR_ONLY // --- added for spyre
-      // The power-of-two requirement is a GPU LinearLayout / warp-tiling
-      // artifact. Spyre (TTIR-only) lowers tensors to KTIR/KTDP descriptors that
-      // handle arbitrary sizes, so skip the pow2 check; the numel cap above
-      // still applies. Mirrors the is_spyre() frontend relaxations.
       if ((numElements & (numElements - 1)) != 0)
         return op->emitError("Number of elements must be power-of-two, but ")
                << *op << " doesn't follow the rule (" << numElements << ")"
                << " elements";
-#endif
     }
   }
   return success();
+#endif
+  // --- END --- changed for spyre
 }
 
 // Check that the Triton layouts on op's operands and return types are valid.
