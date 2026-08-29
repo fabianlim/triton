@@ -59,6 +59,7 @@ import itertools
 import re
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,9 @@ from utils import (  # noqa: E402
 #   output_key    : which inputs key holds the output buffer
 #   func_name     : KTIR function name (defaults to kernel_fn.__name__)
 #   extra_checks  : optional (tester) -> None for variant-specific asserts
+#   factory       : optional VariantFactory supplying the fields that depend
+#                   on the swept combination (see factories.py and
+#                   _apply_factory below)
 #   xfail_numerical : optional str | dict for the numerical-test xfail mark
 #
 # The ``constexprs`` grammar supports only ``dict[str, scalar]`` — each entry
@@ -305,6 +309,94 @@ def _sweep_suffix(merged_params: dict, combo: dict, always_suffixed: set = froze
     return "[" + ", ".join(f"{k}={combo[k][0]}" for k in swept) + "]"
 
 
+@dataclass(frozen=True)
+class VariantFactory:
+    """Produces the variant fields that depend on the swept combination.
+
+    A variant carries one on its ``"factory"`` key. Each hook is called once per
+    combination with the combination as keyword arguments — plain values, so
+    declare ``**_`` for the axes it ignores — and returns that field's value, or
+    ``None`` to leave the field unset. Fixtures subclass this and keep their
+    configuration in dataclass fields (``Elementwise(rank=2)``), so derivations
+    shared between hooks (``DTYPE`` → stick width, ``OP`` → ufunc) live on one
+    object rather than in ``functools.partial`` chains.
+
+    Hooks are recognised **by name**, never inferred from a callable's shape.
+    ``extra_checks`` does infer — any ``**kwargs`` callable is its factory — and
+    that rule cannot be generalised: ``inter_tile_reduce``'s *oracle*
+    ``run_element_sum(inputs, ..., **_kw)`` (``meta.py:86``, bound with partial
+    at ``:317``) would be read as one and called with no ``inputs``.
+
+    ``extra_checks`` is deliberately not a hook. #71 deletes that field, so it
+    keeps its own resolution in ``_load_examples`` and the two never interact.
+    New dtype-dependent *structural* assertions belong in lit, per #55.
+    """
+
+    def signature(self, **combo):
+        """-> the variant's ``SIGNATURE``, ``{arg_name: dtype_str}``."""
+        return None
+
+    def reference(self, **combo):
+        """-> the ``reference`` oracle, ``(inputs) -> np.ndarray``."""
+        return None
+
+    def inputs(self, **combo):
+        """-> the ``inputs`` generator, ``(**param_values) -> {name: array}``."""
+        return None
+
+    def declares(self, hook: str) -> bool:
+        """Whether *hook* is defined here rather than inherited as the default.
+
+        Only for the collision error below: a collision is in what the author
+        wrote, not in what one combination happened to return.
+        """
+        return getattr(type(self), hook) is not getattr(VariantFactory, hook)
+
+
+# Hook name → the field it produces. A table, because ``SIGNATURE`` is uppercase
+# by fixture convention and ``def SIGNATURE(self, ...)`` would read worse.
+_FACTORY_HOOKS = {
+    "signature": "SIGNATURE",
+    "reference": "reference",
+    "inputs":    "inputs",
+}
+
+
+def _apply_factory(entry: dict, combo: dict, *, kernel_name: str) -> None:
+    """Resolve *entry*'s ``factory`` hooks for one combination, in place.
+
+    *combo* is the post-normalisation ``{name: (label, value)}`` map; hooks get
+    the values, since a fixture author reasons about ``DTYPE="fp16"`` and not
+    about the label that names it in a registry key.
+    """
+    factory = entry.get("factory")
+    if factory is None:
+        return
+    if not isinstance(factory, VariantFactory):
+        raise TypeError(
+            f"{kernel_name}: 'factory' must be a VariantFactory instance, got "
+            f"{type(factory).__name__} — hooks are recognised by name, so "
+            f"nothing is duck-typed into being a factory."
+        )
+
+    combo_values = {k: v[1] for k, v in combo.items()}
+    for hook, field in _FACTORY_HOOKS.items():
+        # Refuse the ambiguity where it is written: with both present, which one
+        # wins would be a fact about statement order here. Checked on the
+        # *merged* entry, so inheriting a literal field from a base and adding
+        # the hook is refused too — the base has to drop the literal, since the
+        # merge grammar cannot delete a key.
+        if factory.declares(hook) and field in entry:
+            raise ValueError(
+                f"{kernel_name}: declares both the literal field {field!r} and "
+                f"the factory hook {hook}() that produces it. Keep one: remove "
+                f"the field, or remove the hook."
+            )
+        value = getattr(factory, hook)(**combo_values)
+        if value is not None:
+            entry[field] = value
+
+
 def _load_examples():
     registry: dict = {}
     if not _FIXTURES_DIR.exists():
@@ -379,6 +471,14 @@ def _load_examples():
                            for p in sig.parameters.values()):
                         combo_values = {k: v[1] for k, v in combo.items()}
                         entry["extra_checks"] = ec(**combo_values)
+
+                # Combination-dependent fields, before _resolve_variant: it
+                # reads entry.get("SIGNATURE", module_sig) and needs a plain
+                # dict by then. No handling is needed in _resolve_base above —
+                # 'factory' is a single value, so its shallow merge replaces it
+                # wholesale, and a variant wanting its base's factory with one
+                # field changed writes dataclasses.replace(...).
+                _apply_factory(entry, combo, kernel_name=f"{name}::{vname}{suffix}")
 
                 if module_sig:
                     runtime, constexprs, param_values = _resolve_variant(

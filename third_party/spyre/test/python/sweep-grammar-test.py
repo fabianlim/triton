@@ -1,3 +1,5 @@
+# RUN: %python -m pytest %s -q
+
 # Copyright 2025 IBM Corp.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,38 +14,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for conftest sweep-grammar helpers.
+"""Unit tests for the ``_load_examples`` helpers in ``conftest``.
 
-The sweep grammar allows a fixture variant's ``params`` dict to carry
-lists with more than one value.  ``_load_examples`` expands each variant
-into one registry entry per Cartesian-product point, keyed as
-``<variant>[k=v, ...]``.
+Two related mechanisms that turn ``VARIANTS`` declarations into registry entries:
 
-Two forms are supported:
+**Sweep grammar** — ``params`` lists expand into a Cartesian product, one entry
+per point, keyed as ``<variant>[k=v, ...]``:
 
   Plain values::
 
       "M": [128, 256, 512]   →  entries [M=128], [M=256], [M=512]
 
-  Labelled tuples ``(label, value)`` — used when the value is a complex
-  type (list, dict) whose repr would be unreadable in a key::
+  Labelled tuples — for complex types whose repr would be unreadable in a key::
 
-      "A_LAYOUT": [
-          ("stick_on_k", [(1, "floordiv", ...)]),
-          ("stick_on_m", [(0, "floordiv", ...)]),
-      ]
-      →  entries [A_LAYOUT=stick_on_k], [A_LAYOUT=stick_on_m]
+      "LAYOUT": [("stick", [...])]   →  entry [LAYOUT=stick]  (always shown)
 
-  A labelled param always appears in the suffix even if it has only one
-  value — the explicit label signals the author wants it visible.
+  ``_normalise_param_list``, ``_expand_params``, ``_sweep_suffix``.
 
-These tests exercise ``_normalise_param_list``, ``_expand_params``, and
-``_sweep_suffix`` in isolation: no filesystem access, no Triton import.
+**Factory protocol** — a variant's ``"factory"`` key carries a ``VariantFactory``
+whose hooks produce the fields that depend on the combination, so ``OP`` × ``DTYPE``
+is one declaration rather than twelve. ``_apply_factory``, ``VariantFactory``.
+
+A lit test rather than a pytest module: needs no dbo-opt and no device, and a test
+that needs nothing should not sit in the suite that serializes the device. Same
+direction as #71 for structural checks.
 """
+
+import functools
+from dataclasses import dataclass
 
 import pytest
 
-from conftest import _expand_params, _normalise_param_list, _sweep_suffix
+from conftest import (
+    VariantFactory,
+    _apply_factory,
+    _expand_params,
+    _normalise_param_list,
+    _sweep_suffix,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -362,3 +370,146 @@ def test_integration_mixed_error_propagates():
     """Mixed labelled/plain list raises before any keys are emitted."""
     with pytest.raises(ValueError, match="mixes labelled tuples"):
         _simulate_registry_keys("bad_kernel", {"X": [1, ("label", 2)]})
+
+
+# ---------------------------------------------------------------------------
+# _apply_factory / VariantFactory
+# ---------------------------------------------------------------------------
+
+def _apply(entry: dict, combo_values: dict) -> dict:
+    """``_apply_factory`` on *entry* for a combination of plain values.
+
+    Wraps each value back into the ``(label, value)`` pair form ``_expand_params``
+    produces, which is what ``_apply_factory`` consumes.
+    """
+    combo = {k: (str(v), v) for k, v in combo_values.items()}
+    _apply_factory(entry, combo, kernel_name="fix::variant")
+    return entry
+
+
+def test_absent_factory_leaves_the_entry_untouched():
+    """No ``factory`` key → the entry is passed through byte for byte."""
+    entry = {"kernel_fn": object(), "params": {"M": [64]}, "reference": len}
+    before = dict(entry)
+    _apply(entry, {"M": 64})
+    assert entry == before
+
+
+def test_hooks_reach_their_fields():
+    """Each hook's return value lands on the field the table names for it."""
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def signature(self, DTYPE, **_):
+            return {"x_ptr": f"*{DTYPE}"}
+
+        def reference(self, OP, **_):
+            return f"oracle_{OP}"
+
+        def inputs(self, DTYPE, **_):
+            return f"inputs_{DTYPE}"
+
+    entry = _apply({"factory": F()}, {"DTYPE": "fp16", "OP": "add"})
+    assert entry["SIGNATURE"] == {"x_ptr": "*fp16"}
+    assert entry["reference"] == "oracle_add"
+    assert entry["inputs"] == "inputs_fp16"
+
+
+def test_none_hook_leaves_its_field_unset():
+    """``None`` leaves the field absent, so the protocol is opt-in per field.
+
+    ``inputs`` is declared but declines for this combination; the undeclared
+    ``reference`` inherits the ``None``-returning default.
+    """
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def signature(self, **_):
+            return {"x_ptr": "*fp32"}
+
+        def inputs(self, DTYPE, **_):
+            return None if DTYPE == "fp32" else "gen"
+
+    entry = _apply({"factory": F()}, {"DTYPE": "fp32"})
+    assert "SIGNATURE" in entry
+    assert "inputs" not in entry
+    assert "reference" not in entry
+
+
+def test_hook_plus_literal_field_raises():
+    """A hook and the literal field it produces is an error, not precedence.
+
+    Which one won would otherwise be a fact about statement order in
+    ``_apply_factory``.
+    """
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def reference(self, **_):
+            return "from_hook"
+
+    with pytest.raises(ValueError, match="fix::variant.*'reference'.*reference"):
+        _apply({"factory": F(), "reference": "literal"}, {"M": 64})
+
+
+def test_undeclared_hook_tolerates_its_literal_field():
+    """The collision is per hook, so a factory can supply one field and the
+    variant another."""
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def signature(self, **_):
+            return {"x_ptr": "*fp32"}
+
+    entry = _apply({"factory": F(), "reference": "literal"}, {"M": 64})
+    assert entry["reference"] == "literal"
+    assert entry["SIGNATURE"] == {"x_ptr": "*fp32"}
+
+
+def test_hooks_see_values_not_label_pairs():
+    """Hooks get plain values; labels exist only to build registry keys.
+
+    A labelled param would otherwise arrive as ``("stick", [...])`` and every
+    hook would have to index ``[1]``.
+    """
+    seen = {}
+
+    @dataclass(frozen=True)
+    class F(VariantFactory):
+        def signature(self, **combo):
+            seen.update(combo)
+            return {"x_ptr": "*fp32"}
+
+    combo = {"DTYPE": ("f16", "fp16"), "LAYOUT": ("stick", [(1, "floordiv", 64)])}
+    _apply_factory({"factory": F()}, combo, kernel_name="fix::variant")
+    assert seen == {"DTYPE": "fp16", "LAYOUT": [(1, "floordiv", 64)]}
+
+
+def test_bare_callable_on_factory_is_refused():
+    """Not duck-typed: hooks are recognised by name on a ``VariantFactory``."""
+    with pytest.raises(TypeError, match="must be a VariantFactory"):
+        _apply({"factory": lambda **kw: None}, {"M": 64})
+
+
+def test_kwargs_declaring_reference_is_passed_through_untouched():
+    """Regression: a ``**kwargs``-declaring *oracle* is not a factory.
+
+    ``fixtures/inter_tile_reduce/meta.py:86`` declares
+    ``run_element_sum(inputs, BLOCK_M, BLOCK_N, NUM_N_TILES, **_kw)`` and binds the
+    extras with ``functools.partial`` (``:317``). Any rule inferring
+    combination-dependence from the shape of a callable — as ``extra_checks`` does
+    — reads that as a factory, calls it with no ``inputs``, and collection dies
+    with ``TypeError: run_element_sum() missing 1 required positional argument:
+    'inputs'``. Measured, not hypothetical.
+    """
+    called = []
+
+    def run_element_sum(inputs, BLOCK_M, BLOCK_N, NUM_N_TILES, **_kw):
+        called.append(inputs)
+        return inputs
+
+    reference = functools.partial(
+        run_element_sum, BLOCK_M=16, BLOCK_N=16, NUM_N_TILES=2)
+    entry = _apply({"reference": reference}, {"BLOCK_M": 16, "BLOCK_N": 16})
+    assert entry["reference"] is reference
+    assert called == []
