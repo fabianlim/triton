@@ -26,6 +26,23 @@ No-grid kernel — one tile, no distribution loop at all:
 Scalar-load variant of the 1D kernel — same idea, one axis:
 - :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
   from memory rather than a kernel argument. KTIR-structural only for now.
+
+``DTYPE: tl.constexpr``, on the four kernels whose fixtures sweep dtype, is
+deliberately unread. There is nothing for a kernel to do with it: the element
+type is already fixed by the pointer arguments, and
+``tl.make_tensor_descriptor`` takes it from there — the same source text
+compiles at fp16, fp32 and i32 with no reference to ``DTYPE`` at all. It is
+also not needed to tell the compiled variants apart, since the pointer types
+in the signature already give them distinct hashes.
+
+It exists because sweeping dtype in the fixture forces it. ``DTYPE`` has to be
+in ``params`` for the factory hooks to read; a ``params`` entry that is not a
+constexpr reaches ``run_cpu`` as a runtime scalar and is rejected as an unknown
+kwarg; and a constexpr with no matching kernel parameter is rejected by
+``ASTSource`` (``ValueError: 'DTYPE' is not in list``). So the parameter is an
+artifact of the framework having no notion of a param that drives the fixture
+without being passed to the kernel — the same gap a derived-params hook would
+close.
 """
 
 import triton
@@ -153,6 +170,7 @@ def elementwise_2d(
     X_LAYOUT: tl.constexpr,
     Y_LAYOUT: tl.constexpr,
     OUT_LAYOUT: tl.constexpr,
+    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """2D elementwise op: out[M, N] = x[M, N] OP y[M, N].
@@ -450,6 +468,7 @@ def elementwise_1d_device(
     n_elements: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     LAYOUT: tl.constexpr,
+    DTYPE: tl.constexpr,
     OP: tl.constexpr,
 ):
     """Elementwise op over exactly one tile, with no distribution loop.
@@ -487,3 +506,57 @@ def elementwise_1d_device(
     else:
         result = x / y
     out_desc.store([offset], result)
+
+
+@triton.jit
+def elementwise_2d_device(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    X_LAYOUT: tl.constexpr,
+    Y_LAYOUT: tl.constexpr,
+    OUT_LAYOUT: tl.constexpr,
+    DTYPE: tl.constexpr,
+    OP: tl.constexpr,
+):
+    """2D elementwise op over a single tile, no distribution loop.
+
+    Each of M×N tiles is the whole tensor; no tl.program_id loop, no
+    tl.num_programs. dbo-opt accepts this because there is no scf.for
+    for it to reject. Stick-on-N layouts physicalize the rank-2 tile
+    to rank-3.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    y_desc = tl.make_tensor_descriptor(
+        y_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[M, N], strides=[N, 1], block_shape=[BLOCK_M, BLOCK_N],
+    )
+    if X_LAYOUT is not None:
+        tl.spyre_tensor_layout(x_desc, X_LAYOUT)
+    if Y_LAYOUT is not None:
+        tl.spyre_tensor_layout(y_desc, Y_LAYOUT)
+    if OUT_LAYOUT is not None:
+        tl.spyre_tensor_layout(out_desc, OUT_LAYOUT)
+
+    offset_m = pid * BLOCK_M
+    x = x_desc.load([offset_m, 0])
+    y = y_desc.load([offset_m, 0])
+    if OP == "add":
+        result = x + y
+    elif OP == "sub":
+        result = x - y
+    elif OP == "mul":
+        result = x * y
+    else:
+        result = x / y
+    out_desc.store([offset_m, 0], result)

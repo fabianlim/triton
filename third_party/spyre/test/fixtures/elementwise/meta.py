@@ -57,6 +57,24 @@ def _make_1d_scalar_dim_checks(**_):
     return checks
 
 
+def _make_spyre_stick_checks(M, N, DTYPE, **_):
+    """Level C: the marker is gone and every operand shares one physical view.
+
+    Stick-on-N turns ``[M, N]`` into ``[ceil(N/stick), M, stick]``. All three
+    operands physicalize identically, so the add stays pure elementwise on rank-3
+    tiles and no transpose or reduction loop is synthesized -- asserting the view
+    is what pins that.
+    """
+    stick = sticksize({"p": f"*{DTYPE}"}, "p")
+    elem = {"fp16": "f16", "fp32": "f32", "i32": "i32"}[DTYPE]
+    view = f"{-(-N // stick)}x{M}x{stick}x{elem}"
+
+    def checks(t):
+        t.assert_absent("tt.spyre_tensor_layout")
+        t.assert_result_type("ktdp.construct_memory_view", view)
+    return checks
+
+
 def _make_2d_scalar_dim_checks(N, **_):
     def checks(t):
         # Single-element 1-D scalar-read chain: construct_memory_view
@@ -76,29 +94,42 @@ def _make_2d_scalar_dim_checks(N, **_):
 
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input makers
+#
+# One generator. The named makers below only give it a shape: the framework
+# calls `inputs` with the variant's whole `params` dict, and variants spell
+# their shape with different argument names.
 # ---------------------------------------------------------------------------
 
-def make_inputs(n_elements: int, BLOCK_SIZE: int,
-                *, dtype="f32", **_unused) -> dict:
-    """Build pointer-tensor inputs for the kernel.
+def _make_inputs(shape, *, dtype="fp32", nonzero_y=False) -> dict:
+    """``x`` / ``y`` / zeroed ``output`` buffers of *shape*. Never random.
 
-    Takes the same parameter names as ``VARIANTS[...]["params"]`` so the
-    framework can pass them positionally as kwargs. ``BLOCK_SIZE`` is
-    unused here but accepted so the signature matches the full param
-    set (keeps things uniform for kernels that use it in tensor
-    construction).
+    Floats take ``x = sin`` and ``y = cos`` over the flattened index, keeping
+    both inside [-1, 1] so fp16 stays well conditioned. Integers take a ramp
+    against a constant, small enough that ``mul`` stays clear of the int32
+    boundary.
 
-    Returns only pointer/tensor args keyed by SIGNATURE name. Runtime
-    scalars (e.g. ``n_elements`` in the dynamic variant) are added by
-    the framework from ``params`` before calling ``run_cpu``.
+    ``nonzero_y`` lifts ``y`` off zero, which ``div`` needs -- ``cos`` crosses
+    zero and the quotient there is meaningless. It is a property of the buffers
+    rather than of one op, because a variant sweeping ``OP`` shares one input
+    maker across all of its ops.
+
+    *dtype* is a :data:`DTYPE_MAP` key. It was previously spelled three ways in
+    this file -- ``"f32"``, ``"fp32"`` and ``np.float32`` -- each with its own
+    lookup, so passing one maker's spelling to another raised.
     """
-    del BLOCK_SIZE  # not used in input generation, but part of the param set
-    np_dtype = {"f32": np.float32, "f16": np.float16}[dtype]
-    t = np.arange(n_elements, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / n_elements).astype(np_dtype)
-    y = np.cos(t * 2.0 * np.pi / n_elements).astype(np_dtype)
-    output = np.zeros(n_elements, dtype=np_dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
+    np_dtype = DTYPE_MAP[dtype]
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    total = int(np.prod(shape))
+    if np.issubdtype(np_dtype, np.integer):
+        x = np.arange(1, total + 1, dtype=np_dtype)
+        y = np.full(total, 3, dtype=np_dtype)
+    else:
+        t = np.arange(total, dtype=np.float32)
+        x = np.sin(t * 2.0 * np.pi / total).astype(np_dtype)
+        y = (np.cos(t * 2.0 * np.pi / total)
+             + (2.0 if nonzero_y else 0.0)).astype(np_dtype)
+    return {"x_ptr": x.reshape(shape), "y_ptr": y.reshape(shape),
+            "output_ptr": np.zeros(shape, dtype=np_dtype)}
 
 
 def run(inputs: dict) -> np.ndarray:
@@ -106,62 +137,41 @@ def run(inputs: dict) -> np.ndarray:
     return inputs["x_ptr"] + inputs["y_ptr"]
 
 
-def make_inputs_scalar_dim(BLOCK_SIZE: int, dtype: str = "f32", n_elements: int = 4096, **_unused) -> dict:
-    """1D inputs for elementwise_1d_scalar_dim.
+# Each maker takes the shape argument names its variants use and ignores the
+# rest of ``params``. ``DTYPE`` is read from ``params`` rather than defaulted
+# separately, which is what stops the buffers' dtype drifting from the pointer
+# types ``SIGNATURE`` declares.
 
-    `n_elements` is not part of the kernel's SIGNATURE (it is read from
-    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
-    rather than a `params` entry — same reasoning as
-    `make_inputs_2d_scalar_dim`. Delegates to ``make_inputs`` for the
-    x/y/output buffers and adds the scalar read as a rank-1 buffer of
-    length 1.
+def make_inputs(n_elements, DTYPE="fp32", nonzero_y=False, **_unused) -> dict:
+    return _make_inputs(n_elements, dtype=DTYPE, nonzero_y=nonzero_y)
+
+
+def make_inputs_2d(M, N, DTYPE="fp32", nonzero_y=False, **_unused) -> dict:
+    return _make_inputs((M, N), dtype=DTYPE, nonzero_y=nonzero_y)
+
+
+def make_inputs_3d(M, N, P, DTYPE="fp32", **_unused) -> dict:
+    return _make_inputs((M, N, P), dtype=DTYPE)
+
+
+def make_inputs_scalar_dim(n_elements=4096, DTYPE="fp32", **_unused) -> dict:
+    """1D, plus the length as a rank-1 buffer.
+
+    ``n_elements`` is a default here and not a ``params`` entry: the kernel
+    reads it from ``seqlen_ptr`` instead of taking it as an argument, so a
+    ``params`` entry would leak into ``run_cpu``'s kwargs and fail its
+    unknown-kwarg check.
     """
-    inputs = make_inputs(n_elements, BLOCK_SIZE, dtype=dtype)
+    inputs = _make_inputs(n_elements, dtype=DTYPE)
     inputs["seqlen_ptr"] = np.array([n_elements], dtype=np.int32)
     return inputs
 
 
-def make_inputs_2d(M: int, N: int, BLOCK_M: int, BLOCK_N: int,
-                   *, dtype=np.float32, **_unused) -> dict:
-    """Build 2D pointer-tensor inputs for elementwise_2d."""
-    del BLOCK_M, BLOCK_N
-    total = M * N
-    t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
-    y = np.cos(t * 2.0 * np.pi / total).astype(dtype).reshape(M, N)
-    output = np.zeros((M, N), dtype=dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
-
-
-def make_inputs_2d_scalar_dim(N: int, BLOCK_M: int, BLOCK_N: int, M: int = 32, **_unused) -> dict:
-    """2D inputs for elementwise_2d_scalar_dim.
-
-    `M` is not part of the kernel's SIGNATURE (it is read from
-    `seqlen_ptr`, not passed as an arg), so it is a keyword default here
-    rather than a `params` entry — a `params` entry would otherwise leak
-    into ``run_cpu``'s kwargs and fail its "unknown kwarg" check, since
-    `elementwise_2d_scalar_dim` has no `M` parameter. Delegates to
-    ``make_inputs_2d`` for the x/y/output buffers and adds the scalar
-    read as a rank-1 buffer of length 1.
-    """
-    inputs = make_inputs_2d(M, N, BLOCK_M, BLOCK_N)
+def make_inputs_2d_scalar_dim(N, M=32, DTYPE="fp32", **_unused) -> dict:
+    """2D, plus ``M`` as a rank-1 buffer -- see :func:`make_inputs_scalar_dim`."""
+    inputs = _make_inputs((M, N), dtype=DTYPE)
     inputs["seqlen_ptr"] = np.array([M], dtype=np.int32)
     return inputs
-
-
-def make_inputs_3d(
-    M: int, N: int, P: int,
-    BLOCK_M: int, BLOCK_N: int, BLOCK_P: int,
-    **_unused,
-) -> dict:
-    """Build 3D pointer-tensor inputs for elementwise_3d."""
-    del BLOCK_M, BLOCK_N, BLOCK_P
-    total = M * N * P
-    t = np.arange(total, dtype=np.float32)
-    x = np.sin(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N, P)
-    y = np.cos(t * 2.0 * np.pi / total).astype(np.float32).reshape(M, N, P)
-    output = np.zeros((M, N, P), dtype=np.float32)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +182,7 @@ def make_inputs_3d(
 # come from DTYPE). These are the non-constexpr, non-pointer runtime args.
 _SHAPE_ARGS = {
     1: {"n_elements": "i32"},      # elementwise_1d
-    # 2D and 3D are not used by Level B (1d_compute), kept for Stage 3
+    2: {},                         # 2d_device: M/N are constexprs, no runtime shape args
 }
 
 # NumPy oracles indexed by op name.
@@ -185,27 +195,6 @@ _NUMPY_OPS = {
 
 # Pointer type strings for each DTYPE.
 _PTR = {"fp16": "*fp16", "fp32": "*fp32", "i32": "*i32"}
-
-
-def _make_inputs_compute(n_elements: int, BLOCK_SIZE: int,
-                         *, dtype: str, op: str, **_unused) -> dict:
-    """Input generator for 1d_compute: dtype/op-aware.
-
-    Floats: x = sin, y = cos + 2 (keeps div away from zero and gives
-    interesting values). i32: small positive integers so mul stays in range
-    and floordiv is exact.
-    """
-    np_dtype = DTYPE_MAP[dtype]
-    n = n_elements
-    if dtype == "i32":
-        x = np.arange(1, n + 1, dtype=np_dtype)
-        y = np.full(n, 3, dtype=np_dtype)
-    else:
-        t = np.arange(n, dtype=np.float32)
-        x = np.sin(t * 2.0 * np.pi / n).astype(np_dtype)
-        y = (np.cos(t * 2.0 * np.pi / n) + 2.0).astype(np_dtype)
-    output = np.zeros(n, dtype=np_dtype)
-    return {"x_ptr": x, "y_ptr": y, "output_ptr": output}
 
 
 @dataclass(frozen=True)
@@ -229,8 +218,14 @@ class Elementwise(conftest.VariantFactory):
             return _NUMPY_OPS[OP](x, y).astype(x.dtype)
         return oracle
 
-    def inputs(self, OP, DTYPE, **_):
-        return functools.partial(_make_inputs_compute, dtype=DTYPE, op=OP)
+    def inputs(self, **_):
+        """Shape from ``rank``; ``DTYPE`` the maker reads from ``params`` itself.
+
+        ``nonzero_y`` is unconditional because these variants sweep ``OP``, and
+        one of the ops they sweep is ``div``.
+        """
+        return functools.partial({1: make_inputs, 2: make_inputs_2d}[self.rank],
+                                 nonzero_y=True)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +287,26 @@ _SIG_TENSORS_FP16 = {
 # order.
 _SIG_2D_SPYRE = {**_SIG_2D_LAYOUT, **_SIG_TENSORS_FP16}
 
-_S2 = functools.partial(sticksize, _SIG_TENSORS_FP16)
+
+def _stick_layout_1d(dtype_str: str) -> tuple:
+    """1D stick layout for a given dtype, as a hashable tuple-of-tuples.
+
+    stick=64 for fp16, stick=32 for fp32. The 1D layout maps:
+      physical dim 0 = logical_idx[0] // stick  (which stick)
+      physical dim 1 = logical_idx[0] % stick   (lane within stick)
+    """
+    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
+    return ((0, "floordiv", stick), (0, "mod", stick))
+
+
+def _stick_layout_2d_on_n(dtype_str: str) -> tuple:
+    """2D stick-on-N layout for a given dtype, as a hashable tuple.
+
+    Physicalizes [M, N] -> [N//stick, M, stick]:
+      (1, "floordiv", stick), 0, (1, "mod", stick)
+    """
+    stick = sticksize({"x_ptr": f"*{dtype_str}"}, "x_ptr")
+    return ((1, "floordiv", stick), 0, (1, "mod", stick))
 
 _SIG_3D = {
     "x_ptr":      "*fp32",
@@ -325,7 +339,15 @@ _SIG_2D_SCALAR = {
 }
 
 VARIANTS = {
-    # --- 1D variants ---
+    # -----------------------------------------------------------------------
+    # Level A -- shape
+    #
+    # OP and DTYPE are pinned to add/fp32 throughout: these variants are about
+    # descriptor shape, and sweeping the other two axes would multiply keys
+    # without covering anything shape-related.
+    # -----------------------------------------------------------------------
+
+    # 1D
     "default": {
         # Static-shape flavor (PR #82): n_elements is a constexpr baked
         # into TTIR as the literal 2097152.
@@ -426,35 +448,8 @@ VARIANTS = {
         ),
         "extra_checks": _make_1d_scalar_dim_checks,
     },
-    # --- Level B: compute correctness (op × dtype, ktir_cpu only) ---
-    "1d_compute": {
-        # No base: prevent inheriting `reference` and `inputs` from `default`
-        # (factory hooks produce them; a literal field + hook on the same
-        # variant is a collection-time error).
-        "base": None,
-        "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "elementwise-compute"],
-        "summary": (
-            "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
-            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
-            "div and i32 stop here pending #107."
-        ),
-        "kernel_fn":    kernel.elementwise_1d,
-        "factory":      Elementwise(rank=1),
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
-        "params": {
-            "DTYPE":      ["fp16", "fp32", "i32"],
-            "OP":         ["add", "sub", "mul", "div"],
-            "n_elements": [128],
-            "BLOCK_SIZE": [128],
-        },
-        "grid":         [1],
-        "parallel":     False,
-        "output_key":   "output_ptr",
-        "rtol":         1e-2,
-        "atol":         5e-2,
-    },
-    # --- 2D variants ---
+
+    # 2D
     "2d": {
         # M=[512,520]: absorbs 2d_nonaligned (M=520, m_blocks=33 → clamp fires).
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
@@ -475,12 +470,12 @@ VARIANTS = {
         "kernel_fn":    kernel.elementwise_2d,
         "SIGNATURE":    _SIG_2D_LAYOUT,
         "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
         "params":       {
             # M=[512,520]: absorbs 2d_nonaligned (M=520).
             "M": [512, 520], "N": [32], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
-            "OP": ["add"],
+            "DTYPE": ["fp32"], "OP": ["add"],
         },
         "inputs":       make_inputs_2d,
         "extra_checks": _make_2d_checks,
@@ -499,7 +494,7 @@ VARIANTS = {
             "unchanged across a range of matrix shapes."
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_N",
-                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "OP"],
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
         "extra_checks": lambda t: (
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?xf32>"),
@@ -512,124 +507,8 @@ VARIANTS = {
         "params": {
             "M": [256], "N": [64], "BLOCK_M": [16], "BLOCK_N": [16],
             "X_LAYOUT": [None], "Y_LAYOUT": [None], "OUT_LAYOUT": [None],
-            "OP": ["add"],
+            "DTYPE": ["fp32"], "OP": ["add"],
         },
-    },
-    "1d_device": {
-        # The only variant in the suite that reaches a Spyre binary. Everything
-        # else distributes tiles with an scf.for over the program id, and dbo-opt
-        # rejects the loop it outlines from that; this kernel has no loop and no
-        # program id -- one tile that is the whole tensor.
-        #
-        # That makes it the fixture the spyrecode-stage tests compile, which is
-        # why it lives here rather than inline in a test module.
-        "tags": [
-            "descriptor-load-static", "descriptor-store-static",
-            "simplified:no-loop", "spyre-tensor-layout"
-        ],
-        "summary": (
-            "Elementwise add over a single tile, with no grid distribution "
-            "loop -- the one variant dbo-opt can lower to a binary."
-        ),
-        "doc": (
-            "Takes two `M` fp16 inputs in spyre tensor 2D layouts "
-            "and writes `C = A + B` in one "
-            "`tl.program_id`, no `tl.num_programs`, no loop."
-        ),
-        "kernel_fn":    kernel.elementwise_1d_device,
-        "SIGNATURE":    _SIG_TENSORS_FP16,
-        "constexpr":    ["n_elements", "BLOCK_SIZE", "LAYOUT", "OP"],
-        "params":       {
-            "n_elements": [128],
-            "BLOCK_SIZE": [128],
-            # LAYOUT is a constexpr that enters the Triton cache key, so it
-            # must be hashable -- a list is not. Stored as tuple of tuples.
-            # A labelled ("name", value) pair is required: the framework's
-            # tuple-detection sees any tuple element in the values list and
-            # would misread the raw inner tuple as a (label, value) pair. The
-            # label also becomes the suffix when sweeping: adding a second
-            # layout produces elementwise__1d_device[LAYOUT=stick] and
-            # elementwise__1d_device[LAYOUT=other].
-            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
-            "OP": ["add"],
-        },
-        "grid":         [1],
-        "parallel":     False,
-        # dbo-opt can lower this one all the way to a Spyre binary, so the
-        # spyrecode-stage tests compile it. Declared here rather than named in
-        # conftest so the property travels with the variant, like `parallel`.
-        "compiles_to_binary": True,
-        "reference":    run,
-        # BLOCK_SIZE is actually not used, stub it out
-        "inputs":       functools.partial(make_inputs, dtype="f16"),
-        "output_key":   "output_ptr",
-        "rtol":         1e-2,
-        "atol":         5e-2,
-        "extra_checks": None, # for the device examples we disable the checks
-    },
-    "1d_device_grid2": {
-        # The multi-core counterpart of 1d_device: still one tile per corelet and
-        # still no distribution loop, but two corelets each taking half the
-        # vector.  n_elements=128 over BLOCK_SIZE=64 is exactly two fp16 sticks,
-        # one per corelet, so corelet i owns stick i.
-        "base": "1d_device",
-        "tags": [
-            "descriptor-load-static", "descriptor-store-static",
-            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout"
-        ],
-        "summary": (
-            "Elementwise add distributed over two corelets, one stick each, "
-            "with no distribution loop."
-        ),
-        "doc": (
-            "Takes two 128-element fp16 vectors in a 2-stick spyre tensor "
-            "layout and writes `C = A + B` across a `grid = [2]`.  Each corelet "
-            "reads `tl.program_id(0)` and offsets by `pid * BLOCK_SIZE`, so it "
-            "owns exactly one 64-element stick; there is no `tl.num_programs` "
-            "and no `scf.for`.\n\n"
-        ),
-        "grid": [2],
-        "params":       {
-            "n_elements": [128],
-            "BLOCK_SIZE": [64],
-            "LAYOUT":   [("stick", ((0, "floordiv", _S2("x_ptr")), (0, "mod", _S2("x_ptr"))))],
-            "OP": ["add"],
-        },
-    },
-    "2d_spyre_stick": {
-        # Elementwise add with all three operands stick-on-N. Every operand
-        # physicalizes identically, so the add stays a pure elementwise op on
-        # rank-3 tiles [N//S, M, N%S] = [2, 64, 64] and no transpose or
-        # reduction loop is synthesized.
-        "base": "2d",
-        "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "spyre-tensor-layout"],
-        "summary": (
-            "2D elementwise add with x/y/out all annotated stick-on-N. "
-            "Exercises the layout path on a pure elementwise kernel."
-        ),
-        "SIGNATURE": _SIG_2D_SPYRE,
-        "params": {
-            # fp16 stick = 64; N = 128 = 2 sticks exactly.
-            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
-            "X_LAYOUT":   [[(1, "floordiv", _S2("x_ptr")), 0,
-                            (1, "mod", _S2("x_ptr"))]],
-            "Y_LAYOUT":   [[(1, "floordiv", _S2("y_ptr")), 0,
-                            (1, "mod", _S2("y_ptr"))]],
-            "OUT_LAYOUT": [[(1, "floordiv", _S2("output_ptr")), 0,
-                            (1, "mod", _S2("output_ptr"))]],
-            "OP": ["add"],
-        },
-        "grid":        [1],
-        "data_layout": "host",
-        "inputs":      functools.partial(make_inputs_2d, dtype=np.float16),
-        "rtol":        1e-2,
-        "atol":        5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            # All three operands share the rank-3 physical view [2, 64, 64].
-            t.assert_result_type("ktdp.construct_memory_view", "2x64x64xf16"),
-        ),
     },
     "2d_dynamic_from_scalar_load": {
         "base":         "2d",
@@ -669,7 +548,8 @@ VARIANTS = {
         ),
         "extra_checks": _make_2d_scalar_dim_checks,
     },
-    # --- 3D variants ---
+
+    # 3D
     "3d": {
         # M=[64,65,256]: absorbs 3d_nonaligned (M=65) and 3d_active_cores (M=256).
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-1d", "num-programs-fold"],
@@ -715,7 +595,8 @@ VARIANTS = {
                                  "memref<?x?x?xf32>"),
         ),
     },
-    # --- 2D grid variants ---
+
+    # multi-axis grid
     "2d_grid": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-2d", "num-programs-fold"],
         "summary": (
@@ -756,7 +637,6 @@ VARIANTS = {
                                  "memref<?x?xf32>"),
         ),
     },
-    # --- 3D grid variants ---
     "3d_grid": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "program-id-3d", "num-programs-fold"],
         "summary": (
@@ -801,4 +681,253 @@ VARIANTS = {
                                  "memref<?x?x?xf32>"),
         ),
     },
+
+
+    # -----------------------------------------------------------------------
+    # Level B -- compute
+    #
+    # The op x dtype product on ktir_cpu. Deliberately the simplest shape in
+    # the file -- 1D, static, one tile, no layout -- so arithmetic is the only
+    # thing that differs between its entries. div and every i32 arm stop here:
+    # dbo-opt wants the spyreop spellings this repo does not yet emit.
+    # -----------------------------------------------------------------------
+    "1d_compute": {
+        # No base: prevent inheriting `reference` and `inputs` from `default`
+        # (factory hooks produce them; a literal field + hook on the same
+        # variant is a collection-time error).
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "elementwise-compute"],
+        "summary": (
+            "1D elementwise op across fp16/fp32/i32 and add/sub/mul/div. "
+            "Sweeps the OP × DTYPE product to cover ktir_cpu correctness; "
+            "div and i32 stop here pending #107."
+        ),
+        "kernel_fn":    kernel.elementwise_1d,
+        "factory":      Elementwise(rank=1),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "OP"],
+        "params": {
+            "DTYPE":      ["fp16", "fp32", "i32"],
+            "OP":         ["add", "sub", "mul", "div"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+    },
+
+
+    # -----------------------------------------------------------------------
+    # Level C -- layout
+    #
+    # Stick physicalization without going to a binary. Bases on Level A's 2d,
+    # so this section reads after it.
+    # -----------------------------------------------------------------------
+    "2d_spyre_stick": {
+        # Elementwise add with all three operands stick-on-N. Every operand
+        # physicalizes identically, so the add stays a pure elementwise op on
+        # rank-3 tiles [N//S, M, N%S] = [2, 64, 64] and no transpose or
+        # reduction loop is synthesized.
+        "base": "2d",
+        "tags": ["descriptor-load-static", "descriptor-store-static",
+                 "program-id-1d", "spyre-tensor-layout"],
+        "summary": (
+            "2D elementwise add with x/y/out all annotated stick-on-N. "
+            "Exercises the layout path on a pure elementwise kernel."
+        ),
+        "SIGNATURE": _SIG_2D_SPYRE,
+        "params": {
+            # fp16 stick = 64, so N = 128 is exactly 2 sticks.
+            "M": [64], "N": [128], "BLOCK_M": [64], "BLOCK_N": [128],
+            # list(), not the tuple the helper returns: _normalise_param_list
+            # reads any tuple in a values list as a (label, value) pair. Left
+            # unlabelled so the key stays suffix-free, as it was.
+            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
+            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp16"))],
+            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp16"))],
+            "DTYPE": ["fp16"], "OP": ["add"],
+        },
+        "grid":        [1],
+        "data_layout": "host",
+        "rtol":        1e-2,
+        "atol":        5e-2,
+        "extra_checks": _make_spyre_stick_checks,
+    },
+    "2d_spyre_stick_fp32": {
+        # The same layout path one stick width down: fp32 sticks are 32 lanes, so
+        # the physical view is [2, 64, 32] rather than [2, 64, 64]. Level D covers
+        # fp32 stick-tiling on device; this covers it in KTIR and on ktir_cpu,
+        # where the numbers are checked rather than just the shapes.
+        "base": "2d_spyre_stick",
+        "summary": (
+            "2D fp32 elementwise add with x/y/out all annotated stick-on-N. "
+            "The fp32 arm of the layout path: 32 lanes to a stick, not 64."
+        ),
+        "SIGNATURE": _SIG_2D_LAYOUT,
+        "params": {
+            # fp32 stick = 32, so N = 64 is exactly 2 sticks.
+            "M": [64], "N": [64], "BLOCK_M": [64], "BLOCK_N": [64],
+            # list(), not the tuple the helper returns: _normalise_param_list
+            # reads any tuple in a values list as a (label, value) pair. Left
+            # unlabelled so the key stays suffix-free, as it was.
+            "X_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
+            "Y_LAYOUT":   [list(_stick_layout_2d_on_n("fp32"))],
+            "OUT_LAYOUT": [list(_stick_layout_2d_on_n("fp32"))],
+            "DTYPE": ["fp32"], "OP": ["add"],
+        },
+        "rtol":        1e-6,
+        "atol":        0.0,
+    },
+
+
+    # -----------------------------------------------------------------------
+    # Level D -- device
+    #
+    # compiles_to_binary, so test_device_launch.py and the spyrecode lit tests
+    # pick these up. Loop-free and one tile per core -- dbo-opt rejects the
+    # scf.for every other variant outlines from its program-id distribution.
+    # One variant per dtype because the stick size, and hence the layout and
+    # the 2D shape, follow DTYPE rather than varying independently.
+    # -----------------------------------------------------------------------
+    "1d_device": {
+        # The device variants in the suite that reach a Spyre binary. Everything
+        # else distributes tiles with an scf.for over the program id, and dbo-opt
+        # rejects the loop it outlines from that; this kernel has no loop --
+        # one tile that is the whole tensor.
+        #
+        # That makes it the fixture the spyrecode-stage tests compile, which is
+        # why it lives here rather than inline in a test module.
+        # Stage 3: sweep {fp16} x {add, sub, mul}. fp32 is in 1d_device_fp32.
+        "base": None,   # prevent inheriting reference/inputs from default
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D fp16 elementwise over a single tile, no distribution loop. "
+            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp16."
+        ),
+        "kernel_fn":    kernel.elementwise_1d_device,
+        "factory":      Elementwise(rank=1),
+        "constexpr":    ["n_elements", "BLOCK_SIZE", "DTYPE", "LAYOUT", "OP"],
+        "params": {
+            "DTYPE":      ["fp16"],
+            "OP":         ["add", "sub", "mul"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "compiles_to_binary": True,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": None,
+    },
+    "1d_device_fp32": {
+        "base": "1d_device",
+        # Spelled out rather than inherited: gen_patterns_docs.py reads the raw
+        # VARIANTS dict and never resolves `base`, so a variant with no `tags`
+        # key of its own is absent from the generated pattern docs entirely.
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D fp32 elementwise over a single tile, no distribution loop. "
+            "Sweeps add/sub/mul -- the three ops dbo-opt accepts at fp32."
+        ),
+        "params": {
+            "DTYPE":      ["fp32"],
+            "OP":         ["add", "sub", "mul"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [128],
+            "LAYOUT":     [("stick", _stick_layout_1d("fp32"))],
+        },
+    },
+    "1d_device_grid2": {
+        # The multi-core counterpart of 1d_device: still one tile per core and
+        # still no distribution loop, but two cores each taking half the
+        # vector.  n_elements=128 over BLOCK_SIZE=64 is exactly two fp16 sticks,
+        # one per core, so core i owns stick i.
+        "base": "1d_device",
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "program-id-1d", "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "1D fp16 elementwise across two cores, one fp16 stick each, "
+            "no distribution loop. Sweeps add/sub/mul."
+        ),
+        "grid": [2],
+        "params": {
+            "DTYPE":      ["fp16"],
+            "OP":         ["add", "sub", "mul"],
+            "n_elements": [128],
+            "BLOCK_SIZE": [64],   # 64 elements = 1 fp16 stick per core
+            "LAYOUT":     [("stick", _stick_layout_1d("fp16"))],
+        },
+    },
+    "2d_device": {
+        "base": None,   # prevent inheriting reference/inputs from default
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "2D fp16 elementwise over a single tile, stick-on-N layout. "
+            "Sweeps add/sub/mul. First fixture to put a rank-3 physicalized "
+            "layout and multi-element 2D tile on hardware."
+        ),
+        "kernel_fn":    kernel.elementwise_2d_device,
+        "factory":      Elementwise(rank=2),
+        "constexpr":    ["M", "N", "BLOCK_M", "BLOCK_N",
+                         "X_LAYOUT", "Y_LAYOUT", "OUT_LAYOUT", "DTYPE", "OP"],
+        "params": {
+            "DTYPE":    ["fp16"],
+            "OP":       ["add", "sub", "mul"],
+            "M":        [64],
+            "N":        [128],   # 2 fp16 sticks (128 / 64)
+            "BLOCK_M":  [64],
+            "BLOCK_N":  [128],
+            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
+            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp16"))],
+            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp16"))],
+        },
+        "grid":         [1],
+        "parallel":     False,
+        "compiles_to_binary": True,
+        "output_key":   "output_ptr",
+        "rtol":         1e-2,
+        "atol":         5e-2,
+        "extra_checks": None,
+    },
+    "2d_device_fp32": {
+        "base": "2d_device",
+        # Spelled out rather than inherited -- see 1d_device_fp32.
+        "tags": [
+            "descriptor-load-static", "descriptor-store-static",
+            "simplified:no-loop", "spyre-tensor-layout",
+        ],
+        "summary": (
+            "2D fp32 elementwise over a single tile, stick-on-N layout. "
+            "Sweeps add/sub/mul. fp32 stick = 32 lanes; N = 64 = 2 sticks."
+        ),
+        "params": {
+            "DTYPE":    ["fp32"],
+            "OP":       ["add", "sub", "mul"],
+            "M":        [64],
+            "N":        [64],    # 2 fp32 sticks (64 / 32)
+            "BLOCK_M":  [64],
+            "BLOCK_N":  [64],
+            "X_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
+            "Y_LAYOUT":   [("stick", _stick_layout_2d_on_n("fp32"))],
+            "OUT_LAYOUT": [("stick", _stick_layout_2d_on_n("fp32"))],
+        },
+    },
+
 }
