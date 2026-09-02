@@ -11,6 +11,7 @@
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/Classify.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
+#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "RewriteDescriptorLayout/Types.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -44,20 +45,16 @@ namespace mlir::triton::ktdp {
 // True iff op is a single-result elementwise op with exactly one
 // RankedTensor operand.
 //
-// This single-tensor-operand restriction is specific to the BACKWARD walk in
-// chainBlockedByPendingTranspose: with two or more tensor operands there is
-// no single producer to follow, and the restriction is exactly what keeps
-// that walk from crossing a matmul (3 tensor operands) or reduce (2). It is
-// not a general elementwise predicate. Forward retyping (deciding an op's
-// own result type in Phase 2) must NOT reuse this — see
-// RewriteElementwisePattern, which uses a separate, purely local shape rule
-// that also covers multi-tensor-operand elementwise ops (arith.addf, select,
-// ...).
-// Load-bearing for the backward walks: with two tensor operands there is no
-// single producer to follow, and rejecting them is also what stops those walks
-// crossing a matmul (3 tensor operands) or a reduce (2). Widening this requires
-// re-proving that patterns cannot observe each other's output, i.e. convergence.
-// Forward retyping must not reuse it -- it would exclude arith.addf and friends.
+// Not a general elementwise predicate. It is scoped to findMarkerForStore's
+// chain walk, where the single-tensor-operand restriction is load-bearing:
+// rejecting two or more tensor operands is what stops that walk crossing a
+// matmul (3 tensor operands) or a reduce (2) into an unrelated chain.
+// Widening it requires re-proving that walk cannot leave the chain it started
+// on.
+//
+// Forward retyping (deciding an op's own result type) must NOT reuse this --
+// it would exclude multi-tensor-operand elementwise ops like arith.addf and
+// select. See RewriteElementwisePattern, which uses its own local shape rule.
 bool isSingleTensorElementwiseOp(Operation *op) {
   if (op->getNumResults() != 1 || op->getNumOperands() == 0)
     return false;
@@ -92,36 +89,6 @@ Value emitTranspose(OpBuilder &b, Location loc, Value src,
                                         srcTy.getElementType());
   return linalg::TransposeOp::create(b, loc, src, empty,
       b.getDenseI64ArrayAttr(mlirPerm)).getResult()[0];
-}
-
-// True if a not-yet-erased linalg.transpose sits between `val` and a
-// ktdp.load: a missing ctx.physicalValues entry is then "not ready yet" (the
-// caller must defer, returning failure()) rather than "genuinely logical"
-// (treat as a scratchpad operand) — a transpose's input is not recorded in
-// ctx.physicalValues until RewriteTransposePattern erases it, so a plain map
-// lookup cannot distinguish the two. No pattern-benefit ordering avoids this:
-// a chain with an elementwise op between two transposes needs the transpose
-// and elementwise patterns to alternate across several greedy iterations
-// before a downstream matmul/reduce/store sees a fully resolved operand.
-bool chainBlockedByPendingTranspose(Value val) {
-  Value v = val;
-  while (true) {
-    auto *defOp = v.getDefiningOp();
-    if (!defOp)
-      return false;
-    if (isa<mlir::ktdp::LoadOp>(defOp))
-      return false;
-    if (isa<linalg::TransposeOp>(defOp))
-      return true;
-    if (!isSingleTensorElementwiseOp(defOp))
-      return false;
-    Value next;
-    for (auto operand : defOp->getOperands())
-      if (isa<RankedTensorType>(operand.getType())) { next = operand; break; }
-    if (!next)
-      return false;
-    v = next;
-  }
 }
 
 // Look up the marker for an access tile's base memView in the pass context.
@@ -254,6 +221,27 @@ Value extractOpSlice(OpBuilder &b, Location loc,
       break;
     }
   }
+  // Nothing to slice: every dim starts at 0 and spans the operand's whole
+  // extent at unit stride, so the slice would be the identity. (Strides are
+  // unit by construction above.) Emitting it costs an op the canonicalizer
+  // then folds away.
+  auto operandTy = cast<RankedTensorType>(plan.value.getType());
+  bool wholeTensor = operandTy.getRank() == rank;
+  for (int p = 0; wholeTensor && p < rank; ++p) {
+    auto constOf = [](OpFoldResult r) -> std::optional<int64_t> {
+      if (auto attr = dyn_cast<Attribute>(r))
+        if (auto i = dyn_cast<IntegerAttr>(attr))
+          return i.getInt();
+      return std::nullopt;
+    };
+    auto off = constOf(offsets[p]);
+    auto sz = constOf(sizes[p]);
+    if (!off || *off != 0 || !sz || *sz != operandTy.getDimSize(p))
+      wholeTensor = false;
+  }
+  if (wholeTensor && operandTy == resultTy)
+    return plan.value;
+
   return tensor::ExtractSliceOp::create(
       b, loc, resultTy, plan.value, offsets, sizes, strides);
 }
@@ -442,20 +430,21 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         llvm::dbgs() << "]\n";
       });
     } else {
-      // Not (yet) in ctx.physicalValues: either this operand is genuinely
-      // logical (scratchpad), or a linalg.transpose sitting on its chain has
-      // not been erased yet by RewriteTransposePattern. The latter is not a
-      // fatal condition — defer to a later greedy iteration once the
-      // transpose fires.
-      if (chainBlockedByPendingTranspose(operand))
-        return failure();
-      // A reshape/broadcast producing this operand is not a deferred
-      // physicalization (it is not a linalg.transpose, so
-      // chainBlockedByPendingTranspose does not catch it) and is not a
-      // legitimate logical scratchpad either: its element-to-index mapping
-      // does not match a plain logical tensor's, so classifying it as one
-      // would silently compute the wrong slice. Hard-error rather than
-      // guess (case 3's scope is the transpose path only — see #91/#92).
+      // Not in ctx.physicalValues. Two separate questions, asked in this
+      // order, because the first is not about physicality at all.
+      //
+      // 1. LEGALITY. A reshape/broadcast producing this operand has an
+      //    element-to-index mapping that matches neither a physical tensor's
+      //    nor a plain logical one's, so no conversion is defined for it.
+      //    Physicality has three answers -- physical, not yet, logical -- and
+      //    "no defined conversion exists" is a fourth, so it gets its own
+      //    check rather than being folded into the lookup below. It must come
+      //    FIRST: the analysis correctly declines to give these ops a physical
+      //    type (see ReshapePropagation / BroadcastPropagation), so such an
+      //    operand is absent from the analysis map, and absence means
+      //    "genuinely logical" -- committing it as a scratchpad, which is
+      //    exactly the silent wrong slice this rejects. The two checks are
+      //    complementary, not redundant.
       if (auto *defOp = operand.getDefiningOp()) {
         if (isa<tensor::ReshapeOp, tensor::ExpandShapeOp,
                 tensor::CollapseShapeOp, linalg::BroadcastOp>(defOp))
@@ -464,6 +453,23 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
               "reshape/broadcast, which cannot be treated as a physical "
               "load or a plain logical scratchpad");
       }
+      // 2. PHYSICALITY. Phase 2A decided every value's final physical type up
+      //    front, from Phase 1's roots alone. So an operand present in the
+      //    analysis map WILL be physical; it just is not yet, because the
+      //    rewrite that makes it so (a transpose erasure, an upstream retype)
+      //    has not landed in this greedy iteration. Defer.
+      //
+      //    This replaces a backward walk that hunted a live linalg.transpose.
+      //    That walk could only enumerate ways a value might be unresolved,
+      //    and it read IR Phase 2 was concurrently mutating; the analysis
+      //    answers the same question as a function of Phase 1's output.
+      //    Deferral itself remains -- under a greedy driver the answer "will
+      //    be physical" still means "not now" -- but it is now a lookup
+      //    rather than an inspection of half-rewritten IR.
+      if (ctx.physicalTypeAnalysis &&
+          ctx.physicalTypeAnalysis->contains(operand))
+        return failure();
+      // Absent from the analysis map: genuinely logical. Commit.
       auto tensorTy = dyn_cast<RankedTensorType>(operand.getType());
       if (!tensorTy ||
           tensorTy.getRank() != (int64_t)spec.operands[i].canonicalAxes.size())
@@ -1030,10 +1036,17 @@ struct RewriteElementwisePattern : RewritePattern {
     // Propagate forward: this op's result is now itself a physicalized
     // value, so a downstream elementwise op reading it must see it as such.
     ctx.physicalValues[op->getResult(0)] = info;
-    // The greedy driver re-enqueues an in-place-modified op itself, but not
-    // its users — yet a user (e.g. a downstream linalg.transpose or another
-    // elementwise op) may only become dispatchable now that this op's result
-    // type has changed. Force those users back onto the worklist.
+    // REQUIRED, unlike the transpose pattern's counterpart. setType above
+    // changes this op's result type in place; the greedy driver re-enqueues the
+    // modified op but not its users, and a user's own match condition reads
+    // that operand's type. A downstream linalg.transpose whose init still has
+    // the logical rank is the case that bites: left un-revisited it keeps a
+    // rank-2 init against a now rank-3 input and fails its verifier.
+    //
+    // The analysis cannot substitute here. It predicts what a type WILL be, not
+    // when a neighbour's in-place retype has landed, and this is the latter.
+    // Measured: removing it breaks rewrite-descriptor-layout-chained-transpose
+    // and -elementwise-chain with "input rank 3 does not match init rank 2".
     for (Operation *user : llvm::make_early_inc_range(op->getResult(0).getUsers()))
       rewriter.modifyOpInPlace(user, [] {});
     return success();
@@ -1052,11 +1065,13 @@ struct RewriteElementwisePattern : RewritePattern {
 // permutation from somewhere once the transpose is gone.
 struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   const PassContext &ctx;
-  // Benefit 3, above every consumer of the permutation it records. A transpose
-  // must be erased before dispatchSource reads physicalValues, or the entry is
-  // absent when asked and a miss cannot be told from "genuinely logical".
+  // Benefit 1, like every other pattern here. It was 3 so that a transpose was
+  // erased before dispatchSource read physicalValues -- a miss there could not
+  // be told from "genuinely logical". dispatchSource asks the Phase 2A analysis
+  // now, which knows the transpose's permutation up front, so the ordering has
+  // nothing left to buy; removing it is byte-identical on every fixture.
   RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
-      : OpRewritePattern(mlirCtx, /*benefit=*/3), ctx(layoutCtx) {}
+      : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
 
   LogicalResult matchAndRewrite(linalg::TransposeOp tr,
                                 PatternRewriter &rewriter) const override {
@@ -1073,15 +1088,11 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
     });
     auto &slot = it->second.transposePerm;
     slot = slot.empty() ? perm : composePerm(slot, perm);
-    // Capture users before replaceOp() moves them onto `input`'s use-list:
-    // the greedy driver does not automatically re-enqueue users of a
-    // replaced value, but a downstream elementwise/transpose/contraction op
-    // may only become dispatchable now that this transpose is gone.
-    SmallVector<Operation *> formerUsers(tr.getResult()[0].getUsers().begin(),
-                                         tr.getResult()[0].getUsers().end());
+    // No re-enqueue of former users needed. Erasing this transpose does not
+    // change any consumer's dispatchability: dispatchSource reads the analysis,
+    // which already accounts for this permutation. Measured removable --
+    // byte-identical on every fixture.
     rewriter.replaceOp(tr, input);
-    for (Operation *user : formerUsers)
-      rewriter.modifyOpInPlace(user, [] {});
     return success();
   }
 };

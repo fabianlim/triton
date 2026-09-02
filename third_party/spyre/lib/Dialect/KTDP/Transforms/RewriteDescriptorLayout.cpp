@@ -26,6 +26,7 @@
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/IndexDomain.h"
+#include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
@@ -103,6 +104,12 @@ struct RewriteDescriptorLayoutPass
 
   // Maps each physical ConstructMemoryViewOp result -> its source marker.
   DenseMap<Value, triton::SpyreTensorLayoutOp> physMemViewToMarker;
+
+  // Logical construct_memory_view ops replaced by a physical one in Phase 1.
+  // They cannot be erased there: the marker's bridge cast still holds them as
+  // an operand, and that cast is only erased in Phase 3 (eraseMarker). So
+  // Phase 3 erases them right after, once nothing references them.
+  SmallVector<mlir::ktdp::ConstructMemoryViewOp> deadLogicalMemViews;
 
   // Loops already rescaled to stick granularity.
   DenseSet<scf::ForOp> rescaledLoops;
@@ -826,6 +833,11 @@ struct RewriteDescriptorLayoutPass
         return failure();
     }
 
+    // The logical view is now superseded by the physical one. Its only
+    // remaining user is the marker's bridge cast, which Phase 3 erases; queue
+    // the view so Phase 3 can drop it too.
+    deadLogicalMemViews.push_back(plan.memViewOp);
+
     return success();
   }
 
@@ -881,9 +893,17 @@ struct RewriteDescriptorLayoutPass
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 1 complete, "
                             << "entering Phase 2 (contraction synthesis)\n");
 
+    // Phase 2A: decide, for every value reachable from Phase 1's roots, the
+    // final physical type it will carry -- before Phase 2 rewrites anything.
+    // Mutates no IR, creates no ops (see PhysicalTypeAnalysis.h). Step 4c-A
+    // lands the analysis and the assertions measuring it against the guards
+    // Phase 2 uses today; 4c-B is what makes the rewrite read it instead.
+    PassContext ctx{physMemViewToMarker, physicalValues};
+    PhysicalTypeMap physicalTypes = runPhysicalTypeAnalysis(module, ctx);
+    ctx.physicalTypeAnalysis = &physicalTypes;
+
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
-      PassContext ctx{physMemViewToMarker, physicalValues};
       RewritePatternSet patterns(module.getContext());
       populateContractionPatterns(patterns, ctx);
       // Collect candidate ops: the four contraction-family ops, plus every
@@ -931,6 +951,10 @@ struct RewriteDescriptorLayoutPass
       }
       if (ctx.hadError)
         return signalPassFailure();
+      // Third agreement invariant: at end of Phase 2, everything Phase 2
+      // found to be physical was predicted by Phase 2A.
+      verifyPhysicalTypeAgreement(module, ctx, physicalTypes,
+                                  "end of Phase 2");
     }
 
     LLVM_DEBUG(llvm::dbgs() << "[rewrite-descriptor-layout] Phase 2 complete, "
@@ -939,6 +963,13 @@ struct RewriteDescriptorLayoutPass
     // Phase 3: erase all markers (and their now-dead bridge casts).
     for (auto marker : markers)
       eraseMarker(marker);
+
+    // With the bridge casts gone, the logical views Phase 1 superseded have no
+    // users left. Erase them -- but check rather than assume: a view whose
+    // access tiles Phase 1 could not fully re-point still has real users.
+    for (auto memViewOp : deadLogicalMemViews)
+      if (memViewOp->getBlock() && memViewOp->use_empty())
+        memViewOp.erase();
   }
 };
 
