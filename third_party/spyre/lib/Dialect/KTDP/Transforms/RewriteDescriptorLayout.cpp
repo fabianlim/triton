@@ -899,8 +899,12 @@ struct RewriteDescriptorLayoutPass
     // lands the analysis and the assertions measuring it against the guards
     // Phase 2 uses today; 4c-B is what makes the rewrite read it instead.
     PassContext ctx{physMemViewToMarker, physicalValues};
-    PhysicalTypeMap physicalTypes = runPhysicalTypeAnalysis(module, ctx);
-    ctx.physicalTypeAnalysis = &physicalTypes;
+    PhysicalTypeMap physicalTypeMap = runPhysicalTypeAnalysis(module, ctx);
+    ctx.physicalTypeAnalysis = &physicalTypeMap;
+    // Phase 2B reads that map through the const pointer above and writes it
+    // through this handle, which grants exactly one operation -- see
+    // PhysicalTypeCarryForward.
+    ctx.physicalTypes = PhysicalTypeCarryForward(physicalTypeMap);
 
     // Phase 2: synthesize contractions via greedy pattern rewrite.
     {
@@ -953,7 +957,7 @@ struct RewriteDescriptorLayoutPass
         return signalPassFailure();
       // Third agreement invariant: at end of Phase 2, everything Phase 2
       // found to be physical was predicted by Phase 2A.
-      verifyPhysicalTypeAgreement(module, ctx, physicalTypes,
+      verifyPhysicalTypeAgreement(module, ctx, physicalTypeMap,
                                   "end of Phase 2");
     }
 

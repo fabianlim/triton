@@ -644,6 +644,34 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes, spyre
 
+        # DropReductionInitFill, unconditionally and with no option to select it.
+        # LowerComputeOps gives every reduction a zero `linalg.fill` on its `outs`
+        # per upstream linalg semantics; the scheduler's allowlist is
+        # add/mul/sub/reduce and the fill is none of those, so a reduction
+        # carrying one cannot become a binary. Nothing that stops at KTIR cares,
+        # which is why it belongs here rather than in the pipeline every path
+        # crosses: it is a requirement of dbo-opt, not of the IR.
+        #
+        # Unconditional, unlike MaterializeBaseAddresses below, because nothing
+        # about it is a choice. That pass is guarded because `symbolic_args` and
+        # `base_addresses` genuinely select between argument-passing modes; this
+        # one has no mode -- a reduction either reaches a binary with the fill
+        # gone or does not reach one at all.
+        #
+        # Non-summing reductions are refused here rather than silently lowered:
+        # the pass admits `addf`/`subf` only, since the scheduler resets an
+        # accumulator to zero whatever the combiner is, so `mul` (needs 1.0) and
+        # `max`/`min` (need -/+inf) would get the wrong answer. That refusal
+        # reaches only kernels being built into binaries -- a max reduce still
+        # lowers and still runs on ktir_cpu.
+        #
+        # A no-op for everything else: it matches only linalg ops carrying a
+        # reduction iterator, so the other producer of linalg.fill in this
+        # pipeline (tt.splat) is out of scope.
+        pm = ir.pass_manager(mod.context)
+        spyre.passes.ttir_to_ktdp.add_drop_reduction_init_fill(pm)
+        pm.run(mod, "make_spyrecode.drop_reduction_init_fill")
+
         if options.symbolic_args:
             # Symbolic mode: leave the pointer arguments alone. The addresses are
             # not known at compile time -- dbo-opt records a correction table in
@@ -676,7 +704,7 @@ class SpyreBackend(BaseBackend):
                 pm, base_addresses=list(base_addresses))
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-            pm.run(mod, "make_spyrecode")
+            pm.run(mod, "make_spyrecode.materialize_base_addresses")
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()

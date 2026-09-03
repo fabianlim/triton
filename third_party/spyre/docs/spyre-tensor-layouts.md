@@ -75,6 +75,12 @@ reported, and gets the conservative answer. Resolution is transitive and carries
 a visit stack, so a value already being resolved is a cycle and fails rather than
 diverging.
 
+Most rules are a function of the operand alone, but not all: whether a
+`linalg.reduce` produces a physical result is a question about the layout its
+result is *stored under*, so that rule walks forward to the store, the mirror of
+what the store pattern does backward. Nothing about that walk mutates IR, and it
+reads only what Phase 1 produced, so it stays an analysis.
+
 *2B, rewrite.* Walk the ops and act on the recorded types rather than on the
 current IR. An operand's physicality is a lookup: resolved, or predicted and not
 yet reached (defer to a later visit), or absent and therefore logical.
@@ -121,23 +127,20 @@ With inputs physical, Phase 2 fires on the op and decides what to do with the
 | Can be physicalized | Physicalize it. The op consumes and produces physical shape; no loop. |
 | Cannot be physicalized | Leave it logical and emit a loop that bridges physical inputs to the logical result. |
 
-Whether the output can be physicalized is a property of the op, not of the
-shapes:
+Whether the output can be physicalized *at all* is a property of the op, not of
+the shapes:
 
 | Op | Output can be physical | Why |
 |---|---|---|
 | elementwise (`arith`, `linalg.generic`) | Yes | Rank-agnostic; the physical type propagates unchanged. |
-| `linalg.reduce` | Yes | `dimensions` is a list, so a stick-split reduced axis is expressible in one op. |
+| `linalg.reduce` | Yes | `dimensions` is a list, so a stick-split reduced axis is expressible in one op, and a *surviving* one rides along as a batch dim. |
 | `ktdp.store` | Yes | `AnyTensor`; the verifier checks only that data-tile and access-tile shapes agree. |
-| `linalg.matmul`, `linalg.batch_matmul` | No | Contracts exactly one `K` axis, so a split `K` needs accumulation across sticks. |
+| `linalg.matmul`, `linalg.batch_matmul` | No | Contracts exactly one `K` axis, so a split `K` needs accumulation across sticks; and its init extents must match the A/B slice extents, so a surviving multi-stick axis is scattered by an outer loop rather than carried. |
 
 An annotated output is what makes the first outcome available: the store's
 access tile is physicalized alongside it, so the two sides agree. A reduce whose
 output descriptor carries no marker takes the second outcome — the result stays
 `tensor<64xf32>` and an `scf.for` accumulates into it.
-
-`linalg.reduce` and `ktdp.store` are therefore one category, differing only in
-which outcome their output lands in. There is no separate sink path.
 
 The first outcome, for a reduce over a stick-split axis with physical input
 `[2, 64, 64]` and physical output `[64]`:
@@ -148,6 +151,65 @@ The first outcome, for a reduce over a stick-split axis with physical input
 
 This is legal because `dimensions` is `DenseArrayStrictlySorted` with no
 adjacency or trailing-position requirement.
+
+### Which physical shape: the output axis space
+
+*Design note with the full rationale, the rejected alternatives and the
+invariants involved: `reduce-output-axis-space.md`.*
+
+For a reduce, "can be physicalized" leaves a second question the table above does
+not answer: *which* physical shape. Reducing away a logical axis deletes every
+physical dim sourced from it and leaves the rest in place, so the operand's layout
+**induces** one — the surviving physical dims, in order, with their coord ops and
+args intact, against the surviving axes renumbered. If the output descriptor
+declares exactly that layout, the reduce is emitted at it directly and the store
+has nothing left to do. If it declares anything else, or nothing, the result stays
+logical and the store's widen stage builds the physical form afterwards.
+
+That choice is named `OutputAxisSpace`, and it is what a `role` numbers positions
+in:
+
+- **Logical** — one output axis per surviving *logical* dim. The two physical dims
+  of a stick-split axis share one role, so a surviving stick-index dim is not an
+  output axis at all: it is a scatter dim, sliced away at extent 1 or scattered by
+  an outer loop. Every matmul-like op is here.
+- **Physical** — one output axis per surviving *physical* dim, in physical order. A
+  surviving stick-index dim is an output axis of its own, i.e. a batch dim of the
+  emitted op, so one logical axis can occupy two output axes (its stick index and
+  its lane) — which is exactly what a role numbered per logical dim cannot
+  express, and why the accumulator is keyed by output axis rather than by role.
+
+One predicate, `isScatterDim(role, coordOp, space)`, decides for both `classify()`
+and any caller building a target order from a marker directly, so the two cannot
+disagree about which dims are excluded. It is named for the decision it makes —
+and specifically for what the dim's loop then *does*, scatter — rather than for a
+property of the dim, because it takes three facts to reach: the dim survives, it
+is a stick index (`isFloorCoord`), and the space is Logical so it has no output
+axis to occupy. Its sibling bucket, `reduceLoopDims`, is sliced identically and
+differs only in that its loop accumulates rather than scatters; see
+`reduce-output-axis-space.md` for that pair.
+
+Worked, for a logical `[M=64, N=128]` fp16 stick-split on `N` (`S=64`, physical
+`[2, 64, 64]` = stick index, `M`, lane) reducing **M**, a whole physical
+dimension, into `[128]` declared with the same split (physical `[2, 64]`):
+
+```mlir
+%acc = tensor.empty() : tensor<2x64xf16>
+%r = linalg.reduce ins(%tile : tensor<2x64x64xf16>) outs(%acc : tensor<2x64xf16>) dimensions = [1]
+ktdp.store %r, %out_tile : tensor<2x64xf16>, <2x64xindex>
+```
+
+One reduce, no loop, no slicing, and `ktdp.store` consuming the result. The
+accumulator is rebuilt at the physical shape rather than reused: it is a different
+physicalization of the same logical tensor than the init the op arrived with, not
+a slab of it. Only a `tensor.empty` or a `linalg.fill` over one can be rebuilt —
+which is what `LowerComputeOps` emits for a reduction's `outs` — since anything
+else holds values a rebuild would drop; that keeps the Logical answer.
+
+Reducing `N` instead, the stick axis itself, consumes both of its physical dims,
+so nothing stick-split survives, the induced layout is a single identity dim, and
+a `[64]` output declaring a split does not match it. That is the Logical answer,
+and it is the `dimensions = [0, 2]` form above.
 
 ## One conversion path
 
@@ -185,6 +247,20 @@ place the rank does not change, so the pattern must test whether the work is
 already done — a reduce whose `dimensions` already covers the physical reduce
 dims does not match. Running the pass on its own output is a no-op, and a lit
 fixture asserts it by diffing the two.
+
+A reduce emitted in the Physical output axis space needs a second test, because
+neither of those catches it: it consumes the physical `ktdp.load` unsliced, so
+every other match condition still holds, and its `dimensions` can name a physical
+position that is *within* logical range (a single surviving reduce axis at
+physical position 1, say), so "already covers the physical reduce dims" cannot see
+it. What does is the registration: a result the rewrite recorded as physical is a
+result this pattern already produced.
+
+Recording that result is also why the Phase 2A subset invariant carries one
+exemption. A source pattern *replaces* its op, minting a value that did not exist
+when the analysis ran, so its absence from the analysis map is not the analysis
+under-claiming — the op's original result, which is what the analysis was asked
+about, is still there.
 
 The driver's convergence result is checked, so a pattern that stays matchable
 fails the pass with a diagnostic instead of spinning to the iteration cap and
