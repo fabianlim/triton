@@ -43,16 +43,11 @@ def _make_inputs(shape, *, dtype="fp32", axis=1) -> dict:
 
     *dtype* is a :data:`DTYPE_MAP` key, read from the variant's ``params`` rather
     than defaulted here, so the buffers cannot drift from the pointer types
-    ``SIGNATURE`` declares. It replaces a ``functools.partial(make_inputs,
-    dtype=np.float16)`` that sat on the stick variant beside a ``SIGNATURE``
-    separately saying fp16.
+    ``SIGNATURE`` declares.
 
     Integers take their own branch. ``standard_normal`` cast to int32 truncates
     to a field of -1, 0 and 1, where every row's max is 1 and every row's min is
     -1 -- a reduce could be reducing the wrong axis and still match.
-
-    One seed, where the 2D maker used 0 and the rank-3 maker 7. Nothing depended
-    on them differing.
     """
     np_dtype = DTYPE_MAP[dtype]
     shape = tuple(shape)
@@ -79,8 +74,7 @@ def make_inputs_3d(D0, D1, D2, DTYPE="fp32", **_unused) -> dict:
     return _make_inputs((D0, D1, D2), dtype=DTYPE)
 
 
-#: NumPy oracle per op name. The same three serve both ranks and either axis --
-#: what used to be ``run`` and ``run_3d_middle`` were the same function.
+#: NumPy oracle per op name. The same three serve both ranks and either axis.
 _NUMPY_OPS = {"sum": np.sum, "max": np.max, "min": np.min}
 
 
@@ -109,12 +103,11 @@ run = _oracle("sum")
 # SIGNATURE
 #
 # One entry per ``@triton.jit`` argument, per ``fixtures/README.md``. Built from
-# a shape and a dtype rather than written out per variant: the rank-3 signature
-# used to omit ``BLOCK_D0`` while the 2D one declared ``BLOCK_M``, which was
-# harmless only because ``BLOCK_D0`` is a constexpr in every rank-3 variant and
-# constexpr values come from ``params``. Flip it to a runtime argument and
-# ``_resolve_variant`` would drop it from the ABI and ``run_cpu`` would report a
-# missing kwarg. Deriving the dict is what stops an argument going missing again.
+# a shape and a dtype rather than written out per variant, which is what stops an
+# argument going missing: omitting one is harmless only while it is a constexpr
+# in every variant of that shape, since constexpr values come from ``params``.
+# Flip it to a runtime argument and ``_resolve_variant`` would drop it from the
+# ABI and ``run_cpu`` would report a missing kwarg.
 # ---------------------------------------------------------------------------
 
 _SHAPE_ARGS = {
@@ -147,10 +140,7 @@ _SIG_3D = _signature("3d", "fp32")
 #
 # Every helper takes a *dtype*, never a width: the width follows from the dtype
 # and each call site had the dtype in hand, so taking a width would put the
-# chance of pairing a dtype with the wrong stick at every one of them. That
-# pairing is what ``_SS = functools.partial(sticksize, _SIG_SPYRE)`` and its fp32
-# twin ``_S3`` used to leave open -- each bound to one signature, so moving a
-# layout between variants silently moved its stick width too.
+# chance of pairing a dtype with the wrong stick at every one of them.
 #
 # Each returns the ``("stick", layout)`` pair rather than the bare layout, so a
 # layout has one spelling in this file and the only tuples written into ``params``
@@ -194,13 +184,8 @@ def _stick_on_n_row(dtype: str, n_sticks: int) -> tuple:
     ``[M, N]`` reduce *n_sticks* sticks wide at *dtype*.
 
     ``N`` and both layouts take their width from the one *dtype* argument, so a
-    row cannot pair a 128-lane ``N`` with a 32-lane layout. Spelling a stick
-    width beside a dtype is what let the two disagree; a row makes it
-    unrepresentable, and unrepresentable without a factory, so it reaches every
-    variant rather than the ones carrying one.
-
-    No width is written here or at the call site: *n_sticks* says how many, the
-    dtype says how wide.
+    row cannot pair a 128-lane ``N`` with a 32-lane layout. No width is written
+    here or at the call site: *n_sticks* says how many, the dtype says how wide.
 
     Worked out, because the entry that reaches the kernel is a nest of tuples and
     nothing else here shows it. ``_stick_on_n_row("fp16", n_sticks=2)`` at ``M=64``
@@ -428,9 +413,8 @@ VARIANTS = {
         #
         # So it is fp16 sum that sets both numbers, and the fp32 arm is checked
         # far more loosely than it could be. One tolerance covers all nine
-        # because rtol/atol are fields, not params, and the sweep grammar has
-        # nothing to say about them: the alternative to one loose tolerance is
-        # nine variants, or a tolerance hook, which is mechanism.
+        # because rtol/atol are fields, not params; the alternative is nine
+        # variants, or a tolerance hook, which is mechanism.
         "rtol":         1e-2,
         "atol":         5e-2,
         "extra_checks": lambda t: (
@@ -522,8 +506,7 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.reduce"),
-            # No transpose: linalg.reduce takes a sorted `dimensions` list, so a
-            # reduced axis is named where it sits rather than rotated to the end.
+            # No transpose: the reduced axis is named where it sits.
             t.assert_absent("linalg.transpose"),
         ),
     },
@@ -568,13 +551,8 @@ VARIANTS = {
     # linalg.reduce (``ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]``),
     # with ktdp.store consuming it directly. That is the shape torch-spyre's
     # working ``sum`` emits, and it is the one reduce here that reaches a binary
-    # and launches.
-    #
-    # It used to walk the stick axis with an scf.for and an
-    # extract_slice/insert_slice per stick, plus a second loop to re-tile for the
-    # store, and dbo-opt rejected the loop --
-    # ``rewrite-descriptor-layout-reduce-batch-dim.mlir`` pins the form that
-    # replaced it.
+    # and launches. ``rewrite-descriptor-layout-reduce-batch-dim.mlir`` pins the
+    # emitted form.
     "one_tile": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",

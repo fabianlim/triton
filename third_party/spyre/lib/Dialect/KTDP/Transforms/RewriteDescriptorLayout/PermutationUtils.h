@@ -13,11 +13,10 @@ enum class CoordOp : int64_t { Identity = 0, FloorDiv = 1, Mod = 2 };
 
 /// Where a synthesized op's OUTPUT axes live — the space a `role` (and hence
 /// `dimRoles`, `targetOrder` and the accumulator's axes) numbers positions in.
-/// It is the output half of the decision the layout doc calls "the output
-/// decision", and it is a property of the op *instance*, not of the op kind:
-/// the same linalg.reduce lands in either space depending on whether the
-/// descriptor its result is stored to carries the layout the operand's
-/// surviving stick structure induces.
+/// A property of the op *instance*, not of the op kind: the same linalg.reduce
+/// lands in either space depending on whether the descriptor its result is
+/// stored to carries the layout the operand's surviving stick structure
+/// induces. See "Which physical shape" in docs/spyre-tensor-layouts.md.
 enum class OutputAxisSpace {
   /// One output axis per surviving LOGICAL dim. A surviving stick-index dim is
   /// not an output axis at all: it is sliced away (extent 1) or scattered by an
@@ -48,21 +47,17 @@ inline bool isFloorCoord(CoordOp op) { return op == CoordOp::FloorDiv; }
 ///   isFloorCoord(op)     it is a stick index
 ///   space == Logical     output axes are numbered per surviving *logical* dim
 ///
-/// The third is the one that makes this a decision rather than a property. A
-/// surviving stick index shares its logical axis with the lane dim beside it,
-/// so numbering output axes logically leaves it nowhere to go: one logical axis,
-/// one output axis, already taken by the lane. It gets bucketed into
-/// `scatterDims` and driven from outside instead. In the Physical space it has
-/// an output axis of its own — a batch dim of the emitted op — so it stays in
-/// the op tile and this is false.
+/// The third is what makes this a decision rather than a property: in the
+/// Logical space a surviving stick index shares its logical axis with the lane
+/// dim beside it and has nowhere to go, so it is bucketed into `scatterDims` and
+/// driven from outside; in the Physical space it has an output axis of its own —
+/// a batch dim of the emitted op — so it stays in the op tile and this is false.
 ///
 /// The three conjuncts used to sit behind the name `isFloorDim`, which read as
-/// a property of the dim and was true of neither the parallel requirement nor
-/// the space. `isFloorCoord` is the property; this is the decision. Named for
-/// what the dim's loop *does* — scatter — because the sibling bucket
+/// a property of the dim. `isFloorCoord` is the property; this is the decision,
+/// named for what the dim's loop *does* — scatter — because the sibling bucket
 /// (`reduceLoopDims`) is sliced identically and differs only in that its loop
-/// accumulates; naming one of them for the coordinate they happen to share hid
-/// exactly that.
+/// accumulates.
 ///
 /// Shared by classify() and by any caller deriving the same membership from a
 /// role/coord-op pair without re-running classify() (building a target order

@@ -40,27 +40,22 @@ using PhysicalTypeMap = llvm::DenseMap<mlir::Value, PhysicalTypeInfo>;
 ///
 /// Phase 2B reads the analysis through `PassContext::physicalTypeAnalysis`,
 /// which is a pointer to const on purpose: a rewrite must not be able to invent
-/// a physical-type decision, or revise one, behind the analysis's back. But
-/// there is one thing a rewrite legitimately needs to do to that map. When a
-/// source pattern REPLACES an op whose result the analysis decided is physical,
-/// the replacement is a brand-new value the analysis never saw, and it carries
-/// the decision made for the value it replaced. Recording that is not a new
-/// decision; it is the same decision following the value it is about.
-///
-/// Without it, `verifyPhysicalTypeAgreement`'s containment check (every value
-/// Phase 2 found physical, the analysis predicted) would fail on the
-/// replacement, and the only ways out are to exempt it -- a hole in the check --
-/// or to close the gap at the source, which is this. With it, containment holds
-/// BY CONSTRUCTION for minted values, and the check keeps its full strength for
-/// every other entry.
+/// a physical-type decision, or revise one, behind the analysis's back. The one
+/// thing a rewrite legitimately needs is this: when a source pattern REPLACES an
+/// op whose result the analysis decided is physical, the replacement is a
+/// brand-new value the analysis never saw, carrying the decision made for the
+/// value it replaced. That is not a new decision, and without recording it
+/// `verifyPhysicalTypeAgreement`'s containment check (every value Phase 2 found
+/// physical, the analysis predicted) would fail on the replacement, leaving only
+/// the option of exempting it -- a hole in the check. With it, containment holds
+/// BY CONSTRUCTION for minted values.
 ///
 /// The map is held privately and the class is defined here while
 /// `PhysicalTypeInfo` is still incomplete, so `carryForward` cannot be inlined
 /// and no Phase 2B translation unit can reach the map through this handle by
 /// any other route. Widening what 2B may write therefore means adding a method
 /// here, named and reviewed, rather than a `const` quietly going missing inside
-/// a pattern. Same spirit as handing the Phase 2A propagation rules a
-/// `const MarkerByMemView &` instead of the whole PassContext.
+/// a pattern.
 class PhysicalTypeCarryForward {
 public:
   /// Inert: no analysis to carry anything forward in. Calling `carryForward` on
@@ -107,18 +102,13 @@ struct PassContext {
   /// permutation against the transpose's input, which is already an entry).
   /// Presence answers "is this value reachable from a physicalized load"
   /// without re-walking the chain: an op on a path that was never
-  /// physicalized (no marker anywhere upstream) is simply never in this map.
-  /// This is what keeps the elementwise pattern's local shape rule from
-  /// mis-firing on ops like tt.expand_dims that happen to have one tensor
-  /// operand and a differently-shaped result but are not reachable from any
-  /// physicalized load.
+  /// physicalized (no marker anywhere upstream) is simply never in this map,
+  /// which is what keeps the elementwise pattern's local shape rule from
+  /// mis-firing on ops like tt.expand_dims (see RewriteElementwisePattern).
   llvm::DenseMap<mlir::Value, PhysicalValueInfo> &physicalValues;
   /// Phase 2A's answer: the final physical type of every value reachable from
   /// Phase 1's roots, computed before Phase 2 rewrites anything (see
-  /// PhysicalTypeAnalysis.h). Step 4c-A does not act on it -- the patterns
-  /// read it only to assert that it agrees with the in-flight guards it will
-  /// eventually replace, which is the measurement that makes 4c-B safe. Null
-  /// when the analysis was not run.
+  /// PhysicalTypeAnalysis.h). Null when the analysis was not run.
   const PhysicalTypeMap *physicalTypeAnalysis = nullptr;
   /// The one write path back into that map -- see PhysicalTypeCarryForward for
   /// why it is a handle with a single method rather than dropping the `const`
@@ -235,7 +225,7 @@ struct OperandPlan {
 /// The store sink path needs no `SourceOperandSpec`: a store contracts
 /// nothing, so there is no -1 and no compaction, and its target order is
 /// always the identity (logical dim `d` -> position `d`). It therefore builds
-/// a dense iota inline rather than carrying a spec. See `emitSinkStage`.
+/// a dense iota inline rather than carrying a spec. See `emitWidenStage`.
 struct SourceOperandSpec {
   llvm::SmallVector<int64_t> canonicalAxes;
   llvm::SmallVector<int64_t> targetOrder;

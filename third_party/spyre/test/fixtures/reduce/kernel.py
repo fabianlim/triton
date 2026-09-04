@@ -97,10 +97,8 @@ def reduce_middle_axis_spyre(
     being trailing is: nothing. ``linalg.reduce`` names the axes it folds in a
     sorted ``dimensions`` list, so D1 is reduced where it sits and no
     ``linalg.transpose`` is emitted, at either grid and with or without a stick
-    layout. This docstring used to claim the opposite — that the axis had to be
-    rotated to the end because ``linalg.reduce`` "always takes the trailing
-    dims" — while ``meta.py`` asserted ``assert_absent("linalg.transpose")``
-    two levels down. The emitted IR agrees with the assertion.
+    layout -- which is what ``meta.py`` asserts with
+    ``assert_absent("linalg.transpose")``.
 
     The reduced axis is the *middle* one, so it is never the axis being
     blocked or distributed — the tiling above is orthogonal to what makes

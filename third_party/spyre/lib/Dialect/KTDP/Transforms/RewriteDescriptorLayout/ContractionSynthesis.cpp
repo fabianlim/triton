@@ -288,11 +288,10 @@ Value extractOpSlice(OpBuilder &b, Location loc,
 //===----------------------------------------------------------------------===//
 // Conversion stage: narrow N physical operands into one op-tile (a source op
 // feeding matmul/reduce), or widen one op-tile into physical (a store's data
-// tile). One direction parameter, not two emitters: both narrow N physical
-// operands into one op-tile, or widen one op-tile into physical -- they
-// transpose, drive a counted loop, slice, and insert, differing only in which
-// side of the loop is the physical container and whether an op fires inside
-// it (narrow) or the loop body is a plain gather/scatter (widen).
+// tile). One direction parameter, not two emitters: both transpose, drive a
+// counted loop, slice, and insert, differing only in which side of the loop is
+// the physical container and whether an op fires inside it (narrow) or the loop
+// body is a plain gather/scatter (widen).
 //===----------------------------------------------------------------------===//
 
 // Narrow stage emission: extract slices, optional transpose, call emitOp.
@@ -336,12 +335,11 @@ Value emitNarrowStage(
     }
   auto accTy = RankedTensorType::get(accDims, accElemTy);
 
-  // In the Physical output-axis space the accumulator is a different
-  // physicalization of the same logical tensor than the init the op arrived
-  // with, so it is rebuilt at accTy rather than reused (see
-  // rebuildPhysicalInit). Not gated on a type mismatch alone: in the Logical
-  // space a mismatch is the parallel-scatter slab relation below, where cVal is
-  // deliberately the wider container and accTy one slab of it.
+  // In the Physical output-axis space the accumulator is rebuilt at accTy
+  // rather than reused (see rebuildPhysicalInit). Not gated on a type mismatch
+  // alone: in the Logical space a mismatch is the parallel-scatter slab
+  // relation below, where cVal is deliberately the wider container and accTy
+  // one slab of it.
   //
   // Phase 2A only puts a reduce in this space when canRebuildPhysicalInit holds
   // for the same init, so a null here means those two have drifted apart.
@@ -510,14 +508,6 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
       //    analysis map WILL be physical; it just is not yet, because the
       //    rewrite that makes it so (a transpose erasure, an upstream retype)
       //    has not landed in this greedy iteration. Defer.
-      //
-      //    This replaces a backward walk that hunted a live linalg.transpose.
-      //    That walk could only enumerate ways a value might be unresolved,
-      //    and it read IR Phase 2 was concurrently mutating; the analysis
-      //    answers the same question as a function of Phase 1's output.
-      //    Deferral itself remains -- under a greedy driver the answer "will
-      //    be physical" still means "not now" -- but it is now a lookup
-      //    rather than an inspection of half-rewritten IR.
       if (ctx.physicalTypeAnalysis &&
           ctx.physicalTypeAnalysis->contains(operand))
         return failure();
@@ -595,11 +585,9 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
   // value rather than deciding against a shape it cannot account for.
   //
   // `result` is a value the analysis never saw, so it also inherits the entry
-  // the analysis made for the result it replaces -- the same decision, now
-  // attached to the value it is about. That is what keeps
-  // verifyPhysicalTypeAgreement's containment true without exempting anything;
-  // see PhysicalTypeCarryForward. Every pattern that mints a replacement wants
-  // this pair of lines, and nothing else.
+  // the analysis made for the result it replaces -- see
+  // PhysicalTypeCarryForward. Every pattern that mints a replacement wants this
+  // pair of lines, and nothing else.
   if (spec.outputAxes == OutputAxisSpace::Physical) {
     ctx.physicalValues[result] = PhysicalValueInfo{spec.outputMarker, {}};
     ctx.physicalTypes.carryForward(op->getResult(0), result);
@@ -639,15 +627,13 @@ enum class WidenTarget {
 // (it is the wide side being addressed one stick at a time); whichever side
 // is physical always carries the raw stick index `p` (it already has one
 // slot per stick). That invariant holds regardless of which side plays
-// source vs. destination, which is what lets the two original emitters
-// (emitSinkStage, emitBridgeToLogical) collapse into this one, selected by
-// `target`.
+// source vs. destination, which is what lets one emitter serve both, selected
+// by `target`.
 //
 // Only the Physical target ever transposes: `plan.transposePerm` is filled by
 // resolveOperand(), which the sink caller runs and the bridge caller does
 // not (see RewriteStorePattern) -- so for a Logical target `plan.transposePerm`
-// is always empty and the guard below is simply never taken, matching
-// emitBridgeToLogical's behavior of never transposing.
+// is always empty and the guard below is simply never taken.
 LogicalResult emitWidenStage(mlir::ktdp::StoreOp st,
                              const OperandPlan &plan,
                              WidenTarget target,
@@ -1050,34 +1036,26 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 //===----------------------------------------------------------------------===//
 
 // An elementwise op's output can always be physicalized: it is rank-agnostic,
-// so the physical type of its tensor operand(s) propagates unchanged (the
-// work retypeChain used to do forward, in passing, over the whole chain).
+// so the physical type of its tensor operand(s) propagates unchanged.
 //
 // Deliberately local, and deliberately not isSingleTensorElementwiseOp (see
 // the comment there): by the time Phase 2 runs, Phase 1 has already made
 // every load's result physical, so the decision for an elementwise op is
-// local to that op's own operand/result shapes, not a backward walk. This
-// also means the rule covers multi-tensor-operand elementwise ops (addf,
-// mulf, select, ...) for free -- it just requires every tensor operand to
-// already agree on a shape before retyping the result to match.
+// local to that op's own operand/result shapes, not a backward walk. That
+// also covers multi-tensor-operand elementwise ops (addf, mulf, select, ...)
+// for free -- it just requires every tensor operand to already agree on a
+// shape before retyping the result to match.
 //
 // The shape-mismatch test alone is not sufficient to scope this pattern: it
 // also matches ops that are not elementwise at all but happen to have one
 // tensor operand and a differently-shaped result, e.g. tt.expand_dims
-// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction). Base
-// retypeChain never touched such ops because it only ever walked values
-// reachable from a physicalized load's users -- an unannotated function
-// (softmax has zero tt.spyre_tensor_layout markers) never seeded that walk
-// at all.
-//
-// ctx.physicalValues restores that same reachability scoping, as a seeded
-// worklist rather than a backward traceback: Phase 1 seeds it with every
-// physical ktdp.load result (the root of every chain Phase 2 will retype),
-// and this pattern grows it with the result of each op it retypes -- so
-// membership IS the "reachable from a physicalized load" answer, propagated
-// forward exactly the way base retypeChain did, just now living in Phase 2
-// where the per-op decision belongs. An op on an unannotated path is simply
-// never in the set, so tt.expand_dims in softmax is never retyped.
+// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction).
+// ctx.physicalValues supplies the missing reachability scoping: Phase 1 seeds
+// it with every physical ktdp.load result (the root of every chain Phase 2
+// will retype) and this pattern grows it with the result of each op it
+// retypes, so membership IS the "reachable from a physicalized load" answer.
+// An op on an unannotated path is simply never in the set, so tt.expand_dims
+// in softmax (zero tt.spyre_tensor_layout markers) is never retyped.
 struct RewriteElementwisePattern : RewritePattern {
   const PassContext &ctx;
   RewriteElementwisePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
@@ -1152,8 +1130,6 @@ struct RewriteElementwisePattern : RewritePattern {
     //
     // The analysis cannot substitute here. It predicts what a type WILL be, not
     // when a neighbour's in-place retype has landed, and this is the latter.
-    // Measured: removing it breaks rewrite-descriptor-layout-chained-transpose
-    // and -elementwise-chain with "input rank 3 does not match init rank 2".
     for (Operation *user : llvm::make_early_inc_range(op->getResult(0).getUsers()))
       rewriter.modifyOpInPlace(user, [] {});
     return success();
@@ -1172,11 +1148,9 @@ struct RewriteElementwisePattern : RewritePattern {
 // permutation from somewhere once the transpose is gone.
 struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
   const PassContext &ctx;
-  // Benefit 1, like every other pattern here. It was 3 so that a transpose was
-  // erased before dispatchSource read physicalValues -- a miss there could not
-  // be told from "genuinely logical". dispatchSource asks the Phase 2A analysis
-  // now, which knows the transpose's permutation up front, so the ordering has
-  // nothing left to buy; removing it is byte-identical on every fixture.
+  // Benefit 1, like every other pattern here: dispatchSource asks the Phase 2A
+  // analysis, which knows the transpose's permutation up front, so erasing the
+  // transpose ahead of it buys nothing.
   RewriteTransposePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
       : OpRewritePattern(mlirCtx, /*benefit=*/1), ctx(layoutCtx) {}
 
@@ -1197,8 +1171,7 @@ struct RewriteTransposePattern : OpRewritePattern<linalg::TransposeOp> {
     slot = slot.empty() ? perm : composePerm(slot, perm);
     // No re-enqueue of former users needed. Erasing this transpose does not
     // change any consumer's dispatchability: dispatchSource reads the analysis,
-    // which already accounts for this permutation. Measured removable --
-    // byte-identical on every fixture.
+    // which already accounts for this permutation.
     rewriter.replaceOp(tr, input);
     return success();
   }

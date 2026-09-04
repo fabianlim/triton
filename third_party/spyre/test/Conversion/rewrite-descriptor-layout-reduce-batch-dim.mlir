@@ -58,8 +58,7 @@ module {
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
 // One tensor.empty in the whole function -- the accumulator. A second one here
-// would be the dead logical init surviving the fold, which is what this pass
-// stopped erasing by hand.
+// would be the dead logical init surviving the fold.
 // CHECK-NOT:       tensor.empty
 // CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
 // CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x64xf16>) -> tensor<2x64xf16>

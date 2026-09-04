@@ -701,9 +701,7 @@ class SpyreBackend(BaseBackend):
         from triton._C.libtriton import ir, passes
 
         # The always-on set, whose admission rule is documented on it, then the
-        # one pass that is genuinely a choice. Nothing about _SPYRECODE_STAGE_PASSES
-        # is selectable -- a reduction either reaches a binary with the fill gone
-        # or does not reach one at all -- whereas MaterializeBaseAddresses is
+        # one pass that is genuinely a choice: MaterializeBaseAddresses is
         # guarded because `symbolic_args` and `base_addresses` pick between real
         # argument-passing modes. So the stage is a list plus a conditional, not
         # one flat list.
@@ -723,8 +721,6 @@ class SpyreBackend(BaseBackend):
         # than there are `index` arguments left to put them in, and it fails on
         # exactly that (MaterializeBaseAddresses.cpp, step 2a).
         elif "materialize_base_addresses" not in options.required_fixes:
-            # options.base_addresses is an override; without one, use the fixed
-            # policy _make_ktir derived from the TTIR pointer types.
             base_addresses = options.base_addresses or metadata.get("base_addresses")
             if base_addresses is None:
                 # A compile that starts from a .ktir source skips _make_ktir, and

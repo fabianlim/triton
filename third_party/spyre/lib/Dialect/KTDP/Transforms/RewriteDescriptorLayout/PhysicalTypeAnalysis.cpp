@@ -4,12 +4,10 @@
 // reachable value, the final physical type that value will carry once Phase 2
 // has rewritten the IR. Creates no ops and mutates nothing.
 //
-// Phase 2 used to answer "is this operand final?" from the IR it was itself
-// concurrently mutating, which it could only do by enumerating ways a value
-// might be unresolved. This analysis answers the same question as a function of
-// Phase 1's output alone, and dispatchSource now reads it: an operand present
-// here will be physical, so a miss on ctx.physicalValues means "not yet",
-// while absence here means "genuinely logical".
+// The answer is a function of Phase 1's output alone, and dispatchSource reads
+// it: an operand present here will be physical, so a miss on
+// ctx.physicalValues means "not yet", while absence here means "genuinely
+// logical".
 //
 //===----------------------------------------------------------------------===//
 
@@ -133,52 +131,29 @@ struct StorePropagation : PhysicalPropagationPattern {
   }
 };
 
-/// linalg.reduce: physical exactly when the layout it is stored under is the
-/// one its operand's surviving stick structure induces.
+/// linalg.reduce: Physical exactly when the layout it is stored under is the one
+/// its operand's surviving stick structure induces. Three conditions, and failing
+/// any of them is not an error -- it is the Logical answer, where the store's
+/// widen stage builds the physical form afterwards.
 ///
-/// A result is physical only under a layout of its OWN. A reduce result has no
-/// layout from its input: surviving stick dims on the input belong to the
-/// *operand's* layout. It acquires one from the descriptor it is stored to --
-/// which is the reduce's half of what the layout doc calls the output decision,
-/// and the doc already answers "yes, a reduce's output can be physicalized,
-/// because `dimensions` is a list". This measures when that is actually
-/// available, rather than stating "never" as it did while the emission could
-/// only produce the logical form.
+///   1. One input and one init, and the input is the value that resolved
+///      physical. A multi-operand reduce (argmax) would need every input to
+///      induce the same layout; nothing asks for that yet.
+///   2. The induced layout equals the declared one. Reducing a logical dim away
+///      deletes the physical dims sourced from it, so the survivors in order --
+///      same coord op and arg, axes renumbered -- are the layout the result
+///      would carry. Compared against the store's marker on all three coordinate
+///      arrays AND its access-tile shape: the arrays fix the order, the shape
+///      fixes the extents.
+///   3. The init is rebuildable at the physical shape, asked here so this
+///      decision and the emission cannot disagree (canRebuildPhysicalInit).
 ///
-/// The measurement, and why each half is needed:
-///
-///   INDUCED LAYOUT. Reducing away a set of logical dims deletes every physical
-///   dim sourced from one and leaves the rest in place, so the layout the result
-///   would carry follows: for each surviving physical dim, in order, the same
-///   coord op and arg, against the surviving axis renumbered by canonicalAxes.
-///   That is a coordinate map, which is the thing a marker states, so it can be
-///   compared to one.
-///
-///   DECLARED LAYOUT. The store's marker, plus its (Phase-1-physicalized)
-///   access-tile shape. Equality of all three coordinate arrays AND the shape is
-///   the condition: the arrays are what makes the ORDER agree -- a matching
-///   shape alone can hold by accident -- and the shape is what makes the
-///   EXTENTS agree, since the induced ones come from the input's block while
-///   the declared ones come from the output's.
-///
-///   Equality also means the result needs no transpose and no re-tiling: the
-///   surviving physical dims are already in the order the store wants, which is
-///   what makes them plain batch dims of one linalg.reduce.
-///
-///   REBUILDABLE INIT. The accumulator has to exist at the physical shape, and
-///   the init the op arrived with is at the logical one. Asked here so the
-///   decision and the emission cannot disagree (see rebuildPhysicalInit).
-///
-/// A mismatch on any of these is not an error: it is the Logical answer, the
-/// only one there was before, where the store's widen stage builds the physical
-/// form afterwards. Two examples that land there and must keep landing there: a
-/// reduce that folds the stick axis itself (its stick dims are reduced, so the
-/// induced layout has no split left while the output descriptor declares one),
-/// and a reduce with an unannotated output (no declared layout at all).
+/// Why a reduce has to be asked at all, and why the answer belongs to the store
+/// rather than the input: "Which physical shape" in docs/spyre-tensor-layouts.md.
 struct ReducePropagation : PhysicalPropagationPattern {
-  /// Phase 1's marker map, and nothing more: the only thing this rule needs
-  /// beyond the op is which marker the store it feeds was annotated with, which
-  /// findStoreDestination resolves from this map.
+  /// Only to resolve the store's marker, via findStoreDestination. A forward
+  /// rule reaching forward again is the tell that this fact wants to arrive
+  /// backward; a backward 2A would hand it in and this member would go.
   const MarkerByMemView &markers;
   explicit ReducePropagation(const MarkerByMemView &markers)
       : markers(markers) {}
@@ -191,9 +166,7 @@ struct ReducePropagation : PhysicalPropagationPattern {
   propagate(Operation *op, Value result, Value src,
             const PhysicalTypeInfo &srcInfo) const override {
     auto rd = cast<linalg::ReduceOp>(op);
-    // One input, and it is the one that resolved physical. A multi-operand
-    // reduce (argmax and friends) would need every input's layout to induce the
-    // same output layout; nothing asks for that yet.
+    // Condition 1.
     if (rd.getNumDpsInputs() != 1 || rd.getNumDpsInits() != 1 ||
         src != rd.getInputs()[0])
       return failure();
@@ -269,30 +242,18 @@ struct ReducePropagation : PhysicalPropagationPattern {
 
 /// tensor.expand_shape / collapse_shape / reshape: no physical result.
 ///
-/// Not because the result SHAPE is unknown -- it is derivable. A
-/// tensor.collapse_shape carries its reassociation map in the op, so the result
-/// extents follow from the operand's shape plus that map.
-///
-/// The obstacle is the coordinate map, not the shape. PhysicalTypeInfo pairs a
-/// type with a marker, and the marker's phys_src/phys_op/phys_arg arrays are
-/// indexed per PHYSICAL DIM. Collapsing physical [1, 64, 64] under
+/// The obstacle is the coordinate map, not the shape -- the result extents are
+/// derivable from the reassociation map the op carries. PhysicalTypeInfo pairs a
+/// type with a marker whose phys_src/phys_op/phys_arg arrays are indexed per
+/// PHYSICAL DIM. Collapsing physical [1, 64, 64] under
 /// phys_op = [floor, id, mod] via [[0, 1], [2]] fuses the stick index with the
-/// row, leaving a 2-dim result while the marker still describes 3 dims. The
-/// type and the marker would no longer agree, so the pair is internally
-/// inconsistent: the shape is knowable, the layout is not.
+/// row, leaving a 2-dim result while the marker still describes 3 dims: the pair
+/// would be internally inconsistent. If someone later works out how to rewrite a
+/// marker across a reassociation map, this is the one place that changes.
 ///
-/// Declining is therefore a positive statement of these ops' own rule rather
-/// than a hole in the structural elementwise predicate -- which would
-/// otherwise claim them, since "every tensor operand agrees on a shape" is
-/// satisfied trivially by an op with one tensor operand, and propagate() would
-/// then hand the result the OPERAND's shape, contradicting the op's own result
-/// type.
-///
-/// An operand produced by one of these is rejected downstream as a legality
-/// question (dispatchSource's reshape/broadcast check), which is separate from
-/// asking whether the operand is physical. If someone later works out how to
-/// rewrite a marker across a reassociation map, this is the one place that
-/// changes.
+/// Declining is a positive statement of these ops' own rule, and it must be
+/// registered ahead of the structural elementwise rule -- see
+/// populatePhysicalPropagationPatterns.
 struct ReshapePropagation : PhysicalPropagationPattern {
   bool match(Operation *op) const override {
     return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
@@ -306,23 +267,21 @@ struct ReshapePropagation : PhysicalPropagationPattern {
   }
 };
 
-/// linalg.broadcast: no physical result -- but for a different reason than the
-/// reshape family above, which is why it is stated separately.
+/// linalg.broadcast: no physical result, for a different reason than the reshape
+/// family above.
 ///
 /// A broadcast's result shape is not derived from its operand at all: it is a
-/// target shape fixed when the op was built, and `dimensions` names the axes
-/// added to reach it. LowerComputeOps builds it from tt.broadcast against the
-/// operand's LOGICAL rank. Given a physical operand, that target shape is
-/// simply stale -- it describes a tensor of the wrong rank, and a consuming
-/// elementwise op then fails its same-type constraint.
+/// target shape fixed when the op was built, which LowerComputeOps builds from
+/// tt.broadcast against the operand's LOGICAL rank. Given a physical operand
+/// that target shape is simply stale -- it describes a tensor of the wrong rank,
+/// and a consuming elementwise op then fails its same-type constraint.
 ///
-/// Unlike a reshape's coordinate map, this is recoverable in principle: the
-/// target shape and `dimensions` could be recomputed against the physical rank,
-/// which would let the op work on physical operands directly. That capability
-/// does not exist yet, and it is what a reduce -> broadcast -> elementwise chain
-/// needs -- the shape softmax and layernorm are written in. Until it does,
-/// declining here is the safe answer, and an operand produced by a broadcast is
-/// rejected downstream rather than guessed at.
+/// Unlike a reshape's coordinate map, this is recoverable in principle:
+/// recomputing the target shape and `dimensions` against the physical rank would
+/// let the op work on physical operands directly, which is what a reduce ->
+/// broadcast -> elementwise chain needs -- the shape softmax and layernorm are
+/// written in. Until that exists, declining is the safe answer and such an
+/// operand is rejected downstream rather than guessed at.
 struct BroadcastPropagation : PhysicalPropagationPattern {
   bool match(Operation *op) const override {
     return isa<linalg::BroadcastOp>(op);
@@ -369,11 +328,11 @@ void populatePhysicalPropagationPatterns(
   // Order matters only where two patterns could match the same op. Every
   // named-op pattern must be asked before the structural elementwise rule,
   // which a linalg op with uniformly shaped operands could otherwise satisfy.
-  // The reshape family and linalg.broadcast are the load-bearing cases: those
-  // ops have a single tensor operand, so the elementwise rule's "every tensor
+  // The reshape family and linalg.broadcast are the load-bearing cases: they
+  // have a single tensor operand, so the elementwise rule's "every tensor
   // operand agrees on a shape" test is satisfied trivially and it WOULD claim
   // them if asked first -- recording the operand's shape against a result of a
-  // different one. Both are registered ahead of it for exactly that reason.
+  // different one.
   patterns.push_back(std::make_unique<TransposePropagation>());
   patterns.push_back(std::make_unique<MatmulPropagation>());
   patterns.push_back(std::make_unique<StorePropagation>());
@@ -398,12 +357,9 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
   if (auto it = roots.find(value); it != roots.end())
     return it->second;
 
-  // Cycle detection, mirroring BufferizableOpInterface::getBufferType's
-  // invocationStack contract: the stack holds every value whose computation is
-  // in progress, and finding `value` on it means the value graph closed a loop
-  // (a tensor through scf.for iter_args does exactly that even though the op
-  // graph is a DAG). Return failure rather than recurse forever -- a cycle has
-  // no fixpoint this analysis is asked to compute.
+  // Cycle detection; the invocationStack contract is stated on the declaration.
+  // A cycle has no fixpoint this analysis is asked to compute, so fail rather
+  // than recurse forever.
   if (llvm::is_contained(invocationStack, value)) {
     LLVM_DEBUG(llvm::dbgs()
                << "  [2A] cycle on value, not physicalizing: " << value << "\n");
@@ -423,12 +379,11 @@ getPhysicalizedType(Value value, const PhysicalTypeMap &roots,
 
   const PhysicalPropagationPattern *pattern = lookupPattern(defOp, patterns);
   if (!pattern) {
-    // No pattern is this op's rule. Notably a reshape/expand_shape/
-    // collapse_shape/broadcast lands here: its element-to-index mapping is
-    // neither a physical tensor's nor a plain logical one's, so there is no
-    // propagation rule to state and guessing one would silently compute the
-    // wrong slice. An untaught op must stay visible here rather than acquire a
-    // default: if an op can appear on a physicalized chain, it needs a pattern.
+    // No pattern is this op's rule. An untaught op stays visible here rather
+    // than acquiring a default: if an op can appear on a physicalized chain it
+    // needs a pattern, and guessing one would silently compute the wrong slice.
+    // (The reshape family and linalg.broadcast used to be the example here; they
+    // have patterns of their own now and no longer reach this branch.)
     LLVM_DEBUG(llvm::dbgs()
                << "  [2A] no propagation rule for " << defOp->getName()
                << "; treating its result as logical\n");
@@ -571,12 +526,8 @@ void verifyPhysicalTypeAgreement(ModuleOp module, const PassContext &ctx,
 // build is TritonRelBuildWithAsserts, so this is live in every build we
 // actually use; it is debug-only in name, not in practice.
 #ifndef NDEBUG
-  // The surviving agreement invariant. The two that lived in dispatchSource
-  // compared the analysis against the guards it has now replaced, so they went
-  // with them; this one does not mention a guard, it relates the analysis to
-  // what Phase 2 actually discovered, and stays meaningful. A disagreement is a
-  // defect in the analysis, not an input the user can fix, so it is an
-  // assertion rather than a diagnostic.
+  // A disagreement is a defect in the analysis, not an input the user can fix,
+  // so it is an assertion rather than a diagnostic.
 
   // ctx.physicalValues must be a SUBSET of the analysis map: every value
   // Phase 2 discovered to be physical, the analysis predicted up front. The
@@ -588,9 +539,7 @@ void verifyPhysicalTypeAgreement(ModuleOp module, const PassContext &ctx,
   // postdates the analysis and so could not be in the map on its own, but the
   // pattern that minted it also carried the replaced value's entry forward onto
   // it (PhysicalTypeCarryForward), so containment holds for it by construction
-  // rather than by being excused. Every other entry -- Phase 1's roots and
-  // everything the elementwise and transpose patterns record -- is a value the
-  // analysis was genuinely asked about, and this is the check that it answered.
+  // rather than by being excused.
   for (auto &[value, phys] : ctx.physicalValues) {
     auto it = analysis.find(value);
     assert(it != analysis.end() &&

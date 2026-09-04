@@ -12,8 +12,9 @@ namespace mlir::triton::ktdp {
 ///   >= 0  : parallel dim, maps to output axis [value]
 ///   -1    : reduction dim
 ///
-/// `space` says what an output axis IS, and therefore how the roles are
-/// numbered:
+/// `space` says what an output axis IS (see OutputAxisSpace), and therefore how
+/// the roles are numbered. `canonicalAxes` is what says *whether* a dim survives
+/// in either space; only the numbering changes.
 ///
 ///   Logical  — role = `canonicalAxes[coords.src[p]]`, the output's logical
 ///     axis. Many-to-one: the two physical dims of a stick-split logical axis
@@ -22,8 +23,7 @@ namespace mlir::triton::ktdp {
 ///   Physical — role = the position of `p` among the operand's surviving
 ///     physical dims, ascending. One-to-one, so a stick-split surviving axis
 ///     gets two roles — its stick index and its lane — which is what lets the
-///     accumulator carry both. `canonicalAxes` is still what says *whether* a
-///     dim survives; only the numbering changes.
+///     accumulator carry both.
 ///
 /// Roles stay unique within an operand in both spaces, which is what
 /// computeTransposePerm relies on.
