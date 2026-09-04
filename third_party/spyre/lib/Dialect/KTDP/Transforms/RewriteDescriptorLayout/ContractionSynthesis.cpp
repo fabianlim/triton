@@ -27,7 +27,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -194,27 +193,6 @@ bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
     return ctx.physicalValues.contains(o);
   });
   return reachesPhysicalLoad;
-}
-
-
-// Erase `v`'s producer, and transitively the producers of its own operands,
-// while they are trivially dead.
-//
-// Rebuilding a reduction's init at physical shape leaves the logical
-// tensor.empty and the linalg.fill over it with no users, and a dead
-// tensor.empty is not inert in KTIR -- it is a buffer the downstream pipeline
-// places, and DropReductionInitFill's own gate walks reductions rather than
-// stray empties. The greedy driver erases an op it happens to revisit once that
-// op is dead, but the empty's only user was the fill, and erasing the fill is
-// not something that re-enqueues the empty.
-void eraseDeadProducers(PatternRewriter &rewriter, Value v) {
-  Operation *defOp = v.getDefiningOp();
-  if (!defOp || !isOpTriviallyDead(defOp))
-    return;
-  llvm::SmallVector<Value> operands(defOp->getOperands());
-  rewriter.eraseOp(defOp);
-  for (Value o : operands)
-    eraseDeadProducers(rewriter, o);
 }
 
 // Emit a counted loop (scf.for) over a single iter_arg, or inline for trip <=
@@ -603,13 +581,6 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
         "different trip counts or on different output axes, which would need "
         "two independent scatter loops (not supported)");
 
-  // The init the op arrived with, captured before it is replaced: in the
-  // Physical output-axis space emitNarrowStage rebuilds it at physical shape and
-  // this one is left dead.
-  Value staleInit = spec.outputAxes == OutputAxisSpace::Physical
-                        ? op.getDpsInits()[0]
-                        : Value{};
-
   OpBuilder b(op.getOperation());
   Value result = emitNarrowStage(op, b, spec, plans, tripCounts);
   if (!result)
@@ -634,8 +605,6 @@ LogicalResult dispatchSource(linalg::LinalgOp op, const SourceOpSpec &spec,
     ctx.physicalTypes.carryForward(op->getResult(0), result);
   }
   rewriter.replaceOp(op, result);
-  if (staleInit)
-    eraseDeadProducers(rewriter, staleInit);
   return success();
 }
 

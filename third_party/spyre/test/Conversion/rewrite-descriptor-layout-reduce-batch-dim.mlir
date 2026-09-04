@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-descriptor-memory --lower-scalar-load --lower-compute-ops --rewrite-descriptor-layout --canonicalize -split-input-file | FileCheck %s
 
 // A surviving stick-index dim as a BATCH dim of the reduce.
 //
@@ -16,6 +16,22 @@
 //
 // CHECKs are written rather than generated: what is pinned is a shape and an
 // absence, and a whole-function transcript would pin every constant beside them.
+//
+// --canonicalize is in the RUN line because this pass never runs alone: the
+// backend follows it with canonicalize + CSE in the same pass manager
+// (SpyreBackend._make_ktir), so the module *after* folding is the one that
+// becomes KTIR, and it is the one worth pinning. Two things it removes, both of
+// which a standalone run would leave behind and this file would then have to
+// assert as if they mattered:
+//
+//   - the logical init the Physical-space path leaves dead. rebuildPhysicalInit
+//     mints the accumulator at the physical shape rather than retyping the
+//     original, so a userless tensor.empty is left over. The pass used to erase
+//     it by hand; the canonicalizer collects it, which is why the CHECK-NOTs
+//     below can say tensor.empty at all.
+//   - an identity tensor.extract_slice. The widen stage emits one per stick, and
+//     at a single stick that is a slice of the whole thing into its own type --
+//     a no-op the folder drops (case 2).
 //
 // The CHECK-NOTs are interleaved between consecutive positive checks rather than
 // gathered at the end: a CHECK-NOT's range runs from the previous match to the
@@ -41,6 +57,10 @@ module {
 // DropReductionInitFill's job, later, in the spyrecode stage only.
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
+// One tensor.empty in the whole function -- the accumulator. A second one here
+// would be the dead logical init surviving the fold, which is what this pass
+// stopped erasing by hand.
+// CHECK-NOT:       tensor.empty
 // CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
 // CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x64xf16>) -> tensor<2x64xf16>
 // CHECK-NOT:       scf.for
@@ -92,9 +112,12 @@ module {
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x64x64xindex> -> tensor<2x64x64xf16>
 // CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%{{.*}} : tensor<64xf16>) -> tensor<64xf16>
 // CHECK:           %[[RED:.*]] = linalg.reduce ins(%[[LOAD]] : tensor<2x64x64xf16>) outs(%[[ACC]] : tensor<64xf16>) dimensions = [0, 2]
-// The widen stage: the rank-1 result scattered stick by stick into [1, 64].
-// CHECK:           %[[SL:.*]] = tensor.extract_slice %[[RED]]
-// CHECK:           %[[TILE:.*]] = tensor.insert_slice %[[SL]] into %{{.*}} : tensor<64xf16> into tensor<1x64xf16>
+// The widen stage: the rank-1 result re-tiled into the rank-2 physical block.
+// Its per-stick extract_slice is gone -- at one stick it slices the whole tensor
+// into its own type, and the folder drops it -- so the insert_slice takes the
+// reduce result directly. Nothing is scattered because there is one stick to
+// scatter into; the rank change is the whole of the widen here.
+// CHECK:           %[[TILE:.*]] = tensor.insert_slice %[[RED]] into %{{.*}} : tensor<64xf16> into tensor<1x64xf16>
 // CHECK:           ktdp.store %[[TILE]], %{{.*}} : tensor<1x64xf16>, <1x64xindex>
 tt.func @reduce_folds_the_stick_axis(%a_ptr: !tt.ptr<f16>, %c_ptr: !tt.ptr<f16>) {
   %c0_i32 = arith.constant 0 : i32
@@ -141,7 +164,12 @@ module {
 // CHECK:           %[[LOAD:.*]] = ktdp.load %{{.*}} : <2x2x64x64xindex> -> tensor<2x2x64x64xf16>
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
-// CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%{{.*}} : tensor<2x2x64xf16>) -> tensor<2x2x64xf16>
+// One tensor.empty, as in case 1 -- and named here rather than left as a
+// wildcard so the CHECK-NOT above has somewhere to stop and the accumulator's
+// rank-3 shape is stated where the fill consumes it.
+// CHECK-NOT:       tensor.empty
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x2x64xf16>
+// CHECK:           %[[ACC:.*]] = linalg.fill ins(%{{.*}} : f16) outs(%[[EMPTY]] : tensor<2x2x64xf16>) -> tensor<2x2x64xf16>
 // CHECK-NOT:       scf.for
 // CHECK-NOT:       tensor.extract_slice
 // CHECK:           %[[RED:.*]] = linalg.reduce ins(%[[LOAD]] : tensor<2x2x64x64xf16>) outs(%[[ACC]] : tensor<2x2x64xf16>) dimensions = [2]

@@ -82,7 +82,6 @@ and `~` what it modified; everything unmarked predates it.
 | `reconcileOperandSet`, `resolveOperand`, `emitCountedLoop`, `emitTranspose` | fn | trip counts, permutations, slicing | |
 | `emitNarrowStage` | fn | build the op tile and the accumulator | `~` |
 | `rebuildPhysicalInit` | fn | re-emit empty/fill at physical shape | `+` |
-| `eraseDeadProducers` | fn | drop the dead logical init chain | `+` |
 | `RewriteReducePattern` | pattern | reads 2A's verdict; target order from `buildDimRoles` | `~` |
 | `RewriteMatmulPattern`, `RewriteBatchMatmulPattern` | pattern | always Logical, `absorbReduceLoopDims=false` | `~` |
 | `RewriteStorePattern`, `emitWidenStage` | pattern/fn | widen sink; defers on a predicted-physical producer | `~` |
@@ -293,6 +292,36 @@ afterwards by the store's widen stage.
    `DropReductionInitFill`'s job on the binary path. Only those two producers
    qualify, and Phase 2A asks the same predicate, so the decision and the
    emission cannot drift.
+
+   Minting a replacement rather than retyping the originals in place is the one
+   remaining consequence of the init being a root the forward propagation cannot
+   reach: nothing physical flows *into* an init, so there is no retype to ride,
+   and the shape has to be stated. What it leaves behind — the logical
+   `tensor.empty` the op arrived with, now userless — is *not* this pass's
+   problem. `_make_ktir` canonicalizes and CSEs immediately after the pass, which
+   collects it; there is no consumer in between, and the emitted `.ktir` is
+   byte-identical whether or not the pass sweeps it itself. The pass used to,
+   with a hand-rolled recursive `eraseDeadProducers` on the stale init; that was
+   generic DCE inside a rewrite pattern and it is gone. (The dead logical
+   `linalg.fill` was never the leftover it looked like: the greedy driver
+   revisits and erases it on its own. Only the `tensor.empty` under it survived
+   to the end of the pass, because erasing the fill does not re-enqueue its
+   operand.)
+
+   The consequence for tests is that a standalone `--rewrite-descriptor-layout`
+   run shows that userless `tensor.empty` in its output, which is what pass output
+   before DCE looks like rather than a leak. `rewrite-descriptor-layout-reduce-batch-dim.mlir`
+   therefore runs `--canonicalize` in its RUN line: the pass never runs alone in
+   the backend, so the module worth pinning is the folded one, and only there can
+   the file assert `CHECK-NOT: tensor.empty` — which it does, so that a leftover
+   surviving the fold fails the test rather than being skipped over. Verified in
+   both directions: the CHECKs pass on the folded output and fail on the
+   unfolded one.
+
+   That RUN line also folds an identity `tensor.extract_slice` the widen stage
+   emits per stick — at a single stick it slices a tensor into its own type — so
+   case 2 pins the `tensor.insert_slice` taking the reduce result directly. What
+   was lost there was a check on a no-op.
 
 ## Alternatives rejected
 
