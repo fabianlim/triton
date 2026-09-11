@@ -13,6 +13,7 @@ add_triton_library(KTDPTransforms
   RewriteDescriptorLayout/RequirementAnalysis.cpp
   UnaliasLinalgOuts.cpp
   DropReductionInitFill.cpp
+  HbmRoundtrip.cpp
   DistributeWork.cpp
   MaterializeBaseAddresses.cpp
   Utility.cpp
