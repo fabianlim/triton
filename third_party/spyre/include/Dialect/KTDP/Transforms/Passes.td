@@ -532,8 +532,26 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
         whose base addresses are `index` arguments, whose compute is `linalg`
         ops on tensors, and which carries a `grid` attribute.
 
-        Lowering, for each tensor value produced by a `linalg` op in the entry
-        block and consumed by another `linalg` op in the same block:
+        A function whose entry block contains any `linalg` op other than a
+        `linalg.generic` or a `linalg.fill` is left exactly as it was found. The
+        gate is on the op set and not on what the compute does — a generic carrying
+        reduction iterators is in scope — so what it excludes is every *named*
+        `linalg` op except `fill`: `linalg.reduce`, `linalg.matmul`,
+        `linalg.broadcast`, `linalg.transpose`. This pass is a temporary stand-in
+        for a real spill decision and is narrowed to the ops it was written
+        against rather than guessing at the rest; since LowerComputeOps lowers
+        `tt.reduce` to a named `linalg.reduce`, a kernel through that path is
+        skipped today.
+
+        A `linalg.fill` is a `linalg` op but not a compute — the scheduler's
+        named-op allowlist is `linalg.{add,mul,sub,max,min,reduce,generic,yield}`,
+        so a fill never becomes a compute group of its own — and it is therefore
+        neither a spilled producer nor a consumer whose
+        operands get rewritten. It is cloned into each group that reads it, like
+        the `tensor.empty` it writes into.
+
+        Lowering, for each tensor value produced by a compute `linalg` op in the
+        entry block and consumed by another one in the same block:
         - the kernel already stores that value to HBM ahead of every consumer
           → each consumer reads it back with a `ktdp.load` over a clone of that
           store's access tile, and no buffer is allocated;
@@ -549,9 +567,11 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
         variadic, so a multi-axis grid is folded row-major to one linear index.
 
         Buffers are reused: one whose value has been read by its last consumer
-        is available to a later spill of the same tile type. Reuse is what keeps
-        a chained kernel inside the seven available base addresses (segment 7
-        holds the program), since the kernel's own pointers already take some.
+        is available to a later spill of the same tile type. What reuse saves is
+        address *slots*, not memory: the baked-address policy
+        MaterializeBaseAddresses implements has seven to hand out (segment 7 holds
+        the program) and the kernel's own pointers already take some, so reuse is
+        what keeps a chained kernel inside them.
 
         Why: the dataflow scheduler forms one local schedule per SSA-connected
         region of compute, and each compute template claims the whole local
@@ -566,9 +586,9 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
         groups read cannot be moved into either, and this pass therefore gives
         each group its own copy of everything it reads: a fresh
         `ktdp.construct_access_tile` per store and per load even where two would
-        be identical, a clone of the `tensor.empty` on `outs` and of any
-        `ktdp.load` a second compute reads, and a rebuilt address cone per memory
-        operation down to the base address — which is what hand-written reference
+        be identical, a clone of the `tensor.empty` (or `linalg.fill`) on `outs`
+        and of any `ktdp.load` a second compute reads, and a rebuilt address cone
+        per memory operation down to the base address — which is what hand-written reference
         chains do by re-reading the tile id and re-constructing their views per
         compute. Sharing any of them asserts inside the scheduler's compute-group
         extraction ("StoreOp found before any LoadOp", "Operation should have no
@@ -578,8 +598,8 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
         run after this pass** or it will merge those copies back together; the
         spyrecode stage runs canonicalize/CSE ahead of it.
 
-        A tensor read by a compute that is neither a `tensor.empty` nor a
-        `ktdp.load` is reported rather than left where it is, since this pass
+        A tensor read by a compute that is none of `tensor.empty`, `linalg.fill`
+        or `ktdp.load` is reported rather than left where it is, since this pass
         cannot place it. Only reachable on a kernel that has a
         compute-to-compute edge at all, so nothing that compiles today starts
         failing on it.
@@ -591,15 +611,18 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
         can bake their addresses.
 
         The buffers it created are reported on the module as
-        `ktdp.hbm_roundtrip_buffers`, an array of
-        `{shape, element_type, element_bits}` dictionaries in argument order, so
-        the caller can assign each one an address and the launcher can allocate
-        it. Only one public function per module may need buffers, since that
+        `ktdp.hbm_roundtrip_buffers`, an array of `{shape, element_type}`
+        dictionaries in argument order, so the caller can assign each one an
+        address and the launcher can allocate it. The element *width* is not
+        reported: the backend already derives one from an element type's spelling
+        for the kernel's own pointers, and one reader is easier to keep honest than
+        two. Only one public function per module may need buffers, since that
         list is per module and consumed positionally.
 
-        Output: KTIR in which no `linalg` op reads a value produced by another
-        `linalg` op, so each compute becomes its own local schedule. A no-op on
-        a kernel with a single compute.
+        Output: KTIR in which no compute `linalg` op reads a value produced by
+        another, so each compute becomes its own local schedule. A no-op on a
+        kernel with a single compute, and on any kernel whose `linalg` ops are not
+        all generics and fills.
     }];
 
     let dependentDialects = [

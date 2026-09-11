@@ -20,6 +20,29 @@
 // op and consumed by another one, it stores the value to HBM straight after the
 // producer and loads it back straight before each consumer.
 //
+// Scope: generic and fill only
+// ----------------------------
+// A function is left completely untouched unless every `linalg` op in its entry
+// block is a `linalg.generic` or a `linalg.fill`. The gate is on the *op set*,
+// not on what the compute does: a generic carrying reduction iterators is in
+// scope and gets a roundtrip like any other -- the hand-written reference `exx2`
+// is one. What is excluded is every *named* `linalg` op except `fill`:
+// `linalg.reduce`, `linalg.matmul`, `linalg.broadcast`, `linalg.transpose`.
+//
+// This pass is a temporary stand-in for a real spill/schedule decision, and
+// narrowing it to the ops it was written against is what keeps that honest rather
+// than having it silently mis-handle a compute it never saw. The consequence,
+// stated narrowly: today's LowerComputeOps lowers `tt.reduce` to a *named*
+// `linalg.reduce`, so a kernel that comes through that path is skipped.
+//
+// A `linalg.fill` is a `linalg` op but it is not a compute: the scheduler's
+// named-op allowlist is `linalg.{add,mul,sub,max,min,reduce,generic,yield}` and a
+// fill is not among them, so it does not become a compute group of its own and
+// the edge from a fill to the `outs` of a generic is not an edge this pass has to
+// break. A fill is therefore
+// excluded from the spill scan in both roles, and handled like the
+// `tensor.empty` it writes into: cloned into each compute group that reads it.
+//
 // Where the buffer comes from
 // ---------------------------
 // Two cases, in order of preference:
@@ -38,10 +61,13 @@
 //      `ktdp.hbm_roundtrip_buffers`, in argument order, for exactly that.
 //
 // Buffers are reused. A buffer whose value has been read by its last consumer
-// is available to a later spill of the same tile type. This is not merely a
-// memory economy: segment 7 of the address space holds the program, so a kernel
-// has at most 7 base addresses in total, and its own pointers already take some
-// of them.
+// is available to a later spill of the same tile type. What reuse economizes is
+// not memory -- a spill buffer is one tile per compute tile, a few KiB -- but
+// *address slots*: the baked base-address policy MaterializeBaseAddresses
+// implements hands out one segment per address and segment 7 holds the program,
+// so a kernel has seven in total and its own pointers already take some. That is
+// a property of the policy, not of the hardware, and it is also why this pass
+// runs only where that policy does (see `_make_spyrecode`).
 //
 // Buffer geometry
 // ---------------
@@ -64,11 +90,12 @@
 //     "StoreOp found before any LoadOp" (ComputeGroupExtraction.cpp:570).
 //     Every store and load gets its own, even where two are identical
 //     operand-for-operand.
-//   - the `tensor.empty` on `outs`, or a `ktdp.load` of an input two computes
-//     read: "Operation should have no uses left" (:472). Cloned in front of the
-//     compute that reads it, which also settles *position* -- groups are spans of
-//     the block, so a `tensor.empty` sitting inside the first group's span is in
-//     that group even when only the second reads it.
+//   - the `tensor.empty` (or the `linalg.fill` over it) on `outs`, or a
+//     `ktdp.load` of an input two computes read: "Operation should have no uses
+//     left" (:472). Cloned in front of the compute that reads it, which also
+//     settles *position* -- groups are spans of the block, so a `tensor.empty`
+//     sitting inside the first group's span is in that group even when only the
+//     second reads it.
 //   - the index arithmetic behind an access tile, shared by two of them: the
 //     same assertion, reached through an `arith.divsi` rather than through
 //     anything tensor-shaped. So each memory operation's whole address cone is
@@ -82,8 +109,8 @@
 // `_make_spyrecode` in third_party/spyre/backend/compiler.py runs
 // canonicalize/CSE ahead of this pass for that reason.
 //
-// Scope
-// -----
+// Where it looks
+// --------------
 // The entry block of each public function. A value produced inside a region
 // (an `scf.for` body, say) is out of scope -- the scheduler rejects such a loop
 // on its own account, before the question of where the value lives arises.
@@ -201,6 +228,31 @@ private:
   // Step 1: find the compute-to-compute edges
   //===--------------------------------------------------------------------===//
 
+  /// Whether `op` is a compute, i.e. a `linalg` op that becomes a compute group
+  /// of its own and so cannot hand its result to another one. A `linalg.fill` is
+  /// not: the scheduler's named-op allowlist does not include it, so it is
+  /// materialized into whichever group reads it rather
+  /// than scheduled on a functional unit. Spilling a fill would therefore put a
+  /// store and a load around something that was never a schedule boundary.
+  static bool isCompute(Operation *op) {
+    return isa<linalg::LinalgOp>(op) && !isa<linalg::FillOp>(op);
+  }
+
+  /// Whether every `linalg` op in `entry` is one of the two this pass is written
+  /// for. A named op other than `fill` -- `linalg.reduce` from a `tt.reduce`, a
+  /// `linalg.matmul`, a `linalg.broadcast` -- means the function is left exactly
+  /// as it was found: this is a temporary pass, and a deliberate no-op is a better
+  /// answer than a roundtrip placed around a compute whose scheduling it has not
+  /// been checked against. Note this says nothing about iterator types: a generic
+  /// that reduces is admitted like any other generic.
+  static bool onlyGenericsAndFills(Block &entry) {
+    for (Operation &op : entry)
+      if (isa<linalg::LinalgOp>(&op) &&
+          !isa<linalg::GenericOp, linalg::FillOp>(&op))
+        return false;
+    return true;
+  }
+
   /// The edges of `entry`, in producer order. `order` maps each op of the block
   /// to its position, which is how "precedes" is decided throughout.
   static SmallVector<Spill>
@@ -209,16 +261,16 @@ private:
     DenseMap<Value, unsigned> indexOf;
 
     for (Operation &op : entry) {
-      if (!isa<linalg::LinalgOp>(&op))
+      if (!isCompute(&op))
         continue;
       // Every operand, not just `ins`: an `outs` fed by a compute is the same
-      // unschedulable edge. UnaliasLinalgOuts normally leaves a tensor.empty
-      // there, so in practice this loop finds `ins`.
+      // unschedulable edge. UnaliasLinalgOuts normally leaves a tensor.empty (or
+      // a fill over one) there, so in practice this loop finds `ins`.
       for (Value operand : op.getOperands()) {
         Operation *producer = operand.getDefiningOp();
         if (!producer || producer->getBlock() != &entry)
           continue;
-        if (!isa<linalg::LinalgOp>(producer))
+        if (!isCompute(producer))
           continue;
         auto it = indexOf.find(operand);
         if (it == indexOf.end()) {
@@ -386,27 +438,38 @@ private:
   ///   ComputeGroupExtraction.cpp:472: Assertion `op->use_empty() &&
   ///   "Operation should have no uses left"' failed.
   ///
-  /// Two shared producers occur in practice, both from earlier passes that had
+  /// Three shared producers occur in practice, all from earlier passes that had
   /// no reason to avoid it -- one compute per kernel made sharing invisible:
   ///
   ///   - the `tensor.empty` UnaliasLinalgOuts puts on `outs`, which canonicalize
   ///     and CSE then merge across computes because it is Pure and identical;
+  ///   - a `linalg.fill` over such a `tensor.empty`, for the same reason and with
+  ///     the same remedy: it is Pure, so two identical fills become one, and it
+  ///     is not a compute (see :func:`isCompute`), so it belongs *inside* the
+  ///     group that reads it rather than passing through HBM;
   ///   - a `ktdp.load` of a kernel input read by more than one compute, which is
   ///     how a normalisation reads its values three times.
   ///
-  /// Both are cloned immediately before the compute that reads them, whether or
+  /// All are cloned immediately before the compute that reads them, whether or
   /// not they are shared. Position matters as much as sharing does: groups are
   /// spans of the block, so a `tensor.empty` sitting between the first load and
   /// the first store belongs to the first group even when its only reader is the
   /// second. Cloning in front of the reader settles both questions at once, and
   /// the original is swept afterwards if nothing else wants it.
   ///
-  /// The clone's own address cone is left alone here;
-  /// :func:`privatizeAddressCones` runs afterwards and privatizes every memory
-  /// operation's, these included.
+  /// The clone is a whole cone, not one operation: a `linalg.fill` reads both the
+  /// `tensor.empty` it writes into and the scalar it writes, and leaving either
+  /// of those shared moves the assertion one operation down rather than removing
+  /// it. The recursion is :func:`cloneCone`, the same one the address cones use,
+  /// which also means a cloned `ktdp.load` arrives with an address cone of its
+  /// own.
   static LogicalResult privatizeComputeInputs(Block &entry) {
     for (Operation &op : llvm::make_early_inc_range(entry)) {
-      if (!isa<linalg::LinalgOp>(&op))
+      // Generics only. A fill is privatized as part of the cone of the compute
+      // that reads it; visiting it in its own right would clone its
+      // `tensor.empty` in front of the *fill*, which is a position that may
+      // belong to an earlier group.
+      if (!isa<linalg::GenericOp>(&op))
         continue;
       for (OpOperand &operand : op.getOpOperands()) {
         Value value = operand.get();
@@ -416,23 +479,23 @@ private:
         if (!producer || producer->getBlock() != &entry)
           continue;
 
-        if (isa<tensor::EmptyOp, mlir::ktdp::LoadOp>(producer)) {
+        if (isa<tensor::EmptyOp, linalg::FillOp, mlir::ktdp::LoadOp>(producer)) {
           OpBuilder builder(&op);
-          operand.set(builder.clone(*producer)->getResult(0));
+          DenseMap<Value, Value> cloned;
+          operand.set(cloneCone(builder, value, cloned));
           continue;
         }
-        // A linalg producer is the compute-to-compute edge this pass has
-        // already broken, so anything left here is a tensor producer it cannot
-        // place. Reported rather than left where it is, because getting it
-        // wrong is an assertion failure inside dbo-opt with no reference back
-        // to the IR that caused it. Reachable only on a kernel that has a
-        // compute-to-compute edge in the first place, so nothing that compiles
-        // today starts failing here.
+        // Every compute-to-compute edge is a `ktdp.load` by the time this runs,
+        // and the entry block holds no `linalg` op other than a generic or a fill
+        // (:func:`onlyGenericsAndFills`), so what is left here is a tensor
+        // producer this pass has not been taught to place -- a reshape, say.
+        // Reported rather than cloned blindly, because getting it wrong is an
+        // assertion inside dbo-opt that names no IR the caller wrote.
         return op.emitError()
                << "HbmRoundtrip: " << producer->getName()
                << " produces a tensor a compute reads, and this pass can only "
-                  "place a tensor.empty or a ktdp.load into the compute group "
-                  "that reads it; the scheduler needs one producer per group";
+                  "clone a tensor.empty, a linalg.fill or a ktdp.load into the "
+                  "compute group that reads it";
       }
     }
     return success();
@@ -510,6 +573,12 @@ private:
   FailureOr<bool> roundtrip(func::FuncOp funcOp,
                             SmallVectorImpl<Attribute> &reported) {
     Block &entry = funcOp.getBody().front();
+
+    // Nothing at all on a function whose compute this pass was not written
+    // against -- see the scope note at the top of the file. Checked before
+    // anything else so the function is left byte-for-byte as it arrived.
+    if (!onlyGenericsAndFills(entry))
+      return false;
 
     DenseMap<Operation *, int64_t> order;
     {
@@ -632,21 +701,18 @@ private:
                                                tileShape, indices);
   }
 
-  /// The launcher's view of one buffer: what to allocate, and how wide its
-  /// elements are so that a base address in elements can be derived from a
-  /// segment in bytes.
+  /// The launcher's view of one buffer: what to allocate. Shape and element type
+  /// only -- the element *width* is not reported, because the backend already
+  /// reads a width off an element type's own spelling for the kernel's pointer
+  /// arguments (`_elem_bytes` in backend/compiler.py) and a second answer to the
+  /// same question is a second thing to keep in step.
   static Attribute describe(MLIRContext *ctx, const Buffer &buffer) {
     Builder builder(ctx);
-    Type elemType = buffer.tileType.getElementType();
-    int64_t bits = elemType.isIntOrFloat()
-                       ? static_cast<int64_t>(elemType.getIntOrFloatBitWidth())
-                       : 0;
     return builder.getDictionaryAttr(
         {builder.getNamedAttr("shape",
                               builder.getDenseI64ArrayAttr(buffer.viewShape)),
-         builder.getNamedAttr("element_type", TypeAttr::get(elemType)),
-         builder.getNamedAttr("element_bits",
-                              builder.getI64IntegerAttr(bits))});
+         builder.getNamedAttr("element_type",
+                              TypeAttr::get(buffer.tileType.getElementType()))});
   }
 };
 

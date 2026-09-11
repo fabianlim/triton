@@ -4,6 +4,12 @@
 // before the sqrt, so the two become separate compute groups. The buffer is a new
 // `index` argument (%arg2) and is described on the module for the launcher.
 //
+// The `outs` of both generics is one `linalg.fill` over one `tensor.empty` --
+// which is what canonicalize and CSE leave, both being Pure -- and neither is
+// spilled: a fill is not a compute, so a fill feeding a generic is not a
+// schedule boundary. Both are cloned into each group instead, `tensor.empty`
+// included, so the second group's fill does not read the first group's empty.
+//
 // Every store and every load gets its own construct_access_tile, and each
 // memory op its own memory view and tile-id arithmetic -- the scheduler moves a
 // group's operations into a schedule of their own and asserts on anything two
@@ -12,28 +18,36 @@
 #set_tile = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 5 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 #set_whole = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 
-// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_bits = 32 : i64, element_type = f32, shape = array<i64: 12, 64, 64>}]}
+// One buffer for the exp result and nothing else: a spilled fill would show up
+// here as a second entry.
+// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_type = f32, shape = array<i64: 12, 64, 64>}]}
 // CHECK-LABEL: func.func @two_computes(
 // CHECK-SAME:      %[[IN:.*]]: index, %[[OUT:.*]]: index, %[[SPILL:.*]]: index) attributes
 
-// Group 0 reads the input and writes the spill buffer.
+// Group 0 reads the input, fills its own accumulator and writes the spill buffer.
 // CHECK:         %[[LOADED:.*]] = ktdp.load
-// CHECK:         %[[EXP:.*]] = linalg.generic
+// CHECK:         %[[EMPTY0:.*]] = tensor.empty()
+// CHECK:         %[[FILL0:.*]] = linalg.fill {{.*}} outs(%[[EMPTY0]]
+// CHECK:         %[[EXP:.*]] = linalg.generic {{.*}} outs(%[[FILL0]]
 // CHECK:           spyreop.exp
 // CHECK:         %[[SPILL_VIEW_W:.*]] = ktdp.construct_memory_view %[[SPILL]], sizes: [12, 64, 64], strides: [4096, 64, 1]
 // CHECK:         %[[SPILL_TILE_W:.*]] = ktdp.construct_access_tile %[[SPILL_VIEW_W]]
 // CHECK:         ktdp.store %[[EXP]], %[[SPILL_TILE_W]]
 
-// Group 1 reads it back through a view and access tile of its own.
+// Group 1 reads it back through a view and access tile of its own, and has a
+// fill and an empty of its own too.
 // CHECK:         %[[SPILL_VIEW_R:.*]] = ktdp.construct_memory_view %[[SPILL]], sizes: [12, 64, 64], strides: [4096, 64, 1]
 // CHECK:         %[[SPILL_TILE_R:.*]] = ktdp.construct_access_tile %[[SPILL_VIEW_R]]
 // CHECK:         %[[BACK:.*]] = ktdp.load %[[SPILL_TILE_R]]
-// CHECK:         %[[SQRT:.*]] = linalg.generic {{.*}} ins(%[[BACK]]
+// CHECK:         %[[EMPTY1:.*]] = tensor.empty()
+// CHECK:         %[[FILL1:.*]] = linalg.fill {{.*}} outs(%[[EMPTY1]]
+// CHECK:         %[[SQRT:.*]] = linalg.generic {{.*}} ins(%[[BACK]]{{.*}} outs(%[[FILL1]]
 // CHECK:           spyreop.sqrt
 // CHECK:         ktdp.store %[[SQRT]]
 module {
   func.func @two_computes(%base_in: index, %base_out: index) attributes {grid = [2]} {
     %zero = arith.constant 0 : index
+    %init_value = arith.constant 0.000000e+00 : f32
     %tid = ktdp.get_compute_tile_id : index
 
     %view_in = ktdp.construct_memory_view %base_in, sizes: [12, 64, 64], strides: [4096, 64, 1] {coordinate_set = #set_whole, memory_space = #ktdp.memory_space<global>} : memref<12x64x64xf32>
@@ -42,14 +56,15 @@ module {
     %tile_out = ktdp.construct_access_tile %view_out[%tid * 6, %zero, %zero] {access_tile_order = #map, access_tile_set = #set_tile} : memref<12x64x64xf32> -> !ktdp.access_tile<6x64x64xindex>
 
     %in = ktdp.load %tile_in : <6x64x64xindex> -> tensor<6x64x64xf32>
-    %init0 = tensor.empty() : tensor<6x64x64xf32>
-    %mid = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%in : tensor<6x64x64xf32>) outs(%init0 : tensor<6x64x64xf32>) {
+    // One empty and one fill for both computes, as CSE leaves them.
+    %init = tensor.empty() : tensor<6x64x64xf32>
+    %filled = linalg.fill ins(%init_value : f32) outs(%init : tensor<6x64x64xf32>) -> tensor<6x64x64xf32>
+    %mid = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%in : tensor<6x64x64xf32>) outs(%filled : tensor<6x64x64xf32>) {
     ^bb0(%x: f32, %out: f32):
       %e = spyreop.exp %x : f32
       linalg.yield %e : f32
     } -> tensor<6x64x64xf32>
-    %init1 = tensor.empty() : tensor<6x64x64xf32>
-    %result = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%mid : tensor<6x64x64xf32>) outs(%init1 : tensor<6x64x64xf32>) {
+    %result = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%mid : tensor<6x64x64xf32>) outs(%filled : tensor<6x64x64xf32>) {
     ^bb0(%x: f32, %out: f32):
       %s = spyreop.sqrt %x : f32
       linalg.yield %s : f32
@@ -64,13 +79,13 @@ module {
 // Three chained computes need only ONE buffer: the middle compute reads the
 // first spill and writes the second, so by the time its store lands the earlier
 // value has been read and the buffer is free. Reuse is what keeps a chain inside
-// the seven base addresses Spyre has.
+// the address slots the baked-address policy has to give it.
 #map = affine_map<(d0) -> (d0)>
 #set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
 
 // One buffer, so one entry in the list and one added argument. The closing paren
 // on the signature is what makes that a count rather than a lower bound.
-// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_bits = 32 : i64, element_type = f32, shape = array<i64: 128>}]}
+// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_type = f32, shape = array<i64: 128>}]}
 // CHECK-LABEL: func.func @three_computes(
 // CHECK-SAME:      %[[IN:.*]]: index, %[[OUT:.*]]: index, %[[SPILL:.*]]: index) attributes
 module {
@@ -181,6 +196,53 @@ module {
       linalg.yield %e : f32
     } -> tensor<128xf32>
     ktdp.store %a, %tile_out : tensor<128xf32>, <128xindex>
+    return
+  }
+}
+
+// -----
+
+// A named `linalg` op other than `fill` puts the whole function out of scope, and
+// out of scope means untouched: this one has a genuine compute-to-compute edge
+// (the reduce hands its result to the generic) and still gets no store, no load
+// and no argument. The gate is on the op set, not on what the compute does -- a
+// generic that reduces is in scope; a `linalg.reduce`, which is what
+// LowerComputeOps builds for a `tt.reduce`, is not.
+#whole = affine_map<(d0, d1) -> (d0, d1)>
+#row = affine_map<(d0) -> (d0)>
+#set_2d = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set_1d = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
+
+// CHECK-NOT: ktdp.hbm_roundtrip_buffers
+// CHECK-LABEL: func.func @named_linalg_op_is_out_of_scope(
+// CHECK-SAME:      %[[IN:.*]]: index, %[[OUT:.*]]: index) attributes
+// CHECK-COUNT-1: ktdp.load
+// CHECK:         linalg.reduce
+// CHECK:         linalg.generic
+// CHECK-COUNT-1: ktdp.store
+// CHECK-NOT:     ktdp.load
+module {
+  func.func @named_linalg_op_is_out_of_scope(%base_in: index, %base_out: index) attributes {grid = [1]} {
+    %zero = arith.constant 0 : index
+    %view_in = ktdp.construct_memory_view %base_in, sizes: [4, 128], strides: [128, 1] {coordinate_set = #set_2d, memory_space = #ktdp.memory_space<global>} : memref<4x128xf32>
+    %tile_in = ktdp.construct_access_tile %view_in[%zero, %zero] {access_tile_order = #whole, access_tile_set = #set_2d} : memref<4x128xf32> -> !ktdp.access_tile<4x128xindex>
+    %view_out = ktdp.construct_memory_view %base_out, sizes: [4], strides: [1] {coordinate_set = #set_1d, memory_space = #ktdp.memory_space<global>} : memref<4xf32>
+    %tile_out = ktdp.construct_access_tile %view_out[%zero] {access_tile_order = #row, access_tile_set = #set_1d} : memref<4xf32> -> !ktdp.access_tile<4xindex>
+
+    %in = ktdp.load %tile_in : <4x128xindex> -> tensor<4x128xf32>
+    %init0 = tensor.empty() : tensor<4xf32>
+    %sum = linalg.reduce ins(%in : tensor<4x128xf32>) outs(%init0 : tensor<4xf32>) dimensions = [1]
+      (%x: f32, %acc: f32) {
+        %s = arith.addf %x, %acc : f32
+        linalg.yield %s : f32
+      }
+    %init1 = tensor.empty() : tensor<4xf32>
+    %result = linalg.generic {indexing_maps = [#row, #row], iterator_types = ["parallel"]} ins(%sum : tensor<4xf32>) outs(%init1 : tensor<4xf32>) {
+    ^bb0(%x: f32, %out: f32):
+      %e = spyreop.sqrt %x : f32
+      linalg.yield %e : f32
+    } -> tensor<4xf32>
+    ktdp.store %result, %tile_out : tensor<4xf32>, <4xindex>
     return
   }
 }

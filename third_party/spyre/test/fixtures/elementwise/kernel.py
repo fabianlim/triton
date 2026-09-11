@@ -19,9 +19,13 @@ Multi-axis grid kernels — each axis of the grid maps to one tensor
   from memory rather than a kernel argument; `N` is still chunked the
   same way as `M`. KTIR-structural only for now.
 
-No-grid kernel — one tile, no distribution loop at all:
+No-grid kernels — one tile, no distribution loop at all:
 - :func:`elementwise_1d_device` — 1D, single tile; the only variant here
   that dbo-opt can lower all the way to a binary.
+- :func:`chain_1d_device`, :func:`chain3_1d_device` — the same shape, but
+  two and three chained computes rather than one. Unary, so one input
+  pointer rather than two, and no ``OP``: what the arithmetic is does not
+  matter, only that each result feeds the next.
 
 Scalar-load variant of the 1D kernel — same idea, one axis:
 - :func:`elementwise_1d_scalar_dim` — 1D, but `n_elements` is a scalar read
@@ -555,3 +559,63 @@ def elementwise_2d_device(
     else:
         result = x / y
     out_desc.store([offset_m, 0], result)
+
+
+@triton.jit
+def chain_1d_device(
+    x_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = sqrt(exp(x))`` over exactly one tile, no distribution loop.
+
+    Two chained computes -- the second reads the first's result -- and the
+    simplest arithmetic that gives them. Loop-free and one tile per core, like
+    :func:`elementwise_1d_device` and for the same reason: dbo-opt rejects the
+    ``scf.for`` a program-id distribution loop outlines.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    out_desc.store([offset], tl.sqrt(tl.exp(x)))
+
+
+@triton.jit
+def chain3_1d_device(
+    x_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """``out = exp(sqrt(exp(x)))`` -- three chained computes.
+
+    One longer than :func:`chain_1d_device`, so the middle compute both reads a
+    result and produces one.
+    """
+    pid = tl.program_id(0)
+
+    x_desc = tl.make_tensor_descriptor(
+        x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
+    )
+    tl.spyre_tensor_layout(x_desc, LAYOUT)
+    tl.spyre_tensor_layout(out_desc, LAYOUT)
+
+    offset = pid * BLOCK_SIZE
+    x = x_desc.load([offset])
+    out_desc.store([offset], tl.exp(tl.sqrt(tl.exp(x))))

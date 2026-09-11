@@ -207,7 +207,7 @@ void init_triton_spyre_ir_utils(py::module &&m) {
   // The spill buffers HbmRoundtrip created, in the order of the `index`
   // arguments it appended, read off the `ktdp.hbm_roundtrip_buffers` module
   // attribute it writes. Each entry is
-  //   {"shape": [12, 64, 64], "elem_type": "f32", "elem_bits": 32}
+  //   {"shape": [12, 64, 64], "elem_type": "f32"}
   // and the list is empty when the pass did not run or found nothing to spill.
   // A dedicated getter rather than a generic one because the attribute is an
   // array of dictionaries, which none of the typed getters on ir.operation
@@ -230,8 +230,6 @@ void init_triton_spyre_ir_utils(py::module &&m) {
       llvm::raw_string_ostream elemOs(elemStr);
       elemType.print(elemOs);
       buffer["elem_type"] = elemStr;
-      buffer["elem_bits"] =
-          mlir::cast<mlir::IntegerAttr>(fields.get("element_bits")).getInt();
       buffers.append(buffer);
     }
     return buffers;

@@ -303,10 +303,10 @@ class SpyreLauncher:
         the kernel's own pointers, exactly where the compiler assigned its
         segment.
 
-        Allocated fresh per launch and dropped after it: nothing reads a spill
-        buffer across launches, and holding one would pin a 16 GiB segment for the
-        life of the kernel. Uninitialized rather than zeroed, because every element
-        the kernel reads back is one it wrote in the same launch.
+        Allocated fresh per launch and dropped after it, because nothing reads a
+        spill buffer across launches: every element the kernel reads back is one it
+        wrote in the same launch. Which is also why it is uninitialized rather than
+        zeroed.
         """
         buffers = getattr(self.metadata, "spill_buffers", None) or ()
         if not buffers:
