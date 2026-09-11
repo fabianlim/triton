@@ -69,9 +69,6 @@ def resolve_device(required: bool = True) -> Optional[str]:
 # Pointer argument i is based at i * 16 GiB, matching the assignment
 # torch-spyre's Inductor path makes, so the two producers of a Spyre binary agree
 # by construction. Segment 7 holds the program, which is why only 7 pointers fit.
-# This is the *baked*-address policy and nothing more: the spacing and the
-# seven-slot ceiling are what MaterializeBaseAddresses hands out, not a statement
-# about how much HBM a buffer occupies, and symbolic mode has neither.
 _SEGMENT_BYTES = 16 * 1024 ** 3
 _MAX_POINTER_ARGS = 7
 
@@ -82,17 +79,12 @@ _MAX_POINTER_ARGS = 7
 _MLIR_ELEM_BITS = re.compile(r"^(?:bf|[fiu])(\d+)")
 
 
-def _elem_bytes(elem_type: str) -> int:
-    """Byte width of the MLIR element type *elem_type*.
-
-    Read by both address producers: a pointer argument's pointee and a spill
-    buffer's element type are the same kind of string and get the same answer.
-    """
-    match = _MLIR_ELEM_BITS.match(elem_type)
+def _elem_bytes(pointee: str) -> int:
+    match = _MLIR_ELEM_BITS.match(pointee)
     bits = int(match.group(1)) if match else None
     if not bits or bits % 8:
         raise ValueError(
-            f"element type {elem_type!r} has no usable byte width "
+            f"pointer element type {pointee!r} has no usable byte width "
             f"(read as {bits!r} bits); Spyre base addresses are element "
             "indices, so the width must be a whole number of bytes"
         )
@@ -111,42 +103,6 @@ def _segment_addresses(signature_types) -> Tuple[int, ...]:
         )
     return tuple(i * _SEGMENT_BYTES // _elem_bytes(ty[1:])
                  for i, ty in enumerate(ptr_types))
-
-
-def _spill_buffer_addresses(buffers, first_segment: int) -> Tuple[int, ...]:
-    """Segment addresses in ELEMENTS for HbmRoundtrip's spill buffers.
-
-    The same policy the kernel's own pointers get, continued: buffer *j* lives in
-    segment ``first_segment + j``, and its address is that segment's byte offset
-    divided by its own element width, because ``ktdp.construct_memory_view``
-    takes an element index rather than a byte address.
-
-    *buffers* is what ``spyre.ir_utils.get_hbm_roundtrip_buffers`` returned, so
-    each entry names its element type and the width comes from
-    :func:`_elem_bytes` — the same reader the kernel's own pointers go through,
-    which is why a type with no whole-byte width (an opaque
-    ``!spyreop.fp16_fused``, say) gets that function's diagnostic rather than a
-    second one saying the same thing.
-
-    What a buffer costs is an address *slot*, not a segment's worth of memory:
-    the slot count is a property of the baked-address policy
-    MaterializeBaseAddresses implements, where segment 7 holds the program and so
-    seven addresses is all there is.
-    """
-    addresses = []
-    for j, buffer in enumerate(buffers):
-        segment = first_segment + j
-        if segment >= _MAX_POINTER_ARGS:
-            raise ValueError(
-                f"this kernel needs {segment + 1} HBM base addresses — its own "
-                f"pointers plus {len(buffers)} spill buffer(s) for values that "
-                "pass from one compute to the next — but the baked-address "
-                f"policy has only {_MAX_POINTER_ARGS} to hand out (segment "
-                f"{_MAX_POINTER_ARGS} holds the program itself). Fewer chained "
-                "computes, or fewer pointer arguments."
-            )
-        addresses.append(segment * _SEGMENT_BYTES // _elem_bytes(buffer["elem_type"]))
-    return tuple(addresses)
 
 
 def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
@@ -740,37 +696,23 @@ class SpyreBackend(BaseBackend):
         ``<dir>/spyrecode.json`` and the ``init_bin_file`` it names, both by
         name and with no directory scan.
 
-        Four steps, in three pass-manager runs plus a subprocess:
+        Three steps, the first two in one pass manager:
 
         1. ``_SPYRECODE_STAGE_PASSES``, the rewrites dbo-opt requires that cannot
            live in the TTIR→KTIR pipeline. Its own comment states the rule that
            admits a pass to it.
-        1a. ``HbmRoundtrip``, which breaks every compute-to-compute tensor edge by
-           storing the value to HBM and loading it back, since the scheduler
-           cannot put two computes in one local schedule. It appends one ``index``
-           argument per spill buffer it needs, so it runs whenever the entry
-           function still has such arguments to append to — that is, unless
-           ``required_fixes`` already ran ``MaterializeBaseAddresses``, which is
-           the first half of step 2's condition. Appending arguments is also why
-           it and step 2 cannot share a pass manager: step 2 takes the address
-           list as a pass option, and the count is not known until this pass has
-           run. The buffers it created are reported in
-           ``metadata["spill_buffers"]``, which is how the launcher knows to
-           allocate one per buffer and pass it after the kernel's own pointers —
-           in symbolic mode that, plus the correction table, is the whole address
-           story for a spill buffer.
         2. Resolve the entry function's arguments, which is where
            ``options.symbolic_args`` is honoured — the one place in the backend
-           that branches on the mode. With it False (the default),
-           ``MaterializeBaseAddresses`` replaces the pointer arguments with
-           ``arith.constant`` and drops them from the signature, because the
-           dataflow scheduler requires a zero-argument entry function. It uses
+           that branches on the mode, and the branch ``HbmRoundtrip`` shares.
+
+           Baked instead replaces the pointer arguments with ``arith.constant`` via
+           ``MaterializeBaseAddresses`` and drops them from the signature, because
+           the dataflow scheduler requires a zero-argument entry function. It uses
            ``options.base_addresses`` if the caller set them and the addresses
-           ``_make_ktir`` derived otherwise, extended with one segment per spill
-           buffer from step 1a, and it is skipped when ``required_fixes`` already
-           ran it. Running here rather than in ``_make_ktir`` is what lets the
-           cached ``.ktir`` artifact keep the argument-passing calling
-           convention.
+           ``_make_ktir`` derived otherwise, and it is skipped when
+           ``required_fixes`` already ran it. Running here rather than in
+           ``_make_ktir`` is what lets the cached ``.ktir`` artifact keep the
+           argument-passing calling convention. 
         3. ``dbo-opt --from-ktir --kEmitSpyreCode``, whose scheduler +
            codegen stages write the spyreCodeDir. ``--kEmitSpyreCode`` is a pass
            pipeline that has to be requested explicitly; ``--export-dir`` alone
@@ -786,29 +728,10 @@ class SpyreBackend(BaseBackend):
         """
         from triton._C.libtriton import ir, passes, spyre
 
-        # Whether the entry function still takes its base addresses as arguments.
-        # It gates two passes in two different pass managers -- HbmRoundtrip below,
-        # which appends one such argument per spill buffer, and
-        # MaterializeBaseAddresses further down, which replaces them all with
-        # constants -- so it is computed once here rather than spelled twice.
-        # False means a caller named materialize_base_addresses in
-        # required_fixes, so the arguments are already gone: there is nothing for
-        # the roundtrip to append to and nothing left for the materialization to
-        # bake into.
-        #
-        # Note this is NOT `not options.symbolic_args`. A spill buffer does not
-        # need a *baked* address: in symbolic mode its address arrives the same way
-        # every other one does, through the correction table, from the tensor
-        # SpyreLauncher._spill_tensors appends after the kernel's own. That is the
-        # mode a torch-spyre launch actually runs in (importing torch_spyre sets
-        # BUNDLE_SYMBOLIC_ARGS=1), so gating the roundtrip on baked addresses would
-        # switch it off on exactly the path the device tests cover.
-        args_carry_addresses = "materialize_base_addresses" not in options.required_fixes
-
         # The always-on set, whose admission rule is documented on it, then the
-        # passes that are genuinely a choice: they are guarded because
-        # `symbolic_args` and `base_addresses` pick between real argument-passing
-        # modes. So the stage is a list plus conditionals, not one flat list.
+        # one pass that is genuinely a choice: the two argument-passing modes want
+        # different things done to the base addresses. So the stage is a list plus
+        # a conditional, not one flat list.
         pm = ir.pass_manager(mod.context)
         for stage_pass in _SPYRECODE_STAGE_PASSES:
             _add_ktdp_pass(pm, stage_pass, options)
@@ -819,43 +742,30 @@ class SpyreBackend(BaseBackend):
         # are identical operand-for-operand, a tensor.empty and a linalg.fill per
         # compute) because the scheduler asserts on a shared one; all of those are
         # Pure, so a CSE afterwards would merge them and put the assertion back,
-        # and canonicalize folds the same way. Unconditional, so that skipping the
-        # roundtrip does not also skip the cleanups -- their previous home was the
-        # MaterializeBaseAddresses branch below, which is why that branch no longer
-        # has them.
+        # and canonicalize folds the same way. Unconditional, so that taking the
+        # other branch below does not also skip the cleanups -- their previous home
+        # was the MaterializeBaseAddresses branch, which is why it no longer has
+        # them.
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
-        # Half of the condition below, in the second pass manager: the roundtrip is
-        # only meaningful while the addresses are still arguments.
-        if args_carry_addresses:
+
+        if options.symbolic_args:
+            # Symbolic mode: the addresses are not known at compile time, so
+            # dbo-opt records a correction table in the artifact and the runtime
+            # patches the real ones in at launch. Nothing to materialize.
+            #
+            # This is also the only mode HbmRoundtrip can run in, and the reason is
+            # the same fact: it appends an `index` argument per spill buffer, and a
+            # correction table will happily patch those too, from the tensors
+            # SpyreLauncher appends after the kernel's own. Baked mode has no such
+            # channel 
             _add_ktdp_pass(pm, "hbm_roundtrip", options)
-
-        # Two pass-manager runs, because the address list is not knowable until
-        # HbmRoundtrip has decided how many spill buffers the kernel needs:
-        # MaterializeBaseAddresses takes its addresses as a pass option, so it
-        # cannot be installed alongside the pass that determines them.
-        pm.run(mod, "make_spyrecode")
-
-        spill_buffers = list(spyre.ir_utils.get_hbm_roundtrip_buffers(mod))
-        # Reported whether or not there are any, so that a consumer can tell
-        # "no spills" from "compiled before spills existed".
-        metadata["spill_buffers"] = tuple(
-            {"shape": tuple(buffer["shape"]), "elem_type": buffer["elem_type"]}
-            for buffer in spill_buffers
-        )
-
-        pm = ir.pass_manager(mod.context)
-        # Two ways there is nothing to install here. Symbolic mode leaves the
-        # pointer arguments alone: the addresses are not known at compile time, so
-        # dbo-opt records a correction table in the artifact and the runtime patches
-        # the real ones in at launch -- spill buffers included, which is why they do
-        # not need this branch to exist. Or required_fixes installed
-        # MaterializeBaseAddresses already, at the anchor the caller chose, in which
-        # case the pointer arguments are gone -- installing it a second time would
-        # hand the pass more addresses than there are `index` arguments left to put
-        # them in, and it fails on exactly that (MaterializeBaseAddresses.cpp,
-        # step 2a).
-        if args_carry_addresses and not options.symbolic_args:
+        # required_fixes may have installed MaterializeBaseAddresses already, at
+        # the anchor the caller chose, in which case the pointer arguments are
+        # gone. Installing it a second time would hand the pass more addresses
+        # than there are `index` arguments left to put them in, and it fails on
+        # exactly that (MaterializeBaseAddresses.cpp, step 2a).
+        elif "materialize_base_addresses" not in options.required_fixes:
             base_addresses = options.base_addresses or metadata.get("base_addresses")
             if base_addresses is None:
                 # A compile that starts from a .ktir source skips _make_ktir, and
@@ -869,22 +779,18 @@ class SpyreBackend(BaseBackend):
                     "SpyreOptions.base_addresses explicitly."
                 )
 
-            # The spill buffers HbmRoundtrip appended are `index` arguments after
-            # the kernel's own, so their addresses continue the same positional
-            # list and the same segment policy.
-            base_addresses = tuple(base_addresses) + _spill_buffer_addresses(
-                spill_buffers, first_segment=len(base_addresses))
-
             _add_ktdp_pass(pm, "materialize_base_addresses", options,
                            base_addresses=list(base_addresses))
-            # No canonicalize/CSE after this point -- they now run before
-            # HbmRoundtrip instead, for the reason given there. What they did here
-            # was fold the arith.constant addresses MaterializeBaseAddresses
-            # introduces into their users, which is cosmetic: hand-written
-            # reference KTIR states those constants explicitly and dbo-opt
-            # consumes them as they stand.
 
-        pm.run(mod, "materialize_addresses")
+        pm.run(mod, "make_spyrecode")
+
+        # The spill buffers HbmRoundtrip created, for the launcher to allocate and
+        # append. Reported whether or not there are any, so a consumer can tell
+        # "no spills" from "compiled before spills existed".
+        metadata["spill_buffers"] = tuple(
+            {"shape": tuple(buffer["shape"]), "elem_type": buffer["elem_type"]}
+            for buffer in spyre.ir_utils.get_hbm_roundtrip_buffers(mod)
+        )
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()
