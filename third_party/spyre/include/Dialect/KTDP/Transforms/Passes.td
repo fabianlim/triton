@@ -606,18 +606,22 @@ def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
 
         Ordering: after ConvertFunctions (the arguments it adds are `index`, the
         type that pass leaves base addresses as) and after DistributeWork (it
-        reads `grid` and the compute-tile id). Before
-        MaterializeBaseAddresses, which needs the arguments to exist before it
-        can bake their addresses.
+        reads `grid` and the compute-tile id).
+
+        The arguments it appends can only be filled in by a correction table, so
+        the backend runs it in symbolic-argument mode and not where
+        MaterializeBaseAddresses bakes addresses instead: there is no address to
+        bake for a buffer the caller never declared. Symbolic is the default mode.
 
         The buffers it created are reported on the module as
-        `ktdp.hbm_roundtrip_buffers`, an array of `{shape, element_type}`
-        dictionaries in argument order, so the caller can assign each one an
-        address and the launcher can allocate it. The element *width* is not
-        reported: the backend already derives one from an element type's spelling
-        for the kernel's own pointers, and one reader is easier to keep honest than
-        two. Only one public function per module may need buffers, since that
-        list is per module and consumed positionally.
+        `ktdp.hbm_roundtrip_buffers`, one space-separated MLIR shape spelling per
+        buffer (`"12x64x64xf32 24x64xf16"`) in argument order, so the launcher can
+        allocate one each and pass them after the kernel's own pointers. A string
+        because that is what the Python bindings can already read; an element
+        *width* is absent because the backend already derives one from an element
+        type's spelling for the kernel's own pointers, and one reader is easier to
+        keep honest than two. Only one public function per module may need
+        buffers, since that list is per module and consumed positionally.
 
         Output: KTIR in which no compute `linalg` op reads a value produced by
         another, so each compute becomes its own local schedule. A no-op on a

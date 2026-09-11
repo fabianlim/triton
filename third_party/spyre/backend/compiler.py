@@ -726,7 +726,7 @@ class SpyreBackend(BaseBackend):
         ``ktdp.load`` operand, because the memref keeps a dynamic
         ``strided<..., offset: ?>`` layout until a ``linalg`` consumer pins it.
         """
-        from triton._C.libtriton import ir, passes, spyre
+        from triton._C.libtriton import ir, passes
 
         # The always-on set, whose admission rule is documented on it, then the
         # one pass that is genuinely a choice: the two argument-passing modes want
@@ -785,12 +785,14 @@ class SpyreBackend(BaseBackend):
         pm.run(mod, "make_spyrecode")
 
         # The spill buffers HbmRoundtrip created, for the launcher to allocate and
-        # append. Reported whether or not there are any, so a consumer can tell
-        # "no spills" from "compiled before spills existed".
-        metadata["spill_buffers"] = tuple(
-            {"shape": tuple(buffer["shape"]), "elem_type": buffer["elem_type"]}
-            for buffer in spyre.ir_utils.get_hbm_roundtrip_buffers(mod)
-        )
+        # append: one MLIR shape spelling each ("12x64x64xf32"), in argument order.
+        # Passed through as the strings the pass wrote rather than parsed here,
+        # since the launcher is the only reader and shape and dtype are of no use
+        # to it separately. Reported whether or not there are any, so a consumer
+        # can tell "no spills" from "compiled before spills existed".
+        spill_buffers = mod.get_operation().get_str_attr(
+            "ktdp.hbm_roundtrip_buffers")
+        metadata["spill_buffers"] = tuple((spill_buffers or "").split())
 
         dbo_opt = resolve_dbo_opt()
         device = resolve_device()

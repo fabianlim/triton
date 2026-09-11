@@ -58,7 +58,8 @@
 //      supplies the kernel's own pointer addresses (see MaterializeBaseAddresses
 //      and `SpyreOptions.base_addresses`), and the launcher allocates it -- the
 //      buffers this pass creates are reported on the module as
-//      `ktdp.hbm_roundtrip_buffers`, in argument order, for exactly that.
+//      `ktdp.hbm_roundtrip_buffers` -- one space-separated `12x64x64xf32` per
+//      buffer, in argument order -- for exactly that.
 //
 // Buffers are reused. A buffer whose value has been read by its last consumer
 // is available to a later spill of the same tile type. What reuse economizes is
@@ -133,6 +134,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 
 using namespace mlir;
 
@@ -180,14 +182,14 @@ struct HbmRoundtripPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    SmallVector<Attribute> reported;
+    SmallVector<std::string> reported;
     func::FuncOp reportedFor;
     bool rewrote = false;
 
     for (auto funcOp : module.getOps<func::FuncOp>()) {
       if (!funcOp.isPublic() || funcOp.getBody().empty())
         continue;
-      SmallVector<Attribute> buffers;
+      SmallVector<std::string> buffers;
       FailureOr<bool> touched = roundtrip(funcOp, buffers);
       if (failed(touched))
         return signalPassFailure();
@@ -216,7 +218,8 @@ struct HbmRoundtripPass
       return;
     if (!reported.empty())
       module->setAttr("ktdp.hbm_roundtrip_buffers",
-                      ArrayAttr::get(&getContext(), reported));
+                      StringAttr::get(&getContext(),
+                                      llvm::join(reported, " ")));
     // Privatizing left the originals of everything it cloned behind, unused.
     // Swept rather than left in place because an operation belonging to no
     // compute group is one more thing for the scheduler to place.
@@ -571,7 +574,7 @@ private:
   /// Returns whether the function was rewritten at all, so the caller knows
   /// whether the dead-op sweep has anything to do.
   FailureOr<bool> roundtrip(func::FuncOp funcOp,
-                            SmallVectorImpl<Attribute> &reported) {
+                            SmallVectorImpl<std::string> &reported) {
     Block &entry = funcOp.getBody().front();
 
     // Nothing at all on a function whose compute this pass was not written
@@ -682,7 +685,7 @@ private:
     privatizeAddressCones(entry);
 
     for (const Buffer &buffer : buffers)
-      reported.push_back(describe(funcOp.getContext(), buffer));
+      reported.push_back(describe(buffer));
     return true;
   }
 
@@ -701,18 +704,24 @@ private:
                                                tileShape, indices);
   }
 
-  /// The launcher's view of one buffer: what to allocate. Shape and element type
-  /// only -- the element *width* is not reported, because the backend already
-  /// reads a width off an element type's own spelling for the kernel's pointer
-  /// arguments (`_elem_bytes` in backend/compiler.py) and a second answer to the
-  /// same question is a second thing to keep in step.
-  static Attribute describe(MLIRContext *ctx, const Buffer &buffer) {
-    Builder builder(ctx);
-    return builder.getDictionaryAttr(
-        {builder.getNamedAttr("shape",
-                              builder.getDenseI64ArrayAttr(buffer.viewShape)),
-         builder.getNamedAttr("element_type",
-                              TypeAttr::get(buffer.tileType.getElementType()))});
+  /// One buffer as the launcher needs it: MLIR's own shape spelling,
+  /// `12x64x64xf32`, which carries the extent of every dimension and the element
+  /// type and nothing else.
+  ///
+  /// A string, and all of them joined into one string attribute, because that is
+  /// what Python can already read: `ir.module.get_operation().get_str_attr` is an
+  /// existing binding, where an array of dictionaries would need a new one
+  /// written and kept in step. The width is deliberately absent -- the backend
+  /// already reads a width off an element type's own spelling for the kernel's
+  /// pointer arguments (`_elem_bytes` in backend/compiler.py), and a second
+  /// answer to the same question is a second thing that can disagree.
+  static std::string describe(const Buffer &buffer) {
+    std::string spec;
+    llvm::raw_string_ostream os(spec);
+    for (int64_t extent : buffer.viewShape)
+      os << extent << "x";
+    buffer.tileType.getElementType().print(os);
+    return spec;
   }
 };
 

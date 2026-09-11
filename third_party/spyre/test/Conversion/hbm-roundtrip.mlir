@@ -20,7 +20,7 @@
 
 // One buffer for the exp result and nothing else: a spilled fill would show up
 // here as a second entry.
-// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_type = f32, shape = array<i64: 12, 64, 64>}]}
+// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = "12x64x64xf32"}
 // CHECK-LABEL: func.func @two_computes(
 // CHECK-SAME:      %[[IN:.*]]: index, %[[OUT:.*]]: index, %[[SPILL:.*]]: index) attributes
 
@@ -85,7 +85,7 @@ module {
 
 // One buffer, so one entry in the list and one added argument. The closing paren
 // on the signature is what makes that a count rather than a lower bound.
-// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = [{element_type = f32, shape = array<i64: 128>}]}
+// CHECK: module attributes {ktdp.hbm_roundtrip_buffers = "128xf32"}
 // CHECK-LABEL: func.func @three_computes(
 // CHECK-SAME:      %[[IN:.*]]: index, %[[OUT:.*]]: index, %[[SPILL:.*]]: index) attributes
 module {

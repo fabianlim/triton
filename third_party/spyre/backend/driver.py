@@ -172,12 +172,16 @@ def _artifact_address_count(directory):
     return None
 
 
-def _torch_dtype(mlir_elem_type: str):
-    """The torch dtype for an MLIR element type as the IR spells it.
+def _spill_buffer_spec(spec: str):
+    """``"12x64x64xf32"`` -> ``((12, 64, 64), torch.float32)``.
 
-    Only the types a spill buffer can hold, which is whatever a ``linalg`` op in
-    this pipeline produces. An unrecognized one is reported rather than guessed:
-    allocating the wrong width would make the kernel read back a buffer of the
+    MLIR's own shape spelling, which is what ``HbmRoundtrip`` writes on the module
+    and ``metadata["spill_buffers"]`` carries through verbatim. Parsed here rather
+    than at compile time because this is the only reader, and a shape and a dtype
+    are of no use to anything else separately.
+
+    An element type with no torch counterpart is reported rather than guessed:
+    allocating the wrong width would have the kernel read back a buffer of the
     wrong size, silently.
     """
     import torch  # noqa: F401  -- must precede torch_spyre; see above
@@ -187,13 +191,14 @@ def _torch_dtype(mlir_elem_type: str):
         "f64": torch.float64, "i1": torch.bool, "i8": torch.int8,
         "i16": torch.int16, "i32": torch.int32, "i64": torch.int64,
     }
-    if mlir_elem_type not in dtypes:
+    *dims, elem_type = spec.split("x")
+    if elem_type not in dtypes:
         raise TypeError(
             f"SpyreLauncher: no torch dtype for MLIR element type "
-            f"{mlir_elem_type!r}, so a spill buffer of it cannot be allocated. "
-            f"Known: {', '.join(sorted(dtypes))}."
+            f"{elem_type!r} in spill buffer {spec!r}, so it cannot be "
+            f"allocated. Known: {', '.join(sorted(dtypes))}."
         )
-    return dtypes[mlir_elem_type]
+    return tuple(int(extent) for extent in dims), dtypes[elem_type]
 
 
 class SpyreLauncher:
@@ -300,8 +305,7 @@ class SpyreLauncher:
         computes in one local schedule. Where the kernel did not already write the
         value out, that takes a buffer the kernel never declared, added as an extra
         base-address argument — so the launch has to supply it, positionally after
-        the kernel's own pointers, exactly where the compiler assigned its
-        segment.
+        the kernel's own pointers, where the correction table expects it.
 
         Allocated fresh per launch and dropped after it, because nothing reads a
         spill buffer across launches: every element the kernel reads back is one it
@@ -314,10 +318,9 @@ class SpyreLauncher:
 
         import torch  # noqa: F401  -- must precede torch_spyre; see above
         _import_torch_spyre()
-        return [torch.empty(tuple(buffer["shape"]),
-                            dtype=_torch_dtype(buffer["elem_type"]),
-                            device="spyre")
-                for buffer in buffers]
+        specs = [_spill_buffer_spec(buffer) for buffer in buffers]
+        return [torch.empty(shape, dtype=dtype, device="spyre")
+                for shape, dtype in specs]
 
     def _prepare(self, function, num_addresses):
         """The artifact's JobPlan, prepared once and kept.
