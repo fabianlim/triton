@@ -524,5 +524,91 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
     ];
 }
 
+def HbmRoundtrip : Pass<"hbm-roundtrip", "mlir::ModuleOp"> {
+    let summary = "Break compute-to-compute tensor edges by storing the value "
+                  "to HBM and loading it back.";
+    let description = [{
+        Input: KTIR after ConvertFunctions and DistributeWork — a `func.func`
+        whose base addresses are `index` arguments, whose compute is `linalg`
+        ops on tensors, and which carries a `grid` attribute.
+
+        Lowering, for each tensor value produced by a `linalg` op in the entry
+        block and consumed by another `linalg` op in the same block:
+        - the kernel already stores that value to HBM ahead of every consumer
+          → each consumer reads it back with a `ktdp.load` over a clone of that
+          store's access tile, and no buffer is allocated;
+        - otherwise → a spill buffer, added as a new `index` argument, with a
+          `ktdp.store` after the producer and a `ktdp.load` before each
+          consumer.
+
+        A buffer holds one slab per compute tile: the tile shape with dimension
+        0 multiplied by the product of `grid`, dense row-major, with the access
+        tile anchored at `linear_tile_id * tile_shape[0]`. Same rank as the tile,
+        so no reshape is needed. A grid of one tile gives a buffer that is
+        exactly the tile, anchored at zero. `ktdp.get_compute_tile_id` is
+        variadic, so a multi-axis grid is folded row-major to one linear index.
+
+        Buffers are reused: one whose value has been read by its last consumer
+        is available to a later spill of the same tile type. Reuse is what keeps
+        a chained kernel inside the seven available base addresses (segment 7
+        holds the program), since the kernel's own pointers already take some.
+
+        Why: the dataflow scheduler forms one local schedule per SSA-connected
+        region of compute, and each compute template claims the whole local
+        register file of its functional unit, so a second compute in the same
+        region fails address assignment with "Failed to allocate SFP_LRFREG
+        memory". A `ktdp.store`/`ktdp.load` pair is what ends one schedule and
+        begins the next; hand-written reference KTIR for a chained normalisation
+        or softmax passes every intermediate through HBM for the same reason.
+
+        Splitting the compute is only half of it. The scheduler moves each
+        group's operations into a schedule module of its own, so anything two
+        groups read cannot be moved into either, and this pass therefore gives
+        each group its own copy of everything it reads: a fresh
+        `ktdp.construct_access_tile` per store and per load even where two would
+        be identical, a clone of the `tensor.empty` on `outs` and of any
+        `ktdp.load` a second compute reads, and a rebuilt address cone per memory
+        operation down to the base address — which is what hand-written reference
+        chains do by re-reading the tile id and re-constructing their views per
+        compute. Sharing any of them asserts inside the scheduler's compute-group
+        extraction ("StoreOp found before any LoadOp", "Operation should have no
+        uses left"), naming no IR the caller wrote.
+
+        `construct_access_tile` and `tensor.empty` are Pure, so **CSE must not
+        run after this pass** or it will merge those copies back together; the
+        spyrecode stage runs canonicalize/CSE ahead of it.
+
+        A tensor read by a compute that is neither a `tensor.empty` nor a
+        `ktdp.load` is reported rather than left where it is, since this pass
+        cannot place it. Only reachable on a kernel that has a
+        compute-to-compute edge at all, so nothing that compiles today starts
+        failing on it.
+
+        Ordering: after ConvertFunctions (the arguments it adds are `index`, the
+        type that pass leaves base addresses as) and after DistributeWork (it
+        reads `grid` and the compute-tile id). Before
+        MaterializeBaseAddresses, which needs the arguments to exist before it
+        can bake their addresses.
+
+        The buffers it created are reported on the module as
+        `ktdp.hbm_roundtrip_buffers`, an array of
+        `{shape, element_type, element_bits}` dictionaries in argument order, so
+        the caller can assign each one an address and the launcher can allocate
+        it. Only one public function per module may need buffers, since that
+        list is per module and consumed positionally.
+
+        Output: KTIR in which no `linalg` op reads a value produced by another
+        `linalg` op, so each compute becomes its own local schedule. A no-op on
+        a kernel with a single compute.
+    }];
+
+    let dependentDialects = [
+        "mlir::ktdp::KtdpDialect",
+        "mlir::func::FuncDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect"
+    ];
+}
+
 
 #endif // KTDP_TRANSFORMS_PASSES

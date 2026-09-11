@@ -32,6 +32,7 @@ from backend.compiler import (
     SpyreBackend,
     SpyreOptions,
     _segment_addresses,
+    _spill_buffer_addresses,
     infer_base_addresses_from_ptr_types,
 )
 
@@ -94,6 +95,53 @@ class TestBaseAddresses:
         # honest byte width to divide by.
         with pytest.raises(ValueError, match="no usable byte width"):
             _segment_addresses(["*i1", "*i1"])
+
+
+class TestSpillBufferAddresses:
+    """The same segment policy, continued past the kernel's own pointers.
+
+    ``HbmRoundtrip`` appends one ``index`` argument per spill buffer it needs, so
+    their addresses are the next segments after the pointers'. Inputs are the
+    dicts ``spyre.ir_utils.get_hbm_roundtrip_buffers`` returns.
+    """
+
+    def test_continues_the_pointer_segments(self):
+        # A two-pointer f32 kernel has used segments 0 and 1, so one spill buffer
+        # gets segment 2 -- the same address a third f32 pointer would have had.
+        buffers = [{"elem_type": "f32", "elem_bits": 32, "shape": (128,)}]
+        assert _spill_buffer_addresses(buffers, first_segment=2) == (8589934592,)
+        assert _segment_addresses(["*f32"] * 3)[2] == 8589934592
+
+    def test_each_buffer_uses_its_own_width(self):
+        # As for pointers: segment 3 is 48 GiB either way, and how many elements
+        # that is depends on what sits in it.
+        buffers = [{"elem_type": "f16", "elem_bits": 16, "shape": (64,)},
+                   {"elem_type": "f32", "elem_bits": 32, "shape": (64,)}]
+        assert _spill_buffer_addresses(buffers, first_segment=2) == (
+            17179869184, 12884901888)
+
+    def test_no_buffers_is_no_addresses(self):
+        # The kernel had a compute-to-compute edge but read every value back from
+        # a buffer it already wrote, so nothing was allocated.
+        assert _spill_buffer_addresses([], first_segment=2) == ()
+
+    def test_running_out_of_segments_names_the_reason(self):
+        # Segment 7 holds the program, so pointers plus spills must stay under 7.
+        # The message has to say which half to shrink, because a caller looking at
+        # a two-pointer kernel will not otherwise guess that its chain length is
+        # what ran out.
+        buffers = [{"elem_type": "f32", "elem_bits": 32, "shape": (8,)}] * 2
+        assert len(_spill_buffer_addresses(buffers, first_segment=5)) == 2
+        with pytest.raises(ValueError, match="needs 8 HBM base addresses"):
+            _spill_buffer_addresses(buffers, first_segment=6)
+
+    def test_an_opaque_element_type_raises(self):
+        # A type with no int/float width reports 0 bits, and a base address is an
+        # element index, so there is nothing to divide by.
+        buffers = [{"elem_type": "!spyreop.fp16_fused", "elem_bits": 0,
+                    "shape": (64,)}]
+        with pytest.raises(ValueError, match="not a whole number of"):
+            _spill_buffer_addresses(buffers, first_segment=2)
 
 
 class TestInferBaseAddresses:

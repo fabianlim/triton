@@ -24,6 +24,8 @@ all. The decomposition is not free.
 
 import hashlib
 import io
+import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -32,6 +34,7 @@ from triton import knobs
 from triton.backends.driver import DriverBase
 
 from backend.driver import SpyreDriver, SpyreLauncher, SpyreUtils
+import backend.driver as driver
 
 
 # ---------------------------------------------------------------------------
@@ -362,3 +365,101 @@ class TestAddressArgs:
         launcher = SpyreLauncher(
             _Src({"z_ptr": "*fp16", "a_ptr": "*fp16"}), object())
         assert launcher._address_args((z, a)) == [z, a]
+
+
+# ---------------------------------------------------------------------------
+# Spill buffers — the scratch a chained kernel needs and never declared.
+#
+# ``HbmRoundtrip`` breaks a compute-to-compute tensor edge by storing the value to
+# HBM and loading it back, and where the kernel did not already write that value
+# out it takes a buffer nobody declared. Those arrive as extra base-address
+# arguments after the kernel's own pointers, so the launcher allocates one per
+# descriptor and appends it in that order.
+#
+# torch is stubbed rather than imported. This file runs in CI, where there is no
+# torch and no device, and the launcher's decision here is which buffers to ask
+# for -- not what allocating one does.
+# ---------------------------------------------------------------------------
+
+class _Metadata:
+    """The one member ``_spill_tensors`` reads. Absent on a kernel compiled
+    before spill buffers existed, which is why the launcher uses getattr."""
+
+    def __init__(self, spill_buffers):
+        self.spill_buffers = spill_buffers
+
+
+@pytest.fixture
+def fake_torch(monkeypatch):
+    """A ``torch`` whose ``empty`` records its calls, and a no-op torch-spyre."""
+    calls = []
+    stub = types.ModuleType("torch")
+    for name in ("float16", "bfloat16", "float32", "float64", "bool", "int8",
+                 "int16", "int32", "int64"):
+        setattr(stub, name, f"torch.{name}")
+
+    def empty(shape, dtype=None, device=None):
+        calls.append({"shape": shape, "dtype": dtype, "device": device})
+        return _SpyreTensor()
+
+    stub.empty = empty
+    monkeypatch.setitem(sys.modules, "torch", stub)
+    monkeypatch.setattr(driver, "_import_torch_spyre", lambda: None)
+    return calls
+
+
+class TestSpillTensors:
+
+    def test_no_metadata_member_means_no_spill_buffers(self):
+        # A CompiledKernel from before this existed, or one whose metadata came
+        # back from the cache without the key. Neither is an error: the kernel
+        # simply has no compute-to-compute edge to have needed one.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), object())
+        assert launcher._spill_tensors() == []
+
+    def test_an_empty_list_allocates_nothing(self, fake_torch):
+        # Reported empty rather than absent, which is how a caller tells "no
+        # spills" from "compiled before spills existed". Same answer, and torch is
+        # never reached -- asserted through the stub's untouched call log.
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), _Metadata(()))
+        assert launcher._spill_tensors() == []
+        assert fake_torch == []
+
+    def test_one_buffer_per_descriptor_at_its_shape_and_dtype(self, fake_torch):
+        metadata = _Metadata((
+            {"shape": (12, 64, 64), "elem_type": "f32", "elem_bits": 32},
+            {"shape": (24, 64), "elem_type": "f16", "elem_bits": 16},
+        ))
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), metadata)
+        assert len(launcher._spill_tensors()) == 2
+        assert fake_torch == [
+            {"shape": (12, 64, 64), "dtype": "torch.float32", "device": "spyre"},
+            {"shape": (24, 64), "dtype": "torch.float16", "device": "spyre"},
+        ]
+
+    def test_they_come_after_the_kernels_own_pointers(self, fake_torch):
+        # Segment i belongs to argument i, and HbmRoundtrip appends its arguments
+        # after the existing ones, so a spill buffer that arrived first would
+        # patch the kernel's input with scratch.
+        own = _SpyreTensor()
+        metadata = _Metadata((
+            {"shape": (128,), "elem_type": "f32", "elem_bits": 32},
+        ))
+        launcher = SpyreLauncher(
+            _Src({"x_ptr": "*fp16", "n": "i32"}), metadata)
+        tensors = launcher._address_args((own, 4096))
+        assert len(tensors) == 2
+        assert tensors[0] is own
+
+    def test_an_unmappable_element_type_names_the_known_ones(self, fake_torch):
+        # Guessing a width would allocate a buffer of the wrong size and the
+        # kernel would read back somebody else's memory, silently.
+        metadata = _Metadata((
+            {"shape": (64,), "elem_type": "!spyreop.fp16_fused",
+             "elem_bits": 0},
+        ))
+        launcher = SpyreLauncher(_Src({"x_ptr": "*fp16"}), metadata)
+        with pytest.raises(TypeError) as excinfo:
+            launcher._spill_tensors()
+        assert "fp16_fused" in str(excinfo.value)
+        assert "f32" in str(excinfo.value)
