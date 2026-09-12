@@ -348,3 +348,50 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// Test 14: tensor.collapse_shape on a physicalized chain is not handled.
+// The math.exp above it IS elementwise, so it is claimed and retyped, leaving the
+// collapse with a physical tensor<1x64x64xf32> operand. The collapse itself is
+// claimed by nothing -- ReshapePropagation declines it in Phase 2A and
+// RewriteElementwisePattern's isElementwiseForLayout declines it in Phase 2B --
+// so its reassociation attribute and result type are left untouched, and the
+// rank-2 reassociation against a rank-3 operand fails CollapseShapeOp::verify.
+//
+// Nothing rewrites the reassociation BECAUSE nothing claims the op. That is the
+// intended consequence of declining, not a half-applied rewrite.
+//
+// Before the predicate, RewriteElementwisePattern did claim it: its only filter
+// was "every ranked-tensor operand agrees on a shape", which held trivially here
+// because a collapse has exactly one tensor operand. Phase 2A had declined it, so
+// the two halves disagreed and verifyPhysicalTypeAgreement aborted the pass
+// ("Phase 2A disagreement ... the analysis under-claims"). What this test records
+// is that internal abort becoming the diagnostic below. The kernel still does not
+// compile; making it compile needs a reshape-consumer legality gate, not this
+// precondition.
+#map14 = affine_map<(d0, d1) -> (d0, d1)>
+#set14 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#set15 = affine_set<(d0) : (d0 >= 0, -d0 + 4095 >= 0)>
+module {
+  tt.func @collapse_shape_not_elementwise(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set14, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x64xf32> to !tt.tensordesc<64x64xf32>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    %3 = arith.index_cast %c0_i32 : i32 to index
+    %4 = arith.index_cast %c0_i32 : i32 to index
+    %5 = ktdp.construct_access_tile %1[%3, %4] {access_tile_order = #map14, access_tile_set = #set14} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    %6 = ktdp.load %5 : <64x64xindex> -> tensor<64x64xf32>
+    %7 = math.exp %6 : tensor<64x64xf32>
+    // expected-error @below {{expected reassociation map #0 to have size equal to the expanded rank (3), but it is  2}}
+    %8 = tensor.collapse_shape %7 [[0, 1]] : tensor<64x64xf32> into tensor<4096xf32>
+    %9 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %10 = ktdp.construct_memory_view %9, sizes: [4096], strides: [1] {coordinate_set = #set15, memory_space = #ktdp.memory_space<global>} : memref<4096xf32>
+    %11 = arith.index_cast %c0_i32 : i32 to index
+    %12 = ktdp.construct_access_tile %10[%11] {access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = #set15} : memref<4096xf32> -> !ktdp.access_tile<4096xindex>
+    ktdp.store %8, %12 : tensor<4096xf32>, <4096xindex>
+    tt.return
+  }
+}

@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
+#include "RewriteDescriptorLayout/OpsUtils.h"
 #include "RewriteDescriptorLayout/Classify.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 #include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
@@ -170,20 +171,30 @@ findMarkerForOperand(Value operand, const PassContext &ctx) {
 }
 
 // True if `val`'s defining op is an elementwise op RewriteElementwisePattern
-// has not yet retyped to its final shape: at least one tensor operand, a
-// single tensor result, the operand/result shapes not yet uniform, and (the
-// same reachability scoping RewriteElementwisePattern itself requires -- see
-// its comment) at least one tensor operand already in ctx.physicalValues. A
-// consumer (e.g. RewriteStorePattern) seeing such a value must defer --
-// return failure() -- rather than read dataTy.getRank() now, since that rank
-// is about to change out from under it once the elementwise op is retyped.
-// Without this, a store whose data tile is produced by e.g. arith.addf can
-// fire while addf is still logically shaped, misclassify the store as
-// needing a sink/bridge stage, and lock in a decision building on a value
-// that is not in its final form.
+// has not yet retyped to its final shape: elementwise per
+// isElementwiseForLayout, at least one tensor operand, a single tensor result,
+// the operand/result shapes not yet uniform, and (the same reachability scoping
+// RewriteElementwisePattern itself requires -- see its comment) at least one
+// tensor operand already in ctx.physicalValues. A consumer (e.g.
+// RewriteStorePattern) seeing such a value must defer -- return failure() --
+// rather than read dataTy.getRank() now, since that rank is about to change out
+// from under it once the elementwise op is retyped. Without this, a store whose
+// data tile is produced by e.g. arith.addf can fire while addf is still
+// logically shaped, misclassify the store as needing a sink/bridge stage, and
+// lock in a decision building on a value that is not in its final form.
+//
+// A PREDICTOR of RewriteElementwisePattern rather than a fourth pattern, so it
+// must answer for the same op set: predicting a retype that never comes leaves
+// the caller deferring on a change that is not coming. The structural tests
+// below are restated rather than shared with the pattern because one branch
+// genuinely diverges -- where the pattern reads disagreeing operands as "not
+// yet" and waits to be re-enqueued, this reads them as "no pending retype to
+// wait for" (see that branch's comment).
 bool pendingElementwiseRetype(Value val, const PassContext &ctx) {
   auto *defOp = val.getDefiningOp();
-  if (!defOp || defOp->getNumResults() != 1)
+  if (!defOp || !isElementwiseForLayout(defOp))
+    return false;
+  if (defOp->getNumResults() != 1)
     return false;
   auto resTy = dyn_cast<RankedTensorType>(defOp->getResult(0).getType());
   if (!resTy)
@@ -1051,23 +1062,22 @@ struct RewriteReducePattern : OpRewritePattern<linalg::ReduceOp> {
 // An elementwise op's output can always be physicalized: it is rank-agnostic,
 // so the physical type of its tensor operand(s) propagates unchanged.
 //
-// Deliberately local: by the time Phase 2 runs, Phase 1 has already made
-// every load's result physical, so the decision for an elementwise op is
-// local to that op's own operand/result shapes, not a walk. Note it does NOT
-// require a single tensor operand -- that would exclude multi-tensor-operand
-// elementwise ops (addf, mulf, select, ...) from ever being retyped. It only
-// requires every tensor operand to already agree on a shape.
+// The pattern is MatchAnyOpTypeTag because no single op class covers the set
+// (arith, math and linalg all supply members), so isElementwiseForLayout is the
+// real filter and is asked first. It cannot be replaced by ordering the way the
+// two analysis pattern sets could be: the greedy driver has no ordered list to
+// put a named rule ahead of this in, so the scope has to live in the pattern.
 //
-// The shape-mismatch test alone is not sufficient to scope this pattern: it
-// also matches ops that are not elementwise at all but happen to have one
-// tensor operand and a differently-shaped result, e.g. tt.expand_dims
-// (tensor<1xf32> -> tensor<1x1xf32> in softmax's row-max reduction).
-// ctx.physicalValues supplies the missing reachability scoping: Phase 1 seeds
-// it with every physical ktdp.load result (the root of every chain Phase 2
-// will retype) and this pattern grows it with the result of each op it
-// retypes, so membership IS the "reachable from a physicalized load" answer.
-// An op on an unannotated path is simply never in the set, so tt.expand_dims
-// in softmax (zero tt.spyre_tensor_layout markers) is never retyped.
+// Deliberately local otherwise: by the time Phase 2 runs, Phase 1 has already
+// made every load's result physical, so the remaining decision is local to this
+// op's own operand/result shapes, not a walk. Note it does NOT require a single
+// tensor operand -- that would exclude addf, mulf, select and friends from ever
+// being retyped.
+//
+// ctx.physicalValues still earns its place beside the predicate: the predicate
+// says an op COULD be retyped, membership says this instance is on a chain that
+// should be. An arith.addf in a function with zero tt.spyre_tensor_layout
+// markers passes the predicate and is correctly never retyped.
 struct RewriteElementwisePattern : RewritePattern {
   const PassContext &ctx;
   RewriteElementwisePattern(MLIRContext *mlirCtx, const PassContext &layoutCtx)
@@ -1076,16 +1086,19 @@ struct RewriteElementwisePattern : RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
+    if (!isElementwiseForLayout(op))
+      return failure();
     if (op->getNumResults() != 1)
       return failure();
     auto resTy = dyn_cast<RankedTensorType>(op->getResult(0).getType());
     if (!resTy)
       return failure();
 
-    // Every tensor operand must be a RankedTensorType, and they must all
-    // agree on shape -- that agreement is the safety condition: if one
-    // operand is still logical and another already physical, decline rather
-    // than retype to a guess.
+    // Every tensor operand must be a RankedTensorType, and they must all agree
+    // on shape. Not redundant given the predicate: operands are retyped one at
+    // a time, so mid-rewrite an op can have one physical and one still-logical
+    // operand. Declining then, rather than retyping to a guess, is what makes
+    // the greedy driver's result independent of the order it visits operands.
     ArrayRef<int64_t> commonShape;
     bool sawTensorOperand = false;
     for (Value o : op->getOperands()) {

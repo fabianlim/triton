@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/RequirementAnalysis.h"
+#include "RewriteDescriptorLayout/OpsUtils.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -56,13 +57,14 @@ LayoutRequirement permuteRequirement(const LayoutRequirement &req,
 // Backward patterns: one per op kind
 //===----------------------------------------------------------------------===//
 
-/// Elementwise / single-tensor shape-preserving: the requirement passes through
-/// unchanged, to every tensor operand. Rank-agnostic, so there is nothing to
-/// recompute.
+/// Elementwise: the requirement passes through unchanged, to every tensor
+/// operand. Rank-agnostic, so there is nothing to recompute.
 ///
-/// The match is the forward ElementwisePropagation rule, verbatim: one result, a
-/// RankedTensorType, every tensor operand agreeing on a shape -- so the same op
-/// set carries both facts.
+/// The match is the forward ElementwisePropagation rule, verbatim -- and it must
+/// STAY verbatim, because ReducePropagation reads both ends: it compares the
+/// layout its operand's stick structure induces against the requirement found at
+/// its result. Two different op sets would mean one end present where the other
+/// was absent, and the reduce taking the Logical path for no findable reason.
 ///
 /// It deliberately does NOT also require the result's shape to equal the
 /// operands'. That reads like the stronger test but terminates every requirement
@@ -70,14 +72,20 @@ LayoutRequirement permuteRequirement(const LayoutRequirement &req,
 /// loads and stops there, so a mid-chain `arith.addf` has physical operands and
 /// a still-logical result until Phase 2 retypes it.
 ///
-/// Local is safe for the same reason it is forward -- reachability comes from the
-/// seeded walk -- and the rank-changing ops that satisfy this shape rule
-/// (reshape family, broadcast) have explicit rules registered ahead of it.
+/// The predicate also stops this walk crossing `scf.for`, which it used to via
+/// the loop-carried accumulator (an iter_arg trivially "agrees on a shape" with
+/// the loop result). The information was dead -- the requirement map's only
+/// consumer is ReducePropagation and no fixture puts a reduce behind such a loop
+/// -- and passing a requirement through a loop unchanged is a claim about every
+/// iteration that nothing here checks. A kernel that does need it needs a
+/// `ForRequirement` pattern stating that claim, not this structural rule.
 ///
 /// Nothing here requires the operands' own forward layouts to agree with each
 /// other; a mixed pair at an `arith` op is an owed answer in the doc.
 struct ElementwiseRequirement : RequirementBackwardPattern {
   bool match(Operation *op) const override {
+    if (!isElementwiseForLayout(op))
+      return false;
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
@@ -269,13 +277,10 @@ llvm::FailureOr<LayoutRequirement> seedFromStore(mlir::ktdp::StoreOp st,
 
 void populateRequirementBackwardPatterns(
     RequirementBackwardPatternSet &patterns) {
-  // Order matters only where two patterns could match the same op, and the
-  // constraint is the forward side's, for the same reason: every named-op
-  // pattern must be asked before the structural elementwise rule. The reshape
-  // family and linalg.broadcast are again the load-bearing cases -- one tensor
-  // operand each, so "every tensor operand agrees on a shape" holds trivially
-  // and the elementwise rule WOULD claim them, crossing a requirement over a
-  // change of physical dim count.
+  // Order is a tie-break, not the guarantee -- exactly as on the forward side.
+  // The reshape family and linalg.broadcast used to need registering ahead of the
+  // structural rule or it would have crossed a requirement over a change of
+  // physical dim count; ElementwiseRequirement now declines them itself.
   patterns.push_back(std::make_unique<TransposeRequirement>());
   patterns.push_back(std::make_unique<MatmulRequirement>());
   patterns.push_back(std::make_unique<ReduceRequirement>());

@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RewriteDescriptorLayout/PhysicalTypeAnalysis.h"
+#include "RewriteDescriptorLayout/OpsUtils.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 
@@ -40,14 +41,24 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 /// Elementwise: the result takes the operand's physical shape verbatim, keeping
-/// its own element type. Matched by the same purely local rule
-/// RewriteElementwisePattern uses -- one result, a RankedTensorType, every
-/// tensor operand agreeing on a shape. Local is safe because reachability comes
-/// from the seeded walk, so an op on an unannotated path is never asked; that
-/// is what keeps tt.expand_dims and its rank-changing siblings, which satisfy
-/// the shape rule, from being matched here.
+/// its own element type. Matched by the same rule RewriteElementwisePattern uses
+/// -- isElementwiseForLayout, one ranked-tensor result, every ranked-tensor
+/// operand agreeing on a shape -- so the analysis predicts a physical type for
+/// exactly the ops the rewrite goes on to retype.
+///
+/// isElementwiseForLayout makes this pattern's scope its OWN rather than a
+/// consequence of where it sits in the list: the reshape family and
+/// linalg.broadcast used to be kept out only by being registered ahead of it,
+/// and tt.expand_dims only by sitting on an unannotated path.
+///
+/// Shape agreement survives the predicate rather than being subsumed by it:
+/// mid-rewrite the operands are retyped one at a time, so an op with one
+/// physical and one still-logical operand is momentarily mismatched, and
+/// declining then is what makes the greedy driver order-independent.
 struct ElementwisePropagation : PhysicalPropagationPattern {
   bool match(Operation *op) const override {
+    if (!isElementwiseForLayout(op))
+      return false;
     if (op->getNumResults() != 1 ||
         !isa<RankedTensorType>(op->getResult(0).getType()))
       return false;
@@ -330,14 +341,13 @@ lookupPattern(Operation *op, const PhysicalPropagationPatternSet &patterns) {
 
 void populatePhysicalPropagationPatterns(
     PhysicalPropagationPatternSet &patterns) {
-  // Order matters only where two patterns could match the same op. Every
-  // named-op pattern must be asked before the structural elementwise rule,
-  // which a linalg op with uniformly shaped operands could otherwise satisfy.
-  // The reshape family and linalg.broadcast are the load-bearing cases: they
-  // have a single tensor operand, so the elementwise rule's "every tensor
-  // operand agrees on a shape" test is satisfied trivially and it WOULD claim
-  // them if asked first -- recording the operand's shape against a result of a
-  // different one.
+  // Order is a tie-break, not the correctness guarantee. It used to be the
+  // guarantee: the reshape family and linalg.broadcast had to be registered
+  // ahead of the structural elementwise rule or it would claim them, since
+  // "every tensor operand agrees on a shape" holds trivially on a single
+  // operand. ElementwisePropagation now declines them on its own precondition.
+  // Named rules still go first so a future overlap resolves to the specific rule
+  // rather than a coin flip; the preconditions are the contract.
   patterns.push_back(std::make_unique<TransposePropagation>());
   patterns.push_back(std::make_unique<MatmulPropagation>());
   patterns.push_back(std::make_unique<StorePropagation>());
