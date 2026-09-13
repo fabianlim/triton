@@ -67,6 +67,16 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
         Phase 3 — erase the tt.spyre_tensor_layout markers and the now-dead
         UnrealizedConversionCast bridges.
 
+        Phase 4 — the in-pass legality gate. Asserts that no op was left reading
+        a value Phase 2 retyped to the physical (stick-tiled) shape while still
+        describing that value's logical shape. Every representational decline in
+        this pass is a bare failure reported only under
+        `--debug-only=rewrite-descriptor-layout`, so without this the mistake
+        surfaces as some other op's type error downstream, or not at all. The
+        gate names the surviving op and this pass; it does NOT check that the
+        types the pass DID choose are correct, and it is unrelated to the
+        backend's own `--ktir-legality-check`.
+
         Runs after LowerInterTile, so every inter-tile reduction is already in
         ktdp form; LowerInterTile rejects a kernel that combines a layout marker
         with an inter-tile reduction, since no propagation pattern covers it.

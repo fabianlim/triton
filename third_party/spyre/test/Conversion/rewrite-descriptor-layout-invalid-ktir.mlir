@@ -372,7 +372,7 @@ module {
 // precondition.
 #map14 = affine_map<(d0, d1) -> (d0, d1)>
 #set14 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
-#set15 = affine_set<(d0) : (d0 >= 0, -d0 + 4095 >= 0)>
+#set14b = affine_set<(d0) : (d0 >= 0, -d0 + 4095 >= 0)>
 module {
   tt.func @collapse_shape_not_elementwise(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
     %c0_i32 = arith.constant 0 : i32
@@ -385,13 +385,105 @@ module {
     %5 = ktdp.construct_access_tile %1[%3, %4] {access_tile_order = #map14, access_tile_set = #set14} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
     %6 = ktdp.load %5 : <64x64xindex> -> tensor<64x64xf32>
     %7 = math.exp %6 : tensor<64x64xf32>
-    // expected-error @below {{expected reassociation map #0 to have size equal to the expanded rank (3), but it is  2}}
+    // expected-error @below {{'tensor.collapse_shape' op rewrite-descriptor-layout: this op survived the layout rewrite while consuming a physicalized (stick-tiled) value}}
+    // expected-note @above {{this operand was physicalized here}}
     %8 = tensor.collapse_shape %7 [[0, 1]] : tensor<64x64xf32> into tensor<4096xf32>
     %9 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
-    %10 = ktdp.construct_memory_view %9, sizes: [4096], strides: [1] {coordinate_set = #set15, memory_space = #ktdp.memory_space<global>} : memref<4096xf32>
+    %10 = ktdp.construct_memory_view %9, sizes: [4096], strides: [1] {coordinate_set = #set14b, memory_space = #ktdp.memory_space<global>} : memref<4096xf32>
     %11 = arith.index_cast %c0_i32 : i32 to index
-    %12 = ktdp.construct_access_tile %10[%11] {access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = #set15} : memref<4096xf32> -> !ktdp.access_tile<4096xindex>
+    %12 = ktdp.construct_access_tile %10[%11] {access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = #set14b} : memref<4096xf32> -> !ktdp.access_tile<4096xindex>
     ktdp.store %8, %12 : tensor<4096xf32>, <4096xindex>
+    tt.return
+  }
+}
+
+// -----
+
+// Test 15: the in-pass legality gate -- an op left consuming a physicalized
+// value.
+//
+// This is the gate at the END of the pass (Phase 4, runLegalityGate), not the
+// backend's --ktir-legality-check, which is a different tool at a later stage.
+//
+// A is annotated, so its ktdp.load is retyped to the stick shape
+// tensor<1x64x64xf32> and becomes a Phase-1 root in ctx.physicalValues. The
+// tt.call then reads that physical value while its own signature still says
+// tensor<64x64xf32>. No propagation rule covers tt.call, so Phase 2A declines
+// it silently (LLVM_DEBUG only) and Phase 2 leaves it alone -- the exact class
+// of silent decline the gate exists to name.
+//
+// The second operand's shape is load-bearing, and not incidental: it is what
+// keeps RewriteElementwisePattern from claiming the call first. That pattern's
+// only structural filter is "every tensor operand agrees on a shape"
+// (ContractionSynthesis.cpp), so a single-tensor-operand op reaches it
+// trivially; a second operand at a DIFFERENT shape (32x8) is declined, which is
+// what lets the op survive to the gate rather than being retyped by
+// coincidence.
+//
+// One error at the call, naming the op (emitOpError prefixes 'tt.call' op),
+// plus a note at the ktdp.load pointing out which operand is physical and where
+// that happened. No module-level error: signalPassFailure is the pass's verdict,
+// and the gate says everything it has to say at the op.
+#map15 = affine_map<(d0, d1) -> (d0, d1)>
+#set15 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  tt.func private @mix(%a: tensor<64x64xf32>, %b: tensor<32x8xf32>) -> tensor<64x64xf32>
+  tt.func @legality_gate_survivor(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: tensor<32x8xf32>) {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set15, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %2 = builtin.unrealized_conversion_cast %1 : memref<64x64xf32> to !tt.tensordesc<64x64xf32>
+    tt.spyre_tensor_layout %2 {phys_arg = array<i64: 64, 0, 64>, phys_op = array<i64: 1, 0, 2>, phys_src = array<i64: 1, 0, 1>} : <64x64xf32>
+    %3 = arith.index_cast %c0_i32 : i32 to index
+    %4 = arith.index_cast %c0_i32 : i32 to index
+    %5 = ktdp.construct_access_tile %1[%3, %4] {access_tile_order = #map15, access_tile_set = #set15} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    // expected-note @below {{this operand was physicalized here}}
+    %6 = ktdp.load %5 : <64x64xindex> -> tensor<64x64xf32>
+    // expected-error @below {{'tt.call' op rewrite-descriptor-layout: this op survived the layout rewrite while consuming a physicalized (stick-tiled) value}}
+    %7 = tt.call @mix(%6, %arg2) : (tensor<64x64xf32>, tensor<32x8xf32>) -> tensor<64x64xf32>
+    %8 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %9 = ktdp.construct_memory_view %8, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set15, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %10 = arith.index_cast %c0_i32 : i32 to index
+    %11 = arith.index_cast %c0_i32 : i32 to index
+    %12 = ktdp.construct_access_tile %9[%10, %11] {access_tile_order = #map15, access_tile_set = #set15} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    ktdp.store %7, %12 : tensor<64x64xf32>, <64x64xindex>
+    tt.return
+  }
+}
+
+// -----
+
+// Test 16: the gate does NOT fire on a function with no layout marker.
+//
+// The negative half of test 15, and the cheapest one: with no
+// tt.spyre_tensor_layout anywhere, Phase 1 physicalizes nothing,
+// ctx.physicalValues is empty, and no op has an operand in it -- so the gate
+// examines every op and declines every one. The tt.call here is byte-for-byte
+// the op test 15 flags; only the marker is gone. That is what makes this pair
+// a test of the PREDICATE rather than of the op kind: an op-kind list would
+// flag this call too.
+//
+// No expected-error: any diagnostic at all fails this section under
+// -verify-diagnostics.
+#map16 = affine_map<(d0, d1) -> (d0, d1)>
+#set16 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  tt.func private @mix15(%a: tensor<64x64xf32>, %b: tensor<32x8xf32>) -> tensor<64x64xf32>
+  tt.func @legality_gate_unannotated(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: tensor<32x8xf32>) {
+    %c0_i32 = arith.constant 0 : i32
+    %0 = builtin.unrealized_conversion_cast %arg0 : !tt.ptr<f32> to index
+    %1 = ktdp.construct_memory_view %0, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set16, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %3 = arith.index_cast %c0_i32 : i32 to index
+    %4 = arith.index_cast %c0_i32 : i32 to index
+    %5 = ktdp.construct_access_tile %1[%3, %4] {access_tile_order = #map16, access_tile_set = #set16} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    %6 = ktdp.load %5 : <64x64xindex> -> tensor<64x64xf32>
+    %7 = tt.call @mix15(%6, %arg2) : (tensor<64x64xf32>, tensor<32x8xf32>) -> tensor<64x64xf32>
+    %8 = builtin.unrealized_conversion_cast %arg1 : !tt.ptr<f32> to index
+    %9 = ktdp.construct_memory_view %8, sizes: [64, 64], strides: [64, 1] {coordinate_set = #set16, memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
+    %10 = arith.index_cast %c0_i32 : i32 to index
+    %11 = arith.index_cast %c0_i32 : i32 to index
+    %12 = ktdp.construct_access_tile %9[%10, %11] {access_tile_order = #map16, access_tile_set = #set16} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
+    ktdp.store %7, %12 : tensor<64x64xf32>, <64x64xindex>
     tt.return
   }
 }

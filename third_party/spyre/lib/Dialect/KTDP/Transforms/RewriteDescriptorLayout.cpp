@@ -17,11 +17,14 @@
 //   Phase 1 — physicalize each annotated descriptor (memView + access tiles +
 //             loads + stores)
 //   Phase 3 — erase all markers (and their now-dead bridge casts)
+//   Phase 4 — the in-pass legality gate: assert no op was left consuming a
+//             physicalized value unconverted (see runLegalityGate)
 //
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/KTDP/Transforms/Passes.h"
 #include "Dialect/KTDP/Transforms/Utility.h"
+#include "RewriteDescriptorLayout/OpsUtils.h"
 #include "RewriteDescriptorLayout/PermutationUtils.h"
 #include "RewriteDescriptorLayout/Types.h"
 #include "RewriteDescriptorLayout/ContractionSynthesis.h"
@@ -862,6 +865,86 @@ struct RewriteDescriptorLayoutPass
       castOp.erase();
   }
 
+  // --- Phase 4: the legality gate ---
+  //
+  // WHY. Every representational decline in this pass is a bare
+  // `return failure()` reported only under LLVM_DEBUG -- getPhysicalizedType's
+  // "no rule for this op", the cycle branch, the block-argument boundary (all in
+  // PhysicalTypeAnalysis.cpp). So a value the pass could not physicalize is left
+  // logical silently, and the mistake surfaces as some unrelated op's type error
+  // downstream, or not at all. One measured instance failed MLIR's own
+  // tensor.collapse_shape verifier with a reassociation-rank complaint naming
+  // neither this pass nor the cause. This turns that silence into a diagnostic
+  // at the surviving op.
+  //
+  // WHAT IT DOES NOT CATCH: a wrong type decision that is internally
+  // consistent. If a rule computes a plausible-but-incorrect physical type,
+  // every op converts against it, nothing survives, the IR verifies, and this is
+  // silent -- it has no notion of what the right type was.
+  // verifyPhysicalTypeAgreement remains the only check on the decisions
+  // themselves, and it asserts *presence* only. Nothing here is a correctness
+  // proof.
+  //
+  // Did Phase 2 physicalize this op's inputs but then leave the op itself alone?
+  //
+  // Check 1 -- does it read anything physical? No -> not our business. This is
+  //   what lets an unannotated function through untouched, and what keeps the
+  //   legitimate logical-shape reshapes downstream of a reduce legal.
+  // Check 2 -- is there nothing left to convert? Either the op has no results at
+  //   all (a sink: ktdp.store consumes a physical value and produces nothing, so
+  //   "was it retyped" cannot apply to it), or one of its results is itself
+  //   physical (Phase 2 retyped it). Both admit by the shape of the answer rather
+  //   than by an op-name list -- which is why ktdp.store is NOT in check 3.
+  // Check 3 -- is it one of the ops for which physical-in/logical-out is correct
+  //   anyway? mayConsumePhysicalAsLogical is that question, with the
+  //   per-op justification and the set's provenance.
+  //
+  // Checks 1 and 2 stay here rather than joining check 3 in the header: they read
+  // physicalValues, which is this pass's own state.
+  bool isLeftUnconverted(Operation *op) const {
+    if (llvm::none_of(op->getOperands(),
+                      [&](Value v) { return physicalValues.contains(v); }))
+      return false;
+
+    if (op->getNumResults() == 0)
+      return false;
+
+    if (llvm::any_of(op->getResults(),
+                     [&](Value v) { return physicalValues.contains(v); }))
+      return false;
+
+    return !mayConsumePhysicalAsLogical(op);
+  }
+
+  void runLegalityGate(ModuleOp module) {
+    module.walk([&](Operation *op) {
+      if (!isLeftUnconverted(op))
+        return;
+      InFlightDiagnostic diag = op->emitOpError()
+          << "rewrite-descriptor-layout: this op survived the layout rewrite "
+             "while consuming a physicalized (stick-tiled) value; no "
+             "propagation rule physicalized it, so it still describes the "
+             "logical shape. Teaching this pass the op means a propagation "
+             "rule (PhysicalTypeAnalysis.cpp), its backward twin if a store's "
+             "requirement must cross the op (RequirementAnalysis.cpp), and a "
+             "rewrite pattern (ContractionSynthesis.cpp)";
+      // The reader's next question is "which operand is physical, and where did
+      // that happen?". Note the FIRST physical operand only: the diagnostic is
+      // about this op, one witness is enough to locate the chain, and a note per
+      // operand would bury it on a many-operand op. The defining op is where
+      // Phase 1 or Phase 2 retyped the value.
+      for (Value v : op->getOperands()) {
+        if (!physicalValues.contains(v))
+          continue;
+        if (Operation *def = v.getDefiningOp())
+          diag.attachNote(def->getLoc())
+              << "this operand was physicalized here";
+        break;
+      }
+      signalPassFailure();
+    });
+  }
+
   // --- Pass entry point ---
 
   void runOnOperation() override {
@@ -981,6 +1064,12 @@ struct RewriteDescriptorLayoutPass
     for (auto memViewOp : deadLogicalMemViews)
       if (memViewOp->getBlock() && memViewOp->use_empty())
         memViewOp.erase();
+
+    // Phase 4: assert the rewrite finished. Phase 3 erases the markers and the 
+    // logical views Phase 1 superseded, so we run after that cleanup. It consults
+    // physicalValues in Phase 2's output. It signals inconsistency in this pass's
+    // output and indicates not to proceed onwards in the compilation.
+    runLegalityGate(module);
   }
 };
 
