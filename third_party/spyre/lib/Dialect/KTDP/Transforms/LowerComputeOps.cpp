@@ -420,9 +420,10 @@ struct ConvertTTSplit : public OpConversionPattern<triton::SplitOp> {
 // Group B — Reduction (compute along one axis, produces smaller tensor)
 //
 // These require extracting the combiner region, computing the identity
-// element, and emitting the linalg op with the cloned combiner body.
+// element, and emitting the generic with the cloned combiner body.
 //
-//   B1. tt.reduce → linalg.reduce   reduce along axis with combiner
+//   B1. tt.reduce → linalg.generic  `reduction` iterator on the reduced axis,
+//                                    output map omits it
 //
 // Planned:
 //   B2. tt.scan   → scf.for / linalg  prefix scan along axis
@@ -566,7 +567,8 @@ struct ConvertTTReduce : public OpConversionPattern<triton::ReduceOp> {
 //===----------------------------------------------------------------------===//
 // Group C — Matrix multiply
 //
-//   C1. tt.dot → linalg.matmul   d = matmul(a, b) + c
+//   C1. tt.dot → linalg.generic  d = matmul(a, b) + c, stated as three operand
+//                                 maps plus a single `reduction` iterator
 //===----------------------------------------------------------------------===//
 
 /// C1. tt.dot → linalg.generic stating the contraction

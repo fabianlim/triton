@@ -22,6 +22,17 @@ def RewriteDescriptorLayout : Pass<"rewrite-descriptor-layout", "mlir::ModuleOp"
     let summary = "Rewrite logical tensor descriptors to physical (stick-tiled) "
                   "layout from tt.spyre_tensor_layout annotations.";
     let description = [{
+        STALE AS OF THE ALL-GENERIC EMISSION. The per-op rules below dispatch on
+        named op classes — linalg.matmul / batch_matmul, linalg.reduce,
+        linalg.transpose, linalg.broadcast — and LowerComputeOps no longer emits
+        any of them; every compute op is now a linalg.generic. So a kernel whose
+        chain carries a layout annotation fails in this pass, reporting the
+        generic it has no rule for. The replacement that reads dim roles from a
+        generic's indexing maps is RewriteDescriptorLayoutGeneric; this contract
+        is left as-is rather than rewritten because that pass supersedes it.
+        Everything below still describes what the code does — it just no longer
+        describes IR this pipeline produces.
+
         Input: lowered KTDP IR (after LowerDescriptorMemory + LowerComputeOps).
         Each annotated descriptor has been lowered to:
           ktdp.construct_memory_view (logical shape/strides, wrapped in an
