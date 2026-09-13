@@ -6,10 +6,38 @@
 // minimized and named to reflect the test intent.
 
 // RUN: spyre-triton-opt %s --lower-compute-ops | FileCheck %s
+
+// Every rank of `tt.dot` lowers to a single `linalg.generic` carrying
+// `doc = "tt.dot"` -- there is no rank dispatch onto named ops any more.
+// The contraction is expressed structurally instead of by op name: three
+// indexing maps (lhs (d0,d2), rhs (d2,d1), acc (d0,d1)) plus one "reduction"
+// iterator over the contracted dimension. The rank difference is now visible
+// only in the loop count: three loops (m,n,k) here, four (b,m,n,k) for a
+// batched dot.
 module {
+
+// f16 x f16 -> f32: the accumulator type drives the body. Because the operand
+// element type is narrower than the accumulator, the body extends *each*
+// operand with `arith.extf` up to f32 before the multiply, so the multiply and
+// the accumulate both happen at f32. The two extf ops below are the point of
+// this test.
+
+// CHECK-DAG:   #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+// CHECK-DAG:   #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2) -> (d2, d1)>
+// CHECK-DAG:   #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
 // CHECK-LABEL:   tt.func @matmul_f16(
 // CHECK-SAME:  %[[VAL_0:.*]]: tensor<16x32xf16>, %[[VAL_1:.*]]: tensor<32x8xf16>, %[[VAL_2:.*]]: tensor<16x8xf32>) -> tensor<16x8xf32> {
-// CHECK:           %[[VAL_3:.*]] = linalg.matmul ins(%[[VAL_0]], %[[VAL_1]] : tensor<16x32xf16>, tensor<32x8xf16>) outs(%[[VAL_2]] : tensor<16x8xf32>) -> tensor<16x8xf32>
+// CHECK:           %[[VAL_3:.*]] = linalg.generic {doc = "tt.dot", indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]], #[[$ATTR_2]]], iterator_types = ["parallel", "parallel", "reduction"]} ins(%[[VAL_0]], %[[VAL_1]] : tensor<16x32xf16>, tensor<32x8xf16>) outs(%[[VAL_2]] : tensor<16x8xf32>) {
+// CHECK:           ^bb0(%[[VAL_4:.*]]: f16, %[[VAL_5:.*]]: f16, %[[VAL_6:.*]]: f32):
+// CHECK:             %[[VAL_7:.*]] = arith.extf %[[VAL_4]] : f16 to f32
+// CHECK:             %[[VAL_8:.*]] = arith.extf %[[VAL_5]] : f16 to f32
+// CHECK:             %[[VAL_9:.*]] = arith.mulf %[[VAL_7]], %[[VAL_8]] : f32
+// CHECK:             %[[VAL_10:.*]] = arith.addf %[[VAL_6]], %[[VAL_9]] : f32
+// CHECK:             linalg.yield %[[VAL_10]] : f32
+// CHECK:           } -> tensor<16x8xf32>
+// CHECK-NOT:       tt.dot
+// CHECK-NOT:       linalg.matmul
+// CHECK-NOT:       linalg.batch_matmul
 // CHECK:           tt.return %[[VAL_3]] : tensor<16x8xf32>
 // CHECK:         }
 tt.func @matmul_f16(%a: tensor<16x32xf16>, %b: tensor<32x8xf16>, %c: tensor<16x8xf32>) -> tensor<16x8xf32> {

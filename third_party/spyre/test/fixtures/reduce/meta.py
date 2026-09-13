@@ -7,7 +7,8 @@ Rank-3, middle axis  ``out[d0, d2] = OP(in[d0, :, d2])`` -- the reduced axis is
                      not the trailing one, which is the whole point of the case.
 
 Three reductions lower: ``sum``, ``max`` and ``min``, dispatched by
-``OP: tl.constexpr``. All three reach ``linalg.reduce`` and run on ``ktir_cpu``.
+``OP: tl.constexpr``. All three reach a ``linalg.generic`` tagged
+``doc = "tt.reduce"`` and run on ``ktir_cpu``.
 One combination reaches a Spyre binary and launches -- ``one_tile`` at
 ``AXIS=0``, the loop-free shape folding the non-stick axis. The Level D banner
 records why that one and not the others.
@@ -292,7 +293,7 @@ VARIANTS = {
         "output_key": "out_ptr",
         "rtol":       1e-4,
         "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
             t.assert_absent("tt.reduce"),
         ),
     },
@@ -342,11 +343,17 @@ VARIANTS = {
         "inputs":     make_inputs_3d,
         "output_key": "out_ptr",
         "rtol":       1e-4,
-        # linalg.reduce accumulates the 96 terms in a different order than
-        # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
+        # The tt.reduce generic accumulates the 96 terms in a different order
+        # than NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
         "atol":       1e-4,
         "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
+            # The reduction is on the MIDDLE axis -- the whole point of this
+            # variant. The position of "reduction" in the iterator list is what
+            # says so, now that there is no `dimensions = [1]` to read.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "reduction", "parallel"],
+                               doc="tt.reduce"),
             t.assert_absent("tt.reduce"),
         ),
     },
@@ -407,7 +414,7 @@ VARIANTS = {
         # nine are bit-exact: max and min at every dtype, because a maximum is a
         # selection and reordering the comparisons cannot change it, and i32 sum,
         # because integer addition is associative. Only the two float sums drift,
-        # from linalg.reduce accumulating the 64 terms in an order it does not
+        # from the tt.reduce generic accumulating the 64 terms in an order it does not
         # promise to share with NumPy's -- fp32 by 1.9e-6 absolute (2.1e-5
         # relative), fp16 by 1.6e-2 (4.9e-2), against row sums up to 24.
         #
@@ -418,7 +425,7 @@ VARIANTS = {
         "rtol":         1e-2,
         "atol":         5e-2,
         "extra_checks": lambda t: (
-            t.assert_present("linalg.reduce"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
             t.assert_absent("tt.reduce"),
         ),
     },
@@ -467,23 +474,25 @@ VARIANTS = {
         "atol":        5e-2,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
         ),
     },
     "middle_axis_spyre_stick": {
         # in_ptr stick-on-D2 (fp32 stick = 32, D2 = 64 = 2 sticks exactly):
         #   phys [D2//32, D0, D1, D2%32] = [2, 16, 96, 32]
         # The reduced axis (D1) is non-trailing in the physical tile, and that is
-        # the case: linalg.reduce takes a sorted `dimensions` list, so D1 is named
-        # where it sits and no transpose is emitted. A slot-index-derived
-        # permutation would be identity here and would reduce the wrong axis.
+        # the case: the emitted linalg.generic marks D1 "reduction" in place, so
+        # it is reduced where it sits and no transpose is emitted. A
+        # slot-index-derived permutation would be identity here and would reduce
+        # the wrong axis.
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
                  "spyre-tensor-layout"],
         "summary": (
             "Rank-3 middle-axis reduce with in_ptr stick-on-D2. The reduced "
             "axis is non-trailing in the physical tile, and stays where it is: "
-            "linalg.reduce names it rather than rotating it to the end."
+            "the generic marks it \"reduction\" in place rather than rotating "
+            "it to the end."
         ),
         "kernel_fn":  kernel.reduce_middle_axis_spyre,
         "factory":    Reduce(shape="3d"),
@@ -500,14 +509,20 @@ VARIANTS = {
         "data_layout": "host",
         "output_key":  "out_ptr",
         "rtol":        1e-4,
-        # linalg.reduce accumulates the 96 terms in a different order than
-        # NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
+        # The tt.reduce generic accumulates the 96 terms in a different order
+        # than NumPy's sum, so fp32 drifts ~1e-5 absolute on a few elements.
         "atol":        1e-4,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
-            # No transpose: the reduced axis is named where it sits.
-            t.assert_absent("linalg.transpose"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
+            # The reduced axis stays where it sits rather than being rotated to
+            # the end: "reduction" in the MIDDLE of the iterator list is the
+            # claim, and it is what a transposing lowering would break. (The old
+            # spelling of this was assert_absent("linalg.transpose"), which is
+            # now vacuous -- the pass cannot emit that op at all.)
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "reduction", "parallel"],
+                               doc="tt.reduce"),
         ),
     },
 
@@ -534,7 +549,7 @@ VARIANTS = {
     #   compute op
     #
     # naming the ``linalg.fill`` that LowerComputeOps puts on the reduction's
-    # ``outs``. ``linalg.reduce`` itself is in that allowlist; the neutral-element
+    # ``outs``. The reduction generic itself is in that allowlist; the neutral-element
     # fill beside it is not. ``DropReductionInitFill`` removes exactly that fill,
     # and ``_make_spyrecode`` installs it unconditionally, out of
     # ``_SPYRECODE_STAGE_PASSES`` -- so what reaches the
@@ -548,7 +563,8 @@ VARIANTS = {
     # Folds M, the NON-stick axis -- a whole physical dimension. The stick split
     # of N survives, so RewriteDescriptorLayout physicalizes the reduce's output
     # and the surviving stick index rides along as a batch dimension of the one
-    # linalg.reduce (``ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]``),
+    # reduction generic (``ins tensor<2x64x64> outs tensor<2x64>``, iterators
+    # ``parallel, reduction``),
     # with ktdp.store consuming it directly. That is the shape torch-spyre's
     # working ``sum`` emits, and it is the one reduce here that reaches a binary
     # and launches. ``rewrite-descriptor-layout-reduce-batch-dim.mlir`` pins the
@@ -612,7 +628,7 @@ VARIANTS = {
         "atol":        2.5e-1,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.reduce"),
+            t.assert_present("linalg.generic", doc="tt.reduce"),
             # The zero init fill is still here, and that is correct at this
             # stage: DropReductionInitFill runs in _make_spyrecode, so the KTIR a
             # structural test sees is the KTIR before the binary path repairs it.
@@ -635,8 +651,8 @@ VARIANTS = {
     # widening for the rank-2 store, and dbo-opt stops on ktdf.data_transfer
     # having a rank-2 dest against a 1-result dest_map. No batch dimension
     # survives to carry the split, so the sibling above's path does not apply --
-    # and torch-spyre does not emit linalg.reduce for this case at all, using a
-    # linalg.generic with the maps written out, which currently fails there too.
+    # and torch-spyre does not emit a well-formed reduction for this case at all,
+    # using a linalg.generic with the maps written out, which currently fails there too.
     # So there is no working emission to match yet.
     #
     # That refusal is why this variant carries no ``compiles_to_binary``. It is

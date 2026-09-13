@@ -4,8 +4,9 @@ import triton.language as tl
 
 
 # Three reductions are supported through ``OP: tl.constexpr``: ``sum``, ``max``
-# and ``min``. They are the three that lower: each becomes a ``linalg.reduce``
-# differing only in its combiner (addf/addi, maxnumf/maxsi, minnumf/minsi), and
+# and ``min``. They are the three that lower: each becomes a ``linalg.generic``
+# tagged ``doc = "tt.reduce"``, differing only in the combiner in its payload
+# (addf/addi, maxnumf/maxsi, minnumf/minsi), and
 # all three run on ``ktir_cpu`` at fp16, fp32 and i32. What separates them is the
 # device: the dataflow scheduler resets a reduction accumulator to zero whatever
 # the combiner is, so only ``sum`` has the right neutral element -- see the
@@ -94,11 +95,11 @@ def reduce_middle_axis_spyre(
 
     With three distinct extents, reducing the wrong axis fails loudly — the
     output shape changes. What the lowering does about the reduced axis not
-    being trailing is: nothing. ``linalg.reduce`` names the axes it folds in a
-    sorted ``dimensions`` list, so D1 is reduced where it sits and no
-    ``linalg.transpose`` is emitted, at either grid and with or without a stick
-    layout -- which is what ``meta.py`` asserts with
-    ``assert_absent("linalg.transpose")``.
+    being trailing is: nothing. The emitted ``linalg.generic`` marks D1
+    ``"reduction"`` in place, so D1 is reduced where it sits and nothing is
+    transposed, at either grid and with or without a stick layout -- which is
+    what ``meta.py`` asserts with
+    ``assert_iterators(..., ["parallel", "reduction", "parallel"])``.
 
     The reduced axis is the *middle* one, so it is never the axis being
     blocked or distributed — the tiling above is orthogonal to what makes
@@ -171,15 +172,16 @@ def reduce_one_tile(
     - ``AXIS=0`` folds M, a *whole physical dimension*. The stick structure
       survives untouched, and because the output descriptor declares exactly the
       layout that leaves, the reduce is emitted at physical shape: one
-      ``linalg.reduce`` whose surviving stick index is a batch dimension
-      (``ins tensor<2x64x64> outs tensor<2x64> dimensions = [1]``), which is the
+      reduction ``linalg.generic`` whose surviving stick index is a batch
+      dimension (``ins tensor<2x64x64> outs tensor<2x64>``, iterators
+      ``parallel, reduction``), which is the
       shape torch-spyre's working ``sum`` emits. This one reaches a binary and
       launches.
     - ``AXIS=1`` folds N, the *stick* axis. Stick-on-N splits N across physical
       dimensions 0 and 2, so the reduce names both and collapses to a rank-1
       result that then has to be widened back for a rank-2 store. No batch
-      dimension survives to carry the split. torch-spyre does not emit
-      ``linalg.reduce`` for this at all -- its ``sum-onstick`` case uses
+      dimension survives to carry the split. torch-spyre does not emit a
+      well-formed reduction for this at all -- its ``sum-onstick`` case uses a
       ``linalg.generic`` with the maps written out, because the lanes are read as
       one dimension and written as another. It still stops in the scheduler; the
       Level D banner in ``meta.py`` says where.

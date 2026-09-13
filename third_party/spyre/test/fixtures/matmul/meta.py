@@ -1,7 +1,10 @@
 """SIGNATURE + VARIANTS + reference oracle + input generators for matmul.
 
-Twelve variants exercise ``tt.dot`` → ``linalg.matmul`` (rank-2 operands) or
-``linalg.batch_matmul`` (rank-3 operands) at increasing complexity.
+Twelve variants exercise ``tt.dot`` → ``linalg.generic`` (``doc = "tt.dot"``)
+at increasing complexity. Rank-2 operands give a three-loop contraction
+(``parallel, parallel, reduction``); rank-3 batched operands prepend a batch
+``parallel`` loop — which is the ``assert_iterators`` claim below, and what the
+former ``linalg.matmul`` / ``linalg.batch_matmul`` split used to say.
 Three groups:
 
 1D-grid variants (loop-distributed):
@@ -47,7 +50,9 @@ from utils import sticksize
 
 def _make_default_checks(M, K, **_):
     def checks(t):
-        t.assert_present("linalg.matmul")
+        t.assert_present("linalg.generic", doc="tt.dot")
+        t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                           doc="tt.dot")
         t.assert_absent("tt.dot")
         t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{K}xf32>")
     return checks
@@ -55,7 +60,9 @@ def _make_default_checks(M, K, **_):
 
 def _make_2d_grid_checks(M, K, **_):
     def checks(t):
-        t.assert_present("linalg.matmul")
+        t.assert_present("linalg.generic", doc="tt.dot")
+        t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                           doc="tt.dot")
         t.assert_result_type("ktdp.construct_memory_view", f"memref<{M}x{K}xf32>")
     return checks
 
@@ -270,7 +277,7 @@ VARIANTS = {
             "descriptors lower to fully-static shapes "
             "(`memref<512x64xf32>` for `A`, etc.). The core operator is "
             "a `tl.dot` per inner iteration, which the Spyre pipeline "
-            "lowers to `linalg.matmul`."
+            "lowers to a `linalg.generic` tagged `doc = \"tt.dot\"`."
         ),
         "kernel_fn":    kernel.matmul_kernel,
         "constexpr":    ["M", "K", "N", "BLOCK_M", "BLOCK_K", "BLOCK_N",
@@ -317,7 +324,9 @@ VARIANTS = {
             "A_LAYOUT": [None], "B_LAYOUT": [None], "C_LAYOUT": [None],
         },
         "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
         ),
     },
@@ -341,7 +350,9 @@ VARIANTS = {
         "output_key":   "c_ptr",
         "rtol":         1e-2,
         "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
     },
@@ -406,7 +417,9 @@ VARIANTS = {
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N"],
         "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<?x?xf32>"),
         ),
     },
@@ -420,7 +433,9 @@ VARIANTS = {
         },
         "grid":         [4, 4],
         "extra_checks": lambda t: (
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_result_type("ktdp.construct_memory_view", "memref<256x64xf32>"),
         ),
     },
@@ -454,7 +469,9 @@ VARIANTS = {
         "rtol":         1e-2,
         "atol":         1e-4,
         "extra_checks": lambda t: (
-            t.assert_present("linalg.batch_matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
     },
@@ -553,14 +570,16 @@ VARIANTS = {
         "atol":         5e-2,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_present("scf.for"),
             t.assert_present("tensor.insert_slice"),
         ),
     },
     "spyre_stick_parallel": {
         # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
-        # reduction loop — one inner linalg.matmul per output stick.
+        # reduction loop — one inner tt.dot generic per output stick.
         "base": "spyre_stick_k_reduction",
         "summary": (
             "Matmul with Spyre stick-tiling annotations: A stick-on-M, "
@@ -581,7 +600,9 @@ VARIANTS = {
         },
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_present("tensor.insert_slice"),  # store sink stage
         ),
     },
@@ -682,7 +703,9 @@ VARIANTS = {
         "atol":         5e-2,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.batch_matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
     },
@@ -735,7 +758,12 @@ VARIANTS = {
         },
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.batch_matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            # Four loops, not five: "rank5" names the *physical* memory view, not
+            # the contraction. tt.dot still sees rank-3 logical operands
+            # (2x128x128 @ 2x128x64), so the loop nest is batch + M + N + K.
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S].
             t.assert_result_type("ktdp.construct_memory_view", "2x2x2x64x64xf16"),
             # Nested scf.for: outer M-stick scatter, inner K-stick reduction.
@@ -789,7 +817,9 @@ VARIANTS = {
         "atol":         5e-1,
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.matmul"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+                               doc="tt.dot"),
             t.assert_present("tensor.insert_slice"),  # store sink stage
         ),
     },

@@ -293,13 +293,21 @@ class StructuralAssertions:
         return self.def_map.get(vid)
 
     def _find(self, name: str, parent: str = None, idx: int = 0,
-              shape=None, elem_type: str = None) -> list:
-        """Internal: return all :class:`OpInfo` matching the given filters."""
+              shape=None, elem_type: str = None, doc: str = None) -> list:
+        """Internal: return all :class:`OpInfo` matching the given filters.
+
+        *doc* filters on the ``doc`` string attribute. Every ``linalg.generic``
+        LowerComputeOps emits carries one naming the Triton op it came from, so
+        it is what distinguishes a generic that was a ``tt.dot`` from one that
+        was a ``tt.reduce`` -- a distinction the op name used to carry.
+        """
         result = []
         for o in self.ops:
             if o.name != name:
                 continue
             if parent is not None and not (o.ancestry and o.ancestry[-1] == parent):
+                continue
+            if doc is not None and o._op.get_str_attr("doc") != doc:
                 continue
             if shape is not None or elem_type is not None:
                 info = self.get_result_info(o, idx)
@@ -318,29 +326,48 @@ class StructuralAssertions:
         from triton._C.libtriton import spyre
         return spyre.ir_utils.get_result_info(op_info._op, idx)
 
-    def assert_present(self, *op_names: str, parent: str = None):
-        """Assert each op in *op_names* appears at least once."""
+    def assert_present(self, *op_names: str, parent: str = None,
+                       doc: str = None):
+        """Assert each op in *op_names* appears at least once.
+
+        Pass *doc* to require the op carry that ``doc`` attribute, which is how
+        a specific ``linalg.generic`` is named now that every compute op is one:
+        ``assert_present("linalg.generic", doc="tt.dot")``.
+        """
         for name in op_names:
-            assert self._find(name, parent), (
+            assert self._find(name, parent, doc=doc), (
                 f"Expected op '{name}'"
+                + (f" with doc '{doc}'" if doc else "")
                 + (f" inside '{parent}'" if parent else "")
                 + " not found in KTIR"
             )
 
-    def assert_absent(self, *op_names: str):
-        """Assert none of *op_names* appear anywhere in the module."""
+    def assert_absent(self, *op_names: str, doc: str = None):
+        """Assert none of *op_names* appear anywhere in the module.
+
+        With *doc*, asserts no op of that name carries that ``doc`` -- e.g. that
+        no generic on the chain came from a ``tt.trans``.
+        """
         for name in op_names:
-            assert not self._find(name), (
-                f"Unexpected op '{name}' found in KTIR"
+            assert not self._find(name, doc=doc), (
+                f"Unexpected op '{name}'"
+                + (f" with doc '{doc}'" if doc else "")
+                + " found in KTIR"
             )
 
     def assert_count(self, op_name: str, n: int, cmp: str = "ge",
-                     parent: str = None):
-        """Assert occurrence count of *op_name* satisfies *cmp* vs *n*."""
-        c = len(self._find(op_name, parent))
+                     parent: str = None, doc: str = None):
+        """Assert occurrence count of *op_name* satisfies *cmp* vs *n*.
+
+        With *doc*, counts only the ops carrying that ``doc`` attribute, which
+        is what keeps a count meaningful once every compute op shares one name.
+        """
+        c = len(self._find(op_name, parent, doc=doc))
         ok = {"ge": c >= n, "eq": c == n, "gt": c > n}[cmp]
         assert ok, (
-            f"Op '{op_name}': expected {cmp} {n}"
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + f": expected {cmp} {n}"
             + (f" inside '{parent}'" if parent else "")
             + f", found {c}"
         )
@@ -351,6 +378,40 @@ class StructuralAssertions:
         assert matches, f"Op '{op_name}' not found in KTIR"
         assert any(o._op.get_str_attr(attr_name) is not None for o in matches), (
             f"Op '{op_name}' missing attribute '{attr_name}'"
+        )
+
+    def assert_iterators(self, op_name: str, iterators: list, *,
+                         doc: str = None, parent: str = None):
+        """Assert a matching op's ``iterator_types`` equals *iterators*.
+
+        This is where a claim about a contraction's rank or a reduction's axis
+        lives now that every compute op is a ``linalg.generic``. A rank-2
+        ``tt.dot`` gives ``["parallel", "parallel", "reduction"]`` and a rank-3
+        one prepends a batch ``"parallel"``, so the list length is the rank
+        assertion the old ``linalg.matmul`` / ``linalg.batch_matmul`` split used
+        to make. For a reduce, the POSITION of ``"reduction"`` is the axis --
+        which is what the named op's ``dimensions = [n]`` used to say.
+
+        Pass *doc* to scope the match to one origin, since several Triton ops
+        now share the ``linalg.generic`` name.
+        """
+        from triton._C.libtriton import spyre
+        matches = self._find(op_name, parent, doc=doc)
+        assert matches, (
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + " not found in KTIR"
+        )
+        seen = []
+        for o in matches:
+            got = spyre.ir_utils.get_str_array_attr(o._op, "iterator_types")
+            if got == list(iterators):
+                return
+            seen.append(got)
+        raise AssertionError(
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + f": expected iterator_types {list(iterators)}, found {seen}"
         )
 
     def assert_affine_attr(self, op_name: str, attr_name: str, parent: str = None):

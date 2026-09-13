@@ -1,7 +1,8 @@
 """Matmul kernels: 2D and batched (BMM).
 
-Five @triton.jit functions exercising tt.dot -> linalg.matmul (rank-2 operands)
-or linalg.batch_matmul (rank-3 operands) with tensor descriptors. Three groups:
+Five @triton.jit functions exercising tt.dot -> linalg.generic (doc = "tt.dot")
+with tensor descriptors. Rank-2 operands give three loops (parallel, parallel,
+reduction); rank-3 batched operands prepend a batch parallel loop. Three groups:
 
 1D-grid kernels — one axis distributes work via an explicit loop:
 - matmul_kernel          -- 2D: C[M,N] = A[M,K] @ B[K,N], pid distributes M

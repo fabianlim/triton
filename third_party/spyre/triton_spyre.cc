@@ -168,6 +168,40 @@ void init_triton_spyre_ir_utils(py::module &&m) {
           return py::str(str);
         });
 
+  // get_str_array_attr: return an ArrayAttr of strings as a Python list.
+  // The typed getters cover a single string but not an array of them, and
+  // `iterator_types` on a linalg.generic is exactly that -- it is where a
+  // contraction's rank and a reduction's axis now live, so a test that used to
+  // read them off a named op's identity reads them here instead.
+  m.def("get_str_array_attr",
+        [](mlir::Operation &self, const std::string &name) -> py::object {
+          auto arr = self.getAttrOfType<mlir::ArrayAttr>(name);
+          if (!arr)
+            return py::none();
+          py::list out;
+          for (mlir::Attribute a : arr) {
+            // linalg spells its iterators as IteratorTypeAttr rather than
+            // StringAttr, so fall back to the printed form for anything that is
+            // not already a string.
+            if (auto sa = mlir::dyn_cast<mlir::StringAttr>(a)) {
+              out.append(py::str(sa.getValue().str()));
+              continue;
+            }
+            std::string str;
+            llvm::raw_string_ostream os(str);
+            a.print(os);
+            // Printed enum attrs come out quoted or bracketed; strip the
+            // decoration so callers compare against "parallel"/"reduction".
+            llvm::StringRef ref(str);
+            ref = ref.trim();
+            ref.consume_front("#linalg.iterator_type<");
+            ref.consume_back(">");
+            ref = ref.trim("\"");
+            out.append(py::str(ref.str()));
+          }
+          return out;
+        });
+
   // Introspect the type of a result value.  Returns a dict with keys that
   // depend on the type kind.  For any ShapedType (tensor, memref, …):
   //   {"type_str": "memref<1024xf16>", "shape": [1024], "elem_type": "f16"}

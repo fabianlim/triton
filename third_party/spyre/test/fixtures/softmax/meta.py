@@ -120,10 +120,19 @@ VARIANTS = {
         "rtol":         1e-3,
         "extra_checks": lambda t: (
             # In-tile reduce + broadcast: max and sum each emit one
-            # linalg.reduce; the row_max - row subtraction emits a
-            # broadcast from [1] to [1, BLOCK_SIZE].
-            t.assert_count("linalg.reduce", 2),
-            t.assert_present("linalg.broadcast"),
+            # linalg.generic tagged doc = "tt.reduce"; the row_max - row
+            # subtraction emits one tagged doc = "tt.broadcast", widening
+            # [1] to [1, BLOCK_SIZE].
+            #
+            # Both assertions are scoped by `doc` because every compute op is
+            # now a linalg.generic, and a bare count of that name is trivially
+            # satisfied: convert-elementwise-to-linalg runs later in the
+            # pipeline and emits several more generics with no `doc` at all
+            # (this kernel ends up with 11 generics, 5 of them undocumented).
+            # Only the doc-scoped count can still fail if the reduce lowering
+            # regresses.
+            t.assert_count("linalg.generic", 2, doc="tt.reduce"),
+            t.assert_present("linalg.generic", doc="tt.broadcast"),
         ),
     },
     "multi_tile": {

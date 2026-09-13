@@ -216,20 +216,63 @@ def LowerComputeOps : Pass<"lower-compute-ops", "mlir::ModuleOp"> {
     let description = [{
         Input: triton + ktdp + arith + memref + tensor + scf dialects.
 
+        Every op this pass puts on a compute chain is a `linalg.generic`. A
+        coordinate change is carried as an operand indexing map rather than as a
+        separate op, so what used to be a named op plus a reshape becomes one
+        generic whose maps say where each operand is read.
+
+        Two reasons the named forms are gone. Some of them could not reach a
+        binary at all: the backend's compute allowlist is add/mul/sub/reduce, so
+        a named `linalg.matmul`, `linalg.broadcast` or `linalg.transpose` is
+        rejected outright, while the same computation as a `linalg.generic` is
+        accepted. And a named op is a wall that upstream elementwise fusion
+        cannot cross — it composes indexing maps and matches generic-into-generic
+        only — so every named op left on a chain is a point where fusion silently
+        stops.
+
         Lowering (Group A — shape manipulation):
         - tt.splat → linalg.fill
         - tt.reshape → tensor.reshape
-        - tt.expand_dims → tensor.expand_shape
-        - tt.broadcast → tensor.collapse_shape + linalg.broadcast
-        - tt.trans → linalg.transpose
+        - tt.expand_dims → linalg.generic, rank-reducing operand map
+        - tt.broadcast → linalg.generic, constant-0 operand map
+        - tt.trans → linalg.generic, permuting operand map
         - tt.join → tensor.expand_shape + tensor.concat
         - tt.split → tensor.extract_slice × 2
 
+        The three that became generics share one shape: a copy-only body (a bare
+        `linalg.yield` of the input block argument) and all-`parallel` iterators.
+        They differ only in the operand map — a constant 0 in each expanded dim,
+        a dropped dim, or a permutation — which is the whole content of the op.
+
+        tt.splat, tt.join and tt.split are unchanged: they are not compute-chain
+        ops. `linalg.fill` in particular must stay named, because
+        DropReductionInitFill finds a reduction's init by looking for a
+        `linalg.fill` on its `outs`.
+
         Lowering (Group B — reduction):
-        - tt.reduce (+ tt.reduce.return) → linalg.reduce
+        - tt.reduce (+ tt.reduce.return) → linalg.generic with a `reduction`
+          iterator on the reduced axis and an output map that omits it
+
+        The result stays rank-reduced, exactly as `linalg.reduce` produced, so
+        consumers see the type they saw before; only the op class changes.
 
         Lowering (Group C — matrix multiply):
-        - tt.dot → linalg.matmul
+        - tt.dot → linalg.generic with contraction maps and
+          ["parallel", "parallel", "reduction"] (plus one leading batch dim per
+          rank above 2)
+
+        Every emitted generic carries `linalg.generic`'s own optional `doc` field
+        naming the Triton op it came from — `doc = "tt.dot"`, `doc = "tt.reduce"`
+        and so on. Once every compute op is a generic the op name no longer says
+        what it was, and `doc` prints in the assembly so a reader (and a lit
+        fixture) can still tell. It is for humans only; no pass keys on it, and
+        fusion drops it, which is correct — a fused body has no single origin.
+
+        Everything this pass emits is LOGICAL. No shape, indexing map or iterator
+        list is chosen to satisfy a hardware constraint — not the stick width,
+        not the tile extents. Physicality enters later, at
+        RewriteDescriptorLayout, from the tt.spyre_tensor_layout annotation,
+        which this pass cannot see.
 
         Trivially dead ops left by prior passes are swept at the end.
 
