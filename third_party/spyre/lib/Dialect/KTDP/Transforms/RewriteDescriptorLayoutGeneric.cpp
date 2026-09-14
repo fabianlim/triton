@@ -234,6 +234,9 @@ struct RebuildOperand {
 /// that dim whole addresses it as `stick * width + elem`. A dim no operand
 /// splits contributes one.
 ///
+/// Which loop number each piece gets is read off the RESULT's physical order,
+/// not the logical one — see buildLoopDomain for why the result is the frame.
+///
 /// On top of that refinement, each BROADCAST physical dim contributes one loop
 /// dim of its own. A broadcast is not a subdivision of a logical dim, so no
 /// logical loop dim can stand for it: it replicates that dim across a fresh
@@ -257,9 +260,31 @@ struct LoopDomain {
 };
 
 /// Build the loop domain over `logicalNumLoops` dims, splitting every logical
-/// dim that any operand splits. Loop dims are numbered in logical order, a
-/// split dim taking (stick, elem) adjacently, so the domain is a refinement of
-/// the logical one and an unsplit program keeps its original numbering.
+/// dim that any operand splits. A split dim contributes two loop dims, a stick
+/// index and an element offset.
+///
+/// The numbering is taken from the RESULT's physical dims, walked in order, and
+/// that choice is the whole point of this function. A loop domain is only ever
+/// defined up to a relabelling -- permuting the loop dims and permuting every
+/// map's reference to them describes the same computation -- so the numbering is
+/// free, and something has to fix it. The result's own physical order is what
+/// fixes it, because the result is the one operand whose coordinate order the
+/// generic does not get to choose: its elements are written where its type says
+/// they live. Numbering from anywhere else states a correct relation in a frame
+/// nothing else uses, and the visible symptom is a result map that permutes when
+/// it should be the identity.
+///
+/// Numbering in *logical* order, which is what this used to do, is exactly that
+/// mistake. A layout is free to reorder dims -- stick-on-N sends logical [M, N]
+/// to physical [N/S, M, S] -- so a logical-order domain makes the result read
+/// `(d1, d0, d2)`: faithful to the layout, stated in the logical frame, and not
+/// the frame the result is written in. Nothing cancels it later, because there
+/// is no later: these maps are the output.
+///
+/// Reduction dims, and any dim the result drops, are numbered after the walk in
+/// logical order. They appear in no result map result, so their numbering is
+/// unconstrained; putting them last keeps the result's own map a projection onto
+/// a prefix of the domain wherever one is possible at all.
 ///
 /// Fails when two operands split the same logical dim at different widths:
 /// there is then no single `stick * width + elem` a third operand holding the
@@ -295,9 +320,52 @@ buildLoopDomain(MutableArrayRef<RebuildOperand> operands,
     }
   }
 
+  // Number the loop dims from the result's physical order: the result is the one
+  // operand whose coordinate order the generic does not get to choose, since its
+  // elements are written where its own type says they live. A loop domain is
+  // only defined up to relabelling, so something has to fix the numbering, and
+  // that is what makes the result the frame rather than an arbitrary pick.
+  //
+  // A broadcast physical dim is skipped here: it gets a fresh loop below, since
+  // it stands for no logical dim's elements.
+  //
+  // FIXME(#150/#151): identifying the result POSITIONALLY -- `operands.back()`
+  // -- is the weak part of this. It holds only because every caller appends the
+  // `outs` operand last, which is a convention of this file rather than a fact
+  // the type system or an assertion enforces; a caller that ever builds
+  // `operands` in another order gets a silently wrong loop frame, and the
+  // symptom is not a verifier error (the maps stay internally consistent) but a
+  // relabelled iteration space that only shows up as a shape mismatch inside
+  // ktir-cpu. Prefer deriving this from the op -- `DestinationStyleOpInterface`
+  // gives the init operands directly -- or at minimum assert that the last entry
+  // is the one built from `getDpsInitOperand(0)`. Left as-is for now to keep the
+  // fix small; revisit before this pass takes more callers.
+  const RebuildOperand &result = operands.back();
+  if (const CoordMap *cm = result.layout) {
+    for (unsigned p = 0, e = cm->physRank(); p < e; ++p) {
+      CoordOp coordOp = cm->opAt(p);
+      if (coordOp == CoordOp::Broadcast)
+        continue;
+      auto dimExpr =
+          dyn_cast<AffineDimExpr>(result.logicalMap.getResult(cm->src[p]));
+      if (!dimExpr)
+        continue; // a constant names no loop dim
+      unsigned loop = dimExpr.getPosition();
+      int &slot =
+          coordOp == CoordOp::Mod ? dom.elemDim[loop] : dom.stickDim[loop];
+      if (slot < 0)
+        slot = dom.numLoopDims++;
+    }
+  }
+
+  // Then every loop dim the result did not reach: a reduction dim, a dim the
+  // result drops, or the element half of a dim the result holds whole while
+  // another operand splits it. Logical order among these, so an unsplit program
+  // with an identity result keeps exactly its original numbering.
   for (unsigned d = 0; d < logicalNumLoops; ++d) {
-    dom.stickDim[d] = dom.numLoopDims++;
-    if (dom.width[d])
+    if (dom.stickDim[d] < 0)
+      dom.stickDim[d] = dom.numLoopDims++;
+    if (dom.width[d] && dom.elemDim[d] < 0)
       dom.elemDim[d] = dom.numLoopDims++;
   }
 

@@ -7,8 +7,8 @@
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>
-// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3) -> (d2, d0, d3)>
+// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3, d2)>
+// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
 // CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic | FileCheck %s
@@ -47,7 +47,7 @@ module {
 // CHECK:           %[[VAL_16:.*]] = arith.remsi %[[VAL_2]], %[[VAL_15]] : index
 // CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]], %[[VAL_2]], %[[VAL_16]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_5]]} : memref<2x2x64xf32> -> !ktdp.access_tile<2x2x64xindex>
 // CHECK:           %[[VAL_18:.*]] = tensor.empty() : tensor<2x2x64xf32>
-// CHECK:           %[[VAL_19:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]]], iterator_types = ["parallel", "reduction", "parallel", "parallel"]} ins(%[[VAL_10]] : tensor<2x2x64x64xf32>) outs(%[[VAL_18]] : tensor<2x2x64xf32>) {
+// CHECK:           %[[VAL_19:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]]], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%[[VAL_10]] : tensor<2x2x64x64xf32>) outs(%[[VAL_18]] : tensor<2x2x64xf32>) {
 // CHECK:           ^bb0(%[[VAL_20:.*]]: f32, %[[VAL_21:.*]]: f32):
 // CHECK:             %[[VAL_22:.*]] = arith.addf %[[VAL_20]], %[[VAL_21]] : f32
 // CHECK:             linalg.yield %[[VAL_22]] : f32

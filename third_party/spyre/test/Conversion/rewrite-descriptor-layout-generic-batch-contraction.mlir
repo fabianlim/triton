@@ -27,8 +27,11 @@
 // The accumulator is an unmarked splat constant, so it stays logical and composes
 // the N split it does not carry.
 // CHECK-DAG: #[[ACC:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2 * 64 + d3)>
-// CHECK-DAG: #[[RESIN:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2 * 64 + d3)>
-// CHECK-DAG: #[[RESOUT:.+]] = affine_map<(d0, d1, d2, d3) -> (d2, d0, d1, d3)>
+// The result copy is numbered from its own result, so its output map is the
+// rank-4 identity -- ID4 above, reused below rather than pinned again -- and the
+// composite for the N split lands on RESIN, the f32 accumulator that holds N
+// whole.
+// CHECK-DAG: #[[RESIN:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2, d0 * 64 + d3)>
 
 // CHECK-LABEL: tt.func public @bmm_matmul_kernel
 // K=128 at stick 64 gives two sticks on A; N=64 gives one on B and on the output.
@@ -46,7 +49,7 @@
 // Two reduction loops for the split K; batch, M and the N split are parallel.
 // CHECK:           linalg.generic {indexing_maps = [#[[A]], #[[B]], #[[ACC]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%{{.*}}, %{{.*}} : tensor<2x4x64x64xf16>, tensor<1x4x128x64xf16>) outs(%{{.*}} : tensor<4x64x64xf32>)
 // CHECK:           tensor.empty() : tensor<1x4x64x64xf16>
-// CHECK:           linalg.generic {indexing_maps = [#[[RESIN]], #[[RESOUT]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<4x64x64xf32>) outs(%{{.*}} : tensor<1x4x64x64xf16>)
+// CHECK:           linalg.generic {indexing_maps = [#[[RESIN]], #[[ID4]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<4x64x64xf32>) outs(%{{.*}} : tensor<1x4x64x64xf16>)
 // The store's data tile agrees with its access tile with no widening stage.
 // CHECK:           ktdp.store %{{.*}}, %{{.*}} : tensor<1x4x64x64xf16>, <1x4x64x64xindex>
 // No second loop, no slicing, and no marker survives.
