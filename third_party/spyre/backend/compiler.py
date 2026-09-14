@@ -170,6 +170,13 @@ _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
+    # Before the layout pass, not in the spyrecode stage, when the generic layout
+    # pass is selected: RewriteDescriptorLayoutGeneric restates an op by rebuilding
+    # a linalg.generic's indexing maps, and it has no rule for the linalg.fill on a
+    # reduction's outs -- it declines the whole chain. Dropping the fill here means
+    # there is nothing to restate. See the pass header for why it is now safe to
+    # run over every combiner.
+    *(("drop_reduction_init_fill",) if _LAYOUT_PASS_VARIANT == "generic" else ()),
     "lower_inter_tile",
     _LAYOUT_PASS,
     "convert_functions",

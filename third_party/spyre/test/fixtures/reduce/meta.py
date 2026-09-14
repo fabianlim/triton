@@ -655,16 +655,21 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.reduce"),
-            # The zero init fill is still here, and that is correct at this
-            # stage: DropReductionInitFill runs in _make_spyrecode, so the KTIR a
-            # structural test sees is the KTIR before the binary path repairs it.
-            # Asserted rather than left unsaid because its absence would mean the
-            # pass had moved back into the pipeline every path crosses.
+            # No init fill: DropReductionInitFill now runs IN the pipeline, before
+            # the layout pass, so by the time a structural test sees this KTIR the
+            # fill is already gone and the reduce's `outs` is a bare tensor.empty.
             #
-            # It is re-emitted at the PHYSICAL shape here rather than dropped,
-            # because a reduce's `outs` is read by its payload and the neutral
-            # element is what makes that well defined.
-            t.assert_present("linalg.fill"),
+            # It moved there because the generic layout pass has no rule for a
+            # linalg.fill on a reduction's outs and declines the whole chain;
+            # dropping it earlier means there is nothing to restate. The
+            # accumulator is still well defined -- the scheduler's
+            # MapReductionPartials derives the neutral from the combiner and fills
+            # it back on the way to a binary.
+            #
+            # Asserted as an absence rather than left unsaid, because the fill
+            # reappearing would mean the pass had moved back out of the pipeline
+            # and every layout-annotated reduce would start declining again.
+            t.assert_absent("linalg.fill"),
             # No stick loop -- the whole point of this variant, and what its
             # device story turns on. `parallel: False` above says there is no
             # distribution loop; this says there is no stick loop either.

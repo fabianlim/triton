@@ -1,21 +1,24 @@
 // RUN: spyre-triton-opt %s --drop-reduction-init-fill -split-input-file | FileCheck %s
 
-// DropReductionInitFill removes the zero linalg.fill that LowerComputeOps gives a
+// DropReductionInitFill removes the linalg.fill that LowerComputeOps gives a
 // tt.reduce for its accumulator, leaving the bare tensor.empty that hand-written
 // reference KTIR states directly.
 //
 // The rewrite is sound ONLY because MapReductionPartials overwrites the accumulator
-// with its own hardcoded 0.0 reset before it is read — a reduction payload does read
-// its init, and tensor.empty is explicitly unspecified. So the gate is narrow: the
-// op must be a shape that pass actually rewrites (one ins, one init, simple body),
-// the combiner must be addf/subf, and the fill must be zero. Anything else is left
-// alone or reported.
+// before it is read — a reduction payload does read its init, and tensor.empty is
+// explicitly unspecified. That reset is not a hardcoded zero: getNeutralAttr derives
+// the neutral PER COMBINER (addf/subf 0.0, mulf 1.0, maximumf -inf, minimumf +inf,
+// addi/subi 0, muli 1) and the scheduler emits its own fill of it.
+//
+// So neither the combiner NOR the fill's value is judged here — both are passed
+// through, and downstream reports what it cannot handle. The whole gate is
+// STRUCTURAL: the op must be a shape that pass actually rewrites (one ins, one
+// init, simple body) with the fill writing into a tensor.empty. Anything else is
+// left alone, silently. This pass emits no diagnostics of its own, so there is no
+// -verify-diagnostics companion file; every case lives here.
 //
 // Inputs here are written in the already-lowered form the pass actually sees, so
 // they do not depend on what the upstream producer happens to emit.
-//
-// Rejection cases (our op, but its init cannot be honoured) are in
-// drop-reduction-init-fill-invalid.mlir.
 
 // Test 1: the shape LowerComputeOps produces for tl.sum — linalg.reduce over the
 // middle axis, outs initialised by fill(0.0). The fill goes, the reduce takes the
@@ -67,8 +70,8 @@ func.func @sum_generic(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
 
 // -----
 
-// Test 3: -0.0 is a zero too. Rejecting it would be a needless recompile for an
-// input that is numerically identical to the reset the scheduler writes.
+// Test 3: -0.0. Nothing inspects the fill's value, and there is nothing to inspect
+// it for — -0.0 is numerically the reset the scheduler writes back anyway.
 module {
 // CHECK-LABEL:   func.func @negative_zero(
 // CHECK-NOT:       linalg.fill
@@ -88,7 +91,7 @@ func.func @negative_zero(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
 
 // -----
 
-// Test 4: subf is the other zero-neutral combiner the scheduler lowers correctly.
+// Test 4: subf, the other combiner whose derived neutral is zero.
 module {
 // CHECK-LABEL:   func.func @sub_reduce(
 // CHECK-NOT:       linalg.fill
@@ -255,5 +258,118 @@ func.func @fill_with_another_user(%a: tensor<2x256x64xf16>)
       linalg.yield %s : f16
     }
   return %r, %init : tensor<2x64xf16>, tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 11: a mulf reduction with a 1.0 fill. This used to be rejected on the
+// combiner, on the false premise that the scheduler's reset was a hardcoded zero.
+// It is not: getNeutralAttr gives mulf a 1.0 neutral and the scheduler restores
+// that, so the stated 1.0 is exactly what comes back and the fill says nothing the
+// reset does not.
+module {
+// CHECK-LABEL:   func.func @mul_reduce_neutral_one(
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           linalg.reduce ins(%{{.*}} : tensor<2x256x64xf16>) outs(%[[EMPTY]] : tensor<2x64xf16>) dimensions = [1]
+// CHECK:             arith.mulf
+// CHECK-NOT:       linalg.fill
+// CHECK:           return
+func.func @mul_reduce_neutral_one(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %one = arith.constant 1.000000e+00 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%one : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.mulf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  return %r : tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 12: a maximumf reduction with a -inf fill — the softmax/layernorm path.
+// The scheduler derives -inf as maximumf's neutral and restores it, so dropping a
+// fill that already states -inf loses nothing.
+module {
+// CHECK-LABEL:   func.func @max_reduce_neutral_neg_inf(
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           linalg.reduce ins(%{{.*}} : tensor<2x256x64xf16>) outs(%[[EMPTY]] : tensor<2x64xf16>) dimensions = [1]
+// CHECK:             arith.maximumf
+// CHECK-NOT:       linalg.fill
+// CHECK:           return
+func.func @max_reduce_neutral_neg_inf(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %neg_inf = arith.constant 0xFC00 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%neg_inf : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.maximumf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  return %r : tensor<2x64xf16>
+}
+}
+
+// -----
+
+// Test 13: an INTEGER add with an i32 zero fill. The neutral is per combiner AND
+// typed — getNeutralAttr builds an integer attribute for addi — so there is nothing
+// float-specific to guard against here; the scheduler restores an i32 0 and the
+// fill is redundant.
+module {
+// CHECK-LABEL:   func.func @integer_add_reduce(
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xi32>
+// CHECK:           linalg.reduce ins(%{{.*}} : tensor<2x256x64xi32>) outs(%[[EMPTY]] : tensor<2x64xi32>) dimensions = [1]
+// CHECK:             arith.addi
+// CHECK-NOT:       linalg.fill
+// CHECK:           return
+func.func @integer_add_reduce(%a: tensor<2x256x64xi32>) -> tensor<2x64xi32> {
+  %zero = arith.constant 0 : i32
+  %empty = tensor.empty() : tensor<2x64xi32>
+  %init = linalg.fill ins(%zero : i32) outs(%empty : tensor<2x64xi32>) -> tensor<2x64xi32>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xi32>) outs(%init : tensor<2x64xi32>) dimensions = [1]
+    (%in: i32, %acc: i32) {
+      %s = arith.addi %in, %acc : i32
+      linalg.yield %s : i32
+    }
+  return %r : tensor<2x64xi32>
+}
+}
+
+// -----
+
+// Test 14: THE ACCEPTED CONSEQUENCE. An addf reduce whose fill states 2.5 — a real
+// initial value, not addf's neutral. "Sum, plus 2.5" is what the input says, and the
+// 2.5 is dropped: the pass judges no values, so the fill goes like any other, and the
+// scheduler will reset the accumulator to addf's neutral 0.0 instead. The constant is
+// left dangling for canonicalization, which is the only trace remaining.
+//
+// This is deliberate, not an oversight — see the header block of
+// DropReductionInitFill.cpp under "Why nothing here judges the combiner or the fill's
+// value". Nothing in the pipeline emits such a fill today (LowerComputeOps fills the
+// combiner's neutral by construction), and the alternative is this pass carrying a
+// copy of downstream's reset semantics, which is the thing that was previously wrong.
+// The case is pinned here so that the day something DOES emit a biased init, the
+// behaviour is documented rather than discovered.
+module {
+// CHECK-LABEL:   func.func @biased_accumulator(
+// CHECK:           %[[EMPTY:.*]] = tensor.empty() : tensor<2x64xf16>
+// CHECK:           linalg.reduce ins(%{{.*}} : tensor<2x256x64xf16>) outs(%[[EMPTY]] : tensor<2x64xf16>) dimensions = [1]
+// CHECK:             arith.addf
+// CHECK-NOT:       linalg.fill
+// CHECK:           return
+func.func @biased_accumulator(%a: tensor<2x256x64xf16>) -> tensor<2x64xf16> {
+  %bias = arith.constant 2.500000e+00 : f16
+  %empty = tensor.empty() : tensor<2x64xf16>
+  %init = linalg.fill ins(%bias : f16) outs(%empty : tensor<2x64xf16>) -> tensor<2x64xf16>
+  %r = linalg.reduce ins(%a : tensor<2x256x64xf16>) outs(%init : tensor<2x64xf16>) dimensions = [1]
+    (%in: f16, %acc: f16) {
+      %s = arith.addf %in, %acc : f16
+      linalg.yield %s : f16
+    }
+  return %r : tensor<2x64xf16>
 }
 }

@@ -534,7 +534,7 @@ def MaterializeBaseAddresses
 }
 
 def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
-    let summary = "Drop a zero linalg.fill that initialises a reduction's outs.";
+    let summary = "Drop the linalg.fill that initialises a reduction's outs.";
     let description = [{
         Input: any IR containing linalg ops on ranked tensors. Matches the
         LinalgOp interface but only ops with at least one reduction iterator, so
@@ -544,28 +544,43 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
         pipeline, tt.splat.
 
         Lowering:
-        - reduction whose outs[i] is defined by a linalg.fill of a constant zero
-          (float or integer, +0.0 and -0.0 alike) writing into a tensor.empty
+        - reduction with one ins and one init, a body of exactly one payload op
+          plus the yield, and the init block argument read by that payload, whose
+          outs[i] is defined by a linalg.fill writing into a tensor.empty
           → outs[i] repointed at that tensor.empty, and the fill erased once
-          dead.
-        - Same shape, but the fill value is not zero → rejected with a
-          diagnostic.
+          dead. The value the fill states is not examined, and neither is the
+          combiner the payload uses.
         - A fill writing into anything other than tensor.empty → left alone;
           repointing outs at it would substitute live contents for the stated
           initial value.
+        - Anything else — a multi-operand reduction (matmul and other
+          contractions, argmax and friends), a multi-result reduction, a
+          non-trivial body → left alone, silently.
+
+        This pass emits no diagnostics and cannot fail. The one non-rewrite is
+        the silent skip above, and it is the conservative answer rather than an
+        error: whatever cannot lower such an op will say so itself, while failing
+        here would make any pipeline that merely *contains* a matmul unable to run
+        this fix at all.
 
         A reduction's payload reads its outs operand, so dropping the init is
-        sound only because the scheduler emits its own accumulator reset ahead of
-        the reduction loop. That reset is hardcoded to zero, which is why the
-        gate is the literal value zero rather than the combiner's neutral
-        element: a mulf reduction initialised to 1.0 would be reset to zero by
-        the scheduler whatever this pass does, so it is reported instead of
-        silently lowered.
+        sound only because the dataflow-scheduler's MapReductionPartials emits its
+        own accumulator fill ahead of the reduction loop. That fill is *not* a
+        hardcoded zero: the scheduler's getNeutralAttr derives the neutral per
+        combiner (addf/subf 0.0, mulf 1.0, maximumf -inf, minimumf +inf, addi/subi
+        0, muli 1), so a mulf or a max reduce is restored just as correctly as a
+        sum and there is nothing for this pass to gate on. The structural
+        conditions above are exactly MapReductionPartials' own preconditions,
+        mirrored so that the fill is dropped only where that pass will run; they
+        deliberately name no combiner and read no value, because downstream's
+        gates keep moving and a copy of them here would drift silently. The long
+        form of that argument is in the header of
+        lib/Dialect/KTDP/Transforms/DropReductionInitFill.cpp.
 
         That makes this a deliberate, narrow exception to the rule
         UnaliasLinalgOuts enforces. That pass refuses exactly this rewrite,
         because a payload reading its init makes tensor.empty observable; the
-        exception is justified here by the reset guarantee, which the IR does not
+        exception is justified here by the downstream fill, which the IR does not
         express.
 
         Motivation: LowerComputeOps gives every tt.reduce an outs of
@@ -577,9 +592,14 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
         operand.
 
         Ordering: must run after LowerComputeOps, the pass that creates the fill;
-        anchored earlier it is a silent no-op. Independent of
-        RewriteDescriptorLayout — running before it simply means the layout pass
-        physicalizes a tensor.empty rather than a fill.
+        anchored earlier it is a silent no-op. With the generic layout pass
+        selected it runs in the TTIR→KTIR pipeline directly after
+        LowerComputeOps, not only in the spyrecode stage, because
+        RewriteDescriptorLayoutGeneric restates a chain by rebuilding each
+        linalg.generic's indexing maps and has no rule for a linalg.fill on a
+        reduction's outs — it declines the whole chain. Dropping the fill first
+        leaves nothing to restate. See _CORE_PIPELINE_PASSES in
+        third_party/spyre/backend/compiler.py.
 
         Output: reductions whose outs is a bare tensor.empty, as hand-written
         reference KTIR states directly.
