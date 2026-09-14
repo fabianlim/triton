@@ -277,23 +277,19 @@ struct LoopDomain {
   bool isSplit(int64_t d) const { return elemDim[d] >= 0; }
 };
 
-/// The domain pieces one operand's physical dims name, in that operand's own
-/// physical order.
+/// In what order does this operand's physical layout visit the domain's pieces?
 ///
-/// This is the operand's physical order re-expressed as an order on pieces, and
-/// it is the only thing the numbering below reads off an operand. A physical dim
-/// names the piece its coord op picks out: a mod dim names the element half, a
-/// floordiv dim the stick half, and an identity dim the stick half too — an
-/// identity dim over a dim the domain splits addresses it as
-/// `stick * width + elem`, whose leading term is the stick half, so the stick
-/// half is where that physical position sits.
+/// buildLoopDomain has to compare operands that disagree about physical rank and
+/// dim order, and `DomainPiece` is the only vocabulary they share. This is the
+/// translation: physical dim order in, piece order out. It is the sole thing the
+/// numbering reads off an operand.
 ///
-/// A broadcast dim names none: it is a replication axis, not a piece of any
-/// logical dim, and it gets its own loop after the refinement.
-///
-/// An operand with no layout walks its own logical dims, every one held whole —
-/// which is the same walk under an identity layout. Its logical order IS its
-/// physical order, since nothing physicalized it.
+/// Each physical dim names the piece its coord op selects — mod the element half,
+/// floordiv the stick half, identity the stick half as well, since a dim held
+/// whole is addressed `stick * width + elem` and the stick is its leading term.
+/// Broadcast dims name nothing: a replication axis is not a piece of any logical
+/// dim, and gets its own loop later. An unlaid-out operand walks its logical dims
+/// held whole — nothing physicalized it, so that order IS its physical order.
 void collectPieces(const RebuildOperand &o,
                    SmallVectorImpl<DomainPiece> &pieces) {
   unsigned numDims =
@@ -315,82 +311,48 @@ void collectPieces(const RebuildOperand &o,
 /// index and an element offset. `resultIdx` names the `outs` operand within
 /// `operands`.
 ///
-/// A loop domain is only ever defined up to a relabelling -- permuting the loop
-/// dims and permuting every map's reference to them describes the same
-/// computation -- so the numbering is free, and something has to fix it. Two
-/// consumers care which way, and they care about different operands:
+/// A loop domain is defined only up to relabelling, so the numbering is free and
+/// something has to fix it. Two consumers constrain it, through different
+/// operands:
 ///
-///   - ktir-cpu reads the RESULT's map. For an all-parallel generic it takes the
-///     iteration shape to be the result's shape outright
-///     (`if not reduction_dims: iter_shape = out_shape`), and for a reduction it
-///     folds and squeezes the reduction loops and expects what remains, in loop
-///     order, to be the result's shape. Both say: the result's physical order
-///     must be the order its loops appear in.
+///   - ktir-cpu reads the RESULT's map: it squeezes the reduction loops and
+///     expects what remains, in loop order, to be the result's shape. So the
+///     result's loops must appear in its own physical order.
 ///   - The scheduler reads an INPUT's map. Its ReductionLoopExposurePass
-///     substitutes a loop index for an operand axis index, which is sound only
-///     while a reduction loop sits AT the axis it reduces; moved off it, the
-///     wrong physical dim gets narrowed and the report names a tensor type that
-///     is in no input module. That says: a reduction loop keeps the positional
-///     index of the axis it reduces.
+///     substitutes a loop index for an operand axis index, which holds only while
+///     a reduction loop sits AT the axis it reduces. So a reduced dim keeps that
+///     axis index. Note this is narrower than "the input map is the identity":
+///     permuting PARALLEL dims is fine, and the transpose cases need it.
 ///
-///     Narrower than "the input's map is the identity", and the difference
-///     matters. Permuting the PARALLEL dims is fine -- a fully reversed version
-///     of the same reduce gets a correctly computed slice out of that pass -- and
-///     the transpose cases below require the permutation. Note also that the
-///     scheduler's KTIR frontend handles the permutation correctly and a later
-///     pass discards that, so this is a defect on that side, filed upstream,
-///     rather than a rule this emitter was wrong to violate. The rule below is
-///     the better emission independently of it.
+/// Hence a merge, seeded by the result and refined by the inputs:
 ///
-/// So the rule is a merge, seeded by the result and refined by the inputs:
-///
-///   1. Walk the result's physical dims and number the pieces they name, in that
-///      order. The result is the one operand whose coordinate order the generic
-///      does not get to choose -- its elements are written where its own type
-///      says they live -- so its order is authoritative and nothing below
-///      reorders it.
-///   2. Walk each remaining operand's physical dims. A piece already numbered
-///      only advances a cursor; a piece the result never named is INSERTED at
-///      the cursor, i.e. at the place this operand's own physical order puts it
-///      relative to the pieces the result did name.
+///   1. Number the pieces the result's physical dims name, in that order. The
+///      result is authoritative because its elements are written where its own
+///      type says they live; nothing below reorders what this places.
+///   2. Walk each other operand's pieces with a forward-only cursor. An already
+///      numbered piece advances the cursor; an unnumbered one is INSERTED at it,
+///      i.e. where this operand's own physical order puts it.
 ///   3. Anything still unnumbered is appended in logical order.
 ///
-/// Step 2 is what a reduce needs, and it is where the reduced dim's own axis
-/// index comes from. The result of a reduce does not name the reduced dim at all,
-/// so step 1 leaves it unplaced; appending it -- which is what this used to do --
-/// puts it after pieces that come BEFORE it in the input's physical order, so its
-/// loop number no longer matches the axis it occupies there. Stick-on-N is the
-/// case: logical [M, N] -> physical [N/S, M, S], reduce over M, so the result's
-/// physical order (stick, lane) is a subsequence of the input's (stick, M, lane).
-/// Appending M gives `ins (d0, d2, d1)` -- the reduction is loop d2 sitting at
-/// axis 1. Inserting it where the input puts it gives `ins (d0, d1, d2)`, the
-/// reduction at loop d1 and axis 1, with `outs (d0, d2)` and iterators
-/// [parallel, reduction, parallel]. That is exactly what
+/// Step 2 exists for the reduce. A reduce's result never names the reduced dim,
+/// so step 1 leaves it unplaced, and appending it (the previous rule) lands it
+/// after pieces that precede it in the input — so its loop number stops matching
+/// its axis. Stick-on-N: logical [M, N] -> physical [N/S, M, S] reducing M, so
+/// the result's (stick, lane) is a subsequence of the input's (stick, M, lane).
+/// Appending M gives `ins (d0, d2, d1)`, the reduction at loop d2 but axis 1;
+/// inserting it gives `ins (d0, d1, d2)` and `outs (d0, d2)` — what
 /// `linalg.reduce ... dimensions = [1]` desugars to.
 ///
-/// The identity is how that particular case comes out, not the goal. A reduce
-/// whose operands' physical orders genuinely disagree still gets a permuted input
-/// map -- and correctly so; what the insertion guarantees is that the reduced
-/// dim's loop number is the axis index it has in the input, which is the part
-/// that is not free.
+/// The identity is how that case falls out, not the goal: operands whose physical
+/// orders genuinely disagree still get a permuted input map, correctly. What
+/// insertion guarantees is only the reduced dim's axis index.
 ///
-/// The two conventions do not collide, because inserting never moves a piece the
-/// result named: the result's map stays monotone in the loop numbering, which is
-/// all ktir-cpu asks of it. What changes is only that the result's map need no
-/// longer project onto a *prefix* of the domain.
-///
-/// Numbering in *logical* order, which this did before the result became the
-/// seed, is a different mistake and still one. A layout is free to reorder dims,
-/// so a logical-order domain makes the result read `(d1, d0, d2)` on a
-/// stick-on-N elementwise chain: faithful to the layout, stated in the logical
-/// frame, and not the frame the result is written in. Nothing cancels it later,
-/// because there is no later -- these maps are the output.
-///
-/// When the result's physical order already reaches every piece -- every
-/// elementwise, broadcast and transpose case -- step 2 inserts nothing and the
-/// numbering is exactly the result's own walk. So this generalizes the
-/// result-as-frame rule rather than weakening it: it only decides where the
-/// pieces that rule left unplaced go.
+/// The two constraints never collide, because insertion never moves a piece the
+/// result placed — the result's map stays monotone, which is all ktir-cpu asks;
+/// it merely need no longer project onto a *prefix*. And when the result reaches
+/// every piece (every elementwise, broadcast and transpose case) step 2 inserts
+/// nothing, so this generalizes the result-as-frame rule rather than weakening
+/// it: it only decides where that rule's unplaced pieces go.
 ///
 /// Fails when two operands split the same logical dim at different widths:
 /// there is then no single `stick * width + elem` a third operand holding the
