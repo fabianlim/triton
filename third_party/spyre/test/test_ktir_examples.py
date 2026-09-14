@@ -125,6 +125,14 @@ def test_disabled_variants_tracking_tests_exist():
             failures.append(f"{key}: 'disabled' has no 'tracking_test'")
             continue
 
+        # A permanent decline has no test to point at: there is no gap that will
+        # close, so the field carries prose instead. Only a "file.py::ClassName"
+        # string is resolved below; anything without "::" is taken as that prose
+        # and left alone. The field stays mandatory either way, so a disabled
+        # variant always says something about why.
+        if "::" not in tracking:
+            continue
+
         # Split "file.py::ClassName" — we only validate file + class.
         # Per-method resolution would require pytest's collector; the
         # class-plus-at-least-one-test_ check catches the rot we
