@@ -546,8 +546,17 @@ VARIANTS = {
             # claim, and it is what a transposing lowering would break. (The old
             # spelling of this was assert_absent("linalg.transpose"), which is
             # now vacuous -- the pass cannot emit that op at all.)
+            #
+            # Four loops, not the logical three: stick-on-D2 splits a PARALLEL
+            # axis, and a split parallel axis adds a PARALLEL loop while the
+            # reduced D1 stays a single reduction. The loops are numbered off the
+            # generic's own maps, not off the physical tile, so the list reads
+            # parallel(D0), reduction(D1), parallel(D2 stick), parallel(D2 lane)
+            # -- the input map (d0,d1,d2,d3) -> (d2,d0,d1,d3) permutes them onto
+            # the physical [D2/S, D0, D1, S]. "reduction" is still not last,
+            # which is the point.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "reduction", "parallel"],
+                               ["parallel", "reduction", "parallel", "parallel"],
                                doc="tt.reduce"),
         ),
     },

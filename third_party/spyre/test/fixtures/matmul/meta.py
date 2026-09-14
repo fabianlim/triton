@@ -351,11 +351,13 @@ VARIANTS = {
         "rtol":         1e-2,
         "extra_checks": lambda t: (
             t.assert_present("linalg.generic", doc="tt.dot"),
-            # Six loops: batch + M + N over four parallel loops, and a split K
-            # over two reductions, once the layout pass physicalizes the chain.
+            # Four loops: batch + M + N parallel, K the one reduction. This
+            # variant is UNANNOTATED (A/B/C_LAYOUT all None), so the chain stays
+            # logical and the loop nest is the logical rank -- unlike the
+            # bmm_spyre_stick variants below, where a split K adds a second
+            # reduction.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction", "reduction"],
+                               ["parallel", "parallel", "parallel", "reduction"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
@@ -531,14 +533,17 @@ VARIANTS = {
         # A[M,K] stick-on-K → phys [K//S, M, S] = [2, 64, 64]
         # B[K,N] stick-on-N → phys [N//S, K, S] = [4, 128, 64]
         # C[M,N] stick-on-N → phys [N//S, M, S] = [4, 64, 64]
-        # The K-stick loop is compiler-synthesized: A loads as [2,64,64],
-        # the scf.for over 2 K-sticks slices A and offsets into B's flat K dim.
+        # The K-stick loop is compiler-synthesized: A loads as [2,64,64] and the
+        # scf.for over 2 K-sticks offsets into B's flat K dim. A itself is not
+        # sliced -- its K split is folded into the dot generic's indexing maps,
+        # which is what the second reduction iterator below records.
         "tags": ["descriptor-load-static", "descriptor-store-static", "dot",
                  "program-id-1d", "spyre-tensor-layout"],
         "summary": (
             "Matmul with A stick-on-K, B/C stick-on-N. "
             "The K-stick loop is synthesized: A is loaded as a rank-3 "
-            "[K_sticks, M, lane] tile and iterated with extract_slice."
+            "[K_sticks, M, lane] tile whose stick split is folded into the dot "
+            "generic's indexing maps."
         ),
         "kernel_fn":    kernel.matmul_kernel,
         "SIGNATURE":    _SIG_SPYRE,
@@ -575,16 +580,27 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            # Five loops, not three: the layout pass physicalizes this chain, and
-            # a K split across sticks contributes TWO reduction loops (stick, elem)
-            # where the logical contraction had one. That second reduction is the
+            # Four loops, not three: the layout pass physicalizes this chain and
+            # folds the split into the generic's indexing maps. A's K is split
+            # across sticks, and a split K is the case that adds a SECOND
+            # reduction (stick, elem) where the logical contraction had one --
+            # M and N stay one parallel loop each. That second reduction is the
             # whole point of this variant, so it is asserted rather than elided.
             t.assert_iterators("linalg.generic",
                                ["parallel", "parallel", "parallel",
                                 "reduction", "reduction"],
                                doc="tt.dot"),
+            # The K-stick loop, whose trip count is the K-stick count.
             t.assert_present("scf.for"),
-            t.assert_present("tensor.insert_slice"),
+            # The store path materializes a PHYSICAL tile, which used to be
+            # spelled as a tensor.insert_slice into a bigger tile. The generic
+            # layout pass emits no slicing at all -- the split lives in the
+            # indexing maps -- so what pins the physicalization now is the
+            # memory-view type: A and C both come out
+            # <K_or_N_sticks, M=64, lane=64>, where a logical chain would have
+            # left them rank-2 <64x128>/<64x256>. Only the trailing pair is
+            # spelled because K and N sweep over the four param combos.
+            t.assert_result_type("ktdp.construct_memory_view", "x64x64xf16"),
         ),
     },
     "spyre_stick_parallel": {
@@ -611,13 +627,23 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            # Four loops, not three: a PARALLEL axis is split across sticks here,
-            # so the extra loop is parallel and K stays a single reduction --
-            # the mirror image of spyre_stick_k_reduction above.
+            # Five loops, not three: A's M and B/C's N are both split across
+            # sticks, and a split PARALLEL axis adds a PARALLEL loop while K
+            # stays a single reduction -- the mirror image of
+            # spyre_stick_k_reduction above, which splits K and gets a second
+            # reduction instead.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "reduction"],
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction"],
                                doc="tt.dot"),
-            t.assert_present("tensor.insert_slice"),  # store sink stage
+            # Was assert_present("tensor.insert_slice") for the store sink
+            # stage. The generic layout pass emits no slicing -- the stick split
+            # is folded into the indexing maps -- so the physical materialization
+            # is pinned by the memory-view type instead: every operand is
+            # <1 stick, 64, 64 lanes> where a logical chain would leave it
+            # rank-2 <64x64>.
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<1x64x64xf16>"),
         ),
     },
     "spyre_stick_parallel_dynamic": {
@@ -635,6 +661,20 @@ VARIANTS = {
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        # Same iterator claim as the static sibling -- two split parallel axes,
+        # one reduction -- but the physicalized views are dynamic: only the
+        # 64-wide lane dim stays a static extent, because the stick width follows
+        # from the dtype and not from M/K/N.
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction"],
+                               doc="tt.dot"),
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<?x?x64xf16>"),
+        ),
     },
     "spyre_stick_k": {
         # Case 2: A stick-on-K (split-K). A's K dim drives a reduction loop;
@@ -654,6 +694,27 @@ VARIANTS = {
             "B_LAYOUT": [[(1, "floordiv", _SS("b_ptr")), 0, (1, "mod", _SS("b_ptr"))]],
             "C_LAYOUT": [[(1, "floordiv", _SS("c_ptr")), 0, (1, "mod", _SS("c_ptr"))]],
         },
+        # Own checks rather than the base's. Despite the name, A_LAYOUT here
+        # splits dim 0 (M), a PARALLEL axis -- the base is the variant that
+        # splits A's K. So this is the parallel-split shape: the M and N splits
+        # each add a parallel loop and K stays one reduction, carried by the
+        # scf.for below rather than folded into the generic as a second one.
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction"],
+                               doc="tt.dot"),
+            # The K-stick reduction loop, trip count 2, carrying the accumulator
+            # as an iter_arg.
+            t.assert_present("scf.for"),
+            # Physicalized operands: every stickified extent is exactly one
+            # stick, so each view is <1, 64|128, 64 lanes> where a logical chain
+            # would leave it rank-2.
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<1x64x64xf16>"),
+        ),
     },
     "spyre_stick_k_dynamic": {
         # Dynamic-shape variant of spyre_stick_k: A stick-on-K with BLOCK_K=128
@@ -673,6 +734,20 @@ VARIANTS = {
         ),
         "constexpr":    ["BLOCK_M", "BLOCK_K", "BLOCK_N",
                          "A_LAYOUT", "B_LAYOUT", "C_LAYOUT"],
+        # Same iterator claim as the static sibling, but the physicalized views
+        # are dynamic: only the 64-wide lane dim survives as a static extent,
+        # since the stick width is a property of the dtype and not of M/K/N.
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction"],
+                               doc="tt.dot"),
+            t.assert_present("scf.for"),
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<?x?x64xf16>"),
+        ),
         "params":       {
             "M": [64], "K": [128], "N": [64],
             "BLOCK_M": [64], "BLOCK_K": [128], "BLOCK_N": [64],
@@ -718,7 +793,14 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+            # Six loops, not the logical four: the layout pass physicalizes this
+            # chain, and A's K is split across sticks. A split K is the case that
+            # adds a SECOND reduction (stick, elem); batch + M + N stay parallel,
+            # and B/C's stick-on-N at N == stick size contributes the fourth
+            # parallel loop.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction", "reduction"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
@@ -784,11 +866,18 @@ VARIANTS = {
                                ["parallel", "parallel", "parallel", "parallel",
                                 "reduction", "reduction"],
                                doc="tt.dot"),
-            # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S].
+            # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S]. This is
+            # the assertion that the two independent splits actually reached
+            # memory, and it is what the deleted tensor.insert_slice check used
+            # to say a second, weaker way.
             t.assert_result_type("ktdp.construct_memory_view", "2x2x2x64x64xf16"),
-            # Nested scf.for: outer M-stick scatter, inner K-stick reduction.
+            # The distribution loop. There is no longer a nested stick loop:
+            # both splits are folded into the generic's indexing maps (which the
+            # rank-5 view above and the six iterators above that pin), so the
+            # tensor.insert_slice that used to scatter M-sticks is gone with the
+            # scf.for that carried it -- nothing meaningful is left to assert at
+            # that site.
             t.assert_present("scf.for"),
-            t.assert_present("tensor.insert_slice"),
         ),
     },
     # --- Chained matmul: D = A @ (B @ C) with physical annotations ---
@@ -847,7 +936,14 @@ VARIANTS = {
                                ["parallel", "parallel", "parallel",
                                 "reduction", "reduction"],
                                doc="tt.dot"),
-            t.assert_present("tensor.insert_slice"),  # store sink stage
+            # Was assert_present("tensor.insert_slice") for the store sink
+            # stage. The generic layout pass emits no slicing -- each split is
+            # folded into the indexing maps -- so what pins the physical store
+            # is D's memory-view type: stick-on-N over N=256 at a 64-lane fp16
+            # stick gives [N/S, M, S] = 4x64x64, where a logical D would be
+            # rank-2 <64x256>.
+            t.assert_result_type("ktdp.construct_memory_view",
+                                 "memref<4x64x64xf16>"),
         ),
     },
 }
