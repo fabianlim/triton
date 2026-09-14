@@ -496,6 +496,32 @@ VARIANTS = {
         ),
         "kernel_fn":  kernel.reduce_middle_axis_spyre,
         "factory":    Reduce(shape="3d"),
+        # Numerically xfailed on a ktir-cpu limitation, not a lowering fault.
+        # Only in_ptr is annotated, so the output stays a logical [16, 64] with
+        # its 64-wide dim unsplit, while the input arrives physical [2,16,96,32].
+        # The generic bridges the two by folding the input's stick/lane pair back
+        # into the output's single axis as a COMPOSITE output map:
+        #   ins  (d0,d1,d2,d3) -> (d2, d0, d1, d3)
+        #   outs (d0,d1,d2,d3) -> (d0, d2 * 32 + d3)
+        # That op verifies as linalg and dataflow-scheduler-opt
+        # --ktir-legality-check accepts it, so the emission is fine. ktir-cpu is
+        # what cannot run it, and the gap is asymmetric: _gather_input has a
+        # general path that evaluates an affine map per index, so a composite on
+        # an *input* works, but _infer_iter_shape reads extents only from bare
+        # dim-refs and nothing performs the inverse fold when scattering to a
+        # composite *output*. So it derives (16,2,32) and cannot reconcile it
+        # with the real (16,64).
+        #
+        # strict, and raises= is pinned, so this flips to a failure the moment
+        # ktir-cpu grows the output-side scatter -- rather than silently
+        # absorbing some unrelated breakage in the meantime.
+        "xfail_numerical": {
+            "reason": "ktir-cpu cannot scatter into a composite output indexing "
+                      "map (d2 * 32 + d3); the emitted op is valid linalg and "
+                      "backend-legal",
+            "raises": ValueError,
+            "strict": True,
+        },
         "constexpr":  ["D0", "D1", "D2", "BLOCK_D0", "IN_LAYOUT", "OUT_LAYOUT",
                        "OP"],
         "params": {
