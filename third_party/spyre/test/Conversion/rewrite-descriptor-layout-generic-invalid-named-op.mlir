@@ -2,12 +2,17 @@
 
 // A decline must name the op, not surface as a verifier failure.
 //
-// LowerComputeOps still lowers tt.dot to a NAMED linalg.matmul, which is fixed at
-// logical rank and so cannot carry a stick dim. This pass rewrites only generics,
-// so it rejects the op up front, before Phase 1 retypes the load underneath it.
-// The ordering is the point: retyping first would leave a rank mismatch that
-// MLIR's own verifier reports against an indexing map, naming neither this pass
-// nor what it could not restate.
+// A named linalg op is fixed at logical rank and so cannot carry a stick dim.
+// This pass rewrites only generics, so it rejects such an op up front, before
+// Phase 1 retypes the load underneath it. The ordering is the point: retyping
+// first would leave a rank mismatch that MLIR's own verifier reports against an
+// indexing map, naming neither this pass nor what it could not restate.
+//
+// The named op is written out DIRECTLY rather than obtained by lowering a tt.dot.
+// LowerComputeOps used to emit a named linalg.matmul for tt.dot and now emits a
+// linalg.generic, so routing through tt.dot would no longer produce a named op at
+// all and this decline would go untested. Writing it by hand keeps the test about
+// the pass's own behaviour, and keeps it valid whatever the frontend emits.
 module {
 tt.func @named_matmul_declines(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f16>) {
   %c0_i32 = arith.constant 0 : i32
@@ -25,7 +30,7 @@ tt.func @named_matmul_declines(%a: !tt.ptr<f16>, %b: !tt.ptr<f16>, %c: !tt.ptr<f
   %cd = tt.make_tensor_descriptor %c, [%c128_i32, %c64_i32], [%c64_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
   %cv = tt.descriptor_load %cd[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16>
   // expected-error @below {{rewrite-descriptor-layout-generic: this op reads a value on a physicalized chain, but the rewrite restates only linalg.generic; spell this op as one}}
-  %d = tt.dot %av, %bv, %cv : tensor<128x64xf16> * tensor<64x64xf16> -> tensor<128x64xf16>
+  %d = linalg.matmul ins(%av, %bv : tensor<128x64xf16>, tensor<64x64xf16>) outs(%cv : tensor<128x64xf16>) -> tensor<128x64xf16>
   tt.descriptor_store %cd[%c0_i32, %c0_i32], %d : !tt.tensordesc<128x64xf16>, tensor<128x64xf16>
   tt.return
 }

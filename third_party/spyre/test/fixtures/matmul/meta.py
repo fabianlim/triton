@@ -351,7 +351,11 @@ VARIANTS = {
         "rtol":         1e-2,
         "extra_checks": lambda t: (
             t.assert_present("linalg.generic", doc="tt.dot"),
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+            # Six loops: batch + M + N over four parallel loops, and a split K
+            # over two reductions, once the layout pass physicalizes the chain.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction", "reduction"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
@@ -571,7 +575,13 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+            # Five loops, not three: the layout pass physicalizes this chain, and
+            # a K split across sticks contributes TWO reduction loops (stick, elem)
+            # where the logical contraction had one. That second reduction is the
+            # whole point of this variant, so it is asserted rather than elided.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel",
+                                "reduction", "reduction"],
                                doc="tt.dot"),
             t.assert_present("scf.for"),
             t.assert_present("tensor.insert_slice"),
@@ -601,7 +611,11 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+            # Four loops, not three: a PARALLEL axis is split across sticks here,
+            # so the extra loop is parallel and K stays a single reduction --
+            # the mirror image of spyre_stick_k_reduction above.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "reduction"],
                                doc="tt.dot"),
             t.assert_present("tensor.insert_slice"),  # store sink stage
         ),
@@ -759,10 +773,16 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            # Four loops, not five: "rank5" names the *physical* memory view, not
-            # the contraction. tt.dot still sees rank-3 logical operands
-            # (2x128x128 @ 2x128x64), so the loop nest is batch + M + N + K.
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "parallel", "reduction"],
+            # "rank5" names the *physical* memory view, and the loop nest is not
+            # the logical rank either: the layout pass splits dims across sticks,
+            # so batch + M + N give four parallel loops and a split K gives two
+            # reductions. An earlier version of this assertion read the LOGICAL
+            # rank-3 operands (2x128x128 @ 2x128x64) off the tt.dot and expected
+            # four loops; that is what the emission looks like BEFORE the layout
+            # pass, which is not what this variant exercises.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel", "parallel",
+                                "reduction", "reduction"],
                                doc="tt.dot"),
             # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S].
             t.assert_result_type("ktdp.construct_memory_view", "2x2x2x64x64xf16"),
@@ -818,7 +838,14 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
-            t.assert_iterators("linalg.generic", ["parallel", "parallel", "reduction"],
+            # Two chained dots, physicalized differently: the first splits K (two
+            # reductions), the second splits a parallel axis (four parallel, one
+            # reduction). assert_iterators passes when ANY matching op has the
+            # list, so this pins the split-K one; the second is covered by the
+            # scratchpad assertions below.
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "parallel",
+                                "reduction", "reduction"],
                                doc="tt.dot"),
             t.assert_present("tensor.insert_slice"),  # store sink stage
         ),
