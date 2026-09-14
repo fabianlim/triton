@@ -849,22 +849,6 @@ VARIANTS = {
         # presence check would fail on a kernel that is correct.
         "parallel":    False,
         "data_layout": "host",
-        # Still declared, and still red at dbo-opt -- but no longer for a reason
-        # in this fixture's own subject. The reduce here now emits the identity
-        # input map that ``one_tile`` asserts, so the numbering is right; what
-        # stops it is the SECOND compute. Two chained computes are split through
-        # HBM, and the spill buffer is allocated at the LOGICAL shape while the
-        # computes are physical, so a linearizing map ``(d0, d1) -> (d0 * 32 + d1)``
-        # gets folded onto the spill load and store and dbo-opt rejects it
-        # ("unsupported affine expression in operand indexing map for
-        # data_transfer size computation"). The four
-        # ``elementwise__1d_device_{chain,chain3,chain_grid2,dag}`` variants are red
-        # with the identical diagnostic on the identical ops, which is what says it
-        # is one bug in the spill and not a reduce story.
-        #
-        # Left declared rather than flipped to False: the field is what makes the
-        # gap visible in the device tier, and the shape it is waiting on is a
-        # decision about where the spill buffer lives, not about this variant.
         "compiles_to_binary": True,
         "reference":   run_sum_then_sqrt,
         "inputs":      make_inputs_positive_axis0,
@@ -874,6 +858,20 @@ VARIANTS = {
         # the fp16 sibling's: the elementwise-shaped tolerance is enough, and the
         # sqrt over the sum halves the relative error rather than growing it.
         "atol":        5e-2,
-        "extra_checks": None,
+        # This variant is the intersection of the two rules the numbering obeys,
+        # which is why both are claimed here and neither alone would do.
+        #
+        # The reduce's own claim is `one_tile`'s: the reduction loop sits at the
+        # axis it reduces. The second claim is about the value BETWEEN the two
+        # computes -- the reduced tensor, which carries no marker of its own. Left
+        # logical it is addressed `(d0, d1) -> (d0 * 32 + d1)` by both computes,
+        # which dbo-opt rejects; taking its layout from a neighbour makes every map
+        # here a projected permutation. Nothing about that is visible in a type, so
+        # the maps have to be what is asserted.
+        "extra_checks": lambda t: (
+            t.assert_reduction_loops_positional("linalg.generic", 0,
+                                                doc="tt.reduce"),
+            t.assert_operand_maps_are_projected_permutations("linalg.generic"),
+        ),
     },
 }

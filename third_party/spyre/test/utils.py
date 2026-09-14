@@ -477,6 +477,64 @@ class StructuralAssertions:
             + f"axis index (axis, loop) {seen}"
         )
 
+    def assert_operand_maps_are_projected_permutations(
+            self, op_name: str, *, doc: str = None, parent: str = None):
+        """Assert every indexing map of *op_name* is a projected permutation.
+
+        Projected permutation: every map result is a bare loop-dim reference, and
+        no two results of one map name the same loop. So each operand axis is one
+        loop dim and nothing else -- no composite ``stick * width + elem``, no
+        constant, no dim used twice.
+
+        A PROPERTY, like :meth:`assert_reduction_loops_positional`, and for the
+        same reason: a composite prints legally, verifies, and satisfies the
+        layout pass's own consistency guard, so pinning printed maps cannot tell a
+        composite from a projection. It only reports that the text changed -- which
+        is how a composite got recorded as expected output in two fixtures.
+
+        What is not free is this: dbo-opt's data-transfer size computation reads
+        extents off bare dim references only, and rejects the function outright
+        ("unsupported affine expression in operand indexing map") when an operand
+        map composes. Every tensor value in KTIR reaches memory through a
+        ``ktdp.load`` or a ``ktdp.store``, so this holds wherever a kernel is meant
+        to schedule.
+
+        NOT claimed universally, and it must not be: two markers can genuinely
+        disagree about which logical dim is split -- a matmul whose A is
+        stick-on-K and whose B holds K whole -- and then a composite is the correct
+        emission and this assertion would be false for a right answer. It belongs
+        on variants whose descriptors agree.
+
+        Unlike the assertions around it, this one holds for EVERY matching op
+        rather than for at least one: a claim that any single generic is clean says
+        nothing about the one that is not.
+        """
+        from triton._C.libtriton import spyre
+        matches = self._find(op_name, parent, doc=doc)
+        assert matches, (
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + " not found in KTIR"
+        )
+        bad = []
+        for o in matches:
+            maps = spyre.ir_utils.get_affine_map_array_attr(o._op, "indexing_maps")
+            if not maps:
+                bad.append((o.name, "no indexing_maps"))
+                continue
+            for i, entry in enumerate(maps):
+                dims = list(entry["result_dims"])
+                if any(k is None for k in dims):
+                    bad.append((i, entry["map_str"], "result is not a bare loop dim"))
+                elif len(set(dims)) != len(dims):
+                    bad.append((i, entry["map_str"], "a loop dim appears twice"))
+        assert not bad, (
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + f": indexing map is not a projected permutation "
+            + f"(operand, map, why) {bad}"
+        )
+
     def assert_affine_attr(self, op_name: str, attr_name: str, parent: str = None):
         """Assert at least one matching op has *attr_name* as an IntegerSet or AffineMap attribute."""
         from triton._C.libtriton import spyre

@@ -9,9 +9,20 @@
 //
 // The truncf between the contraction and the store is spelled as a generic, which
 // is what convert_elementwise_to_linalg produces; as a bare arith.truncf on a
-// tensor this pass declines it by name, since it rewrites only generics. It is
-// also what carries the result to the store's shape: the contraction's outs is an
-// unmarked splat constant, so it stays logical, and this generic re-sticks it.
+// tensor this pass declines it by name, since it rewrites only generics.
+//
+// It used to be the operand that re-sticked the result too: the contraction's
+// `outs` is an unmarked splat constant, so it stayed logical and both this generic
+// and the contraction addressed it with a composite. It no longer does. The splat
+// carries no values and has only this contraction as a user, so it can be given
+// the layout the truncf's marked `outs` prescribes, which physicalizes the
+// contraction's own result. The truncf is then a pure cast at the rank-4 identity.
+//
+// What that does NOT remove is B's composite: B holds K whole because its own
+// marker says so, and an operand holding a split dim whole addresses it as
+// `stick * 64 + lane` under any layout the other operands could take. That is the
+// residue a preference for physical realization cannot reach -- two markers
+// genuinely disagreeing -- and it is pinned here as such.
 //
 // Input produced from rewrite-descriptor-layout-batch-matmul.mlir by lowering to
 // pre-pass IR and running --linalg-morph-ops=named-to-generic. CHECK lines are
@@ -19,19 +30,18 @@
 // scf.for.
 
 // CHECK-DAG: #[[ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-// A splits K, and A's physical order is what places the two K loops, so A's map
-// comes out the rank-4 identity: (stick-K, batch, M, lane-K) in A's own order.
-// CHECK-DAG: #[[A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>
-// B holds K whole, so it is the operand that carries the composite.
-// CHECK-DAG: #[[B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d4, d1, d0 * 64 + d3, d5)>
-// The accumulator is an unmarked splat constant, so it stays logical and composes
-// the N split it does not carry.
-// CHECK-DAG: #[[ACC:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d4 * 64 + d5)>
-// The result copy is numbered from its own result, so its output map is the
-// rank-4 identity -- ID4 above, reused below rather than pinned again -- and the
-// composite for the N split lands on RESIN, the f32 accumulator that holds N
-// whole.
-// CHECK-DAG: #[[RESIN:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d2, d0 * 64 + d3)>
+// The accumulator now carries the N split, so the numbering is seeded from ITS
+// physical order -- (stick-N, batch, M, lane-N) -- and A's two K loops are
+// inserted around that. So A's map is a projection rather than the identity it was
+// while the accumulator was logical, and the two K loops are no longer adjacent to
+// A's own axes.
+// CHECK-DAG: #[[A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d2, d3, d4)>
+// B holds K whole, so it is the operand that carries the composite -- the only one
+// left.
+// CHECK-DAG: #[[B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d0 * 64 + d4, d5)>
+// The accumulator's map: a projection now, where it used to compose the N split it
+// did not carry.
+// CHECK-DAG: #[[ACC:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d3, d5)>
 
 // CHECK-LABEL: tt.func public @bmm_matmul_kernel
 // K=128 at stick 64 gives two sticks on A; N=64 gives one on B and on the output.
@@ -46,14 +56,15 @@
 // CHECK:         scf.for
 // CHECK:           ktdp.load %{{.*}} : <2x4x64x64xindex> -> tensor<2x4x64x64xf16>
 // CHECK:           ktdp.load %{{.*}} : <1x4x128x64xindex> -> tensor<1x4x128x64xf16>
-// Two reduction loops for the split K; batch, M and the N split are parallel. K
-// is not last in the numbering any more: it sits where A's physical order puts
-// it, which is what makes A's map the identity. The relation is unchanged -- the
-// substitution d4->d0, d0->d1, d1->d2, d5->d3, d2->d4, d3->d5 carries the old
-// triple of maps and iterators onto this one.
-// CHECK:           linalg.generic {indexing_maps = [#[[A]], #[[B]], #[[ACC]]], iterator_types = ["reduction", "parallel", "parallel", "reduction", "parallel", "parallel"]} ins(%{{.*}}, %{{.*}} : tensor<2x4x64x64xf16>, tensor<1x4x128x64xf16>) outs(%{{.*}} : tensor<4x64x64xf32>)
+// Two reduction loops for the split K; batch, M and the N split are parallel. The
+// counts are unchanged; the ORDER follows the accumulator's physical order now
+// that it has one, so the K stick loop leads and the K lane loop sits next to the
+// N lane loop rather than beside A's own axes.
+// CHECK:           linalg.generic {indexing_maps = [#[[A]], #[[B]], #[[ACC]]], iterator_types = ["reduction", "parallel", "parallel", "parallel", "reduction", "parallel"]} ins(%{{.*}}, %{{.*}} : tensor<2x4x64x64xf16>, tensor<1x4x128x64xf16>) outs(%{{.*}} : tensor<1x4x64x64xf32>)
 // CHECK:           tensor.empty() : tensor<1x4x64x64xf16>
-// CHECK:           linalg.generic {indexing_maps = [#[[RESIN]], #[[ID4]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<4x64x64xf32>) outs(%{{.*}} : tensor<1x4x64x64xf16>)
+// The truncf is now a pure cast: both operands are physical and both maps are the
+// rank-4 identity, where its input map used to compose the N split.
+// CHECK:           linalg.generic {indexing_maps = [#[[ID4]], #[[ID4]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x4x64x64xf32>) outs(%{{.*}} : tensor<1x4x64x64xf16>)
 // The store's data tile agrees with its access tile with no widening stage.
 // CHECK:           ktdp.store %{{.*}}, %{{.*}} : tensor<1x4x64x64xf16>, <1x4x64x64xindex>
 // No second loop, no slicing, and no marker survives.

@@ -67,6 +67,52 @@ def _make_2d_grid_checks(M, K, **_):
     return checks
 
 
+def _make_k_reduction_checks(K, BLOCK_K, **_):
+    """spyre_stick_k_reduction's checks, which branch on the K-block count.
+
+    Five loops either way -- the counts are the claim, and they do not move. What
+    moves is the ORDER, and it moves for a reason worth spelling: the numbering is
+    seeded from the result's own physical order, so it depends on whether the
+    accumulator has one.
+
+    With one K block there is no K loop, the accumulator is the splat constant the
+    generic writes, and it takes a layout from the operands that have one -- so the
+    result's physical order seeds the numbering and the split N loops bracket the
+    rest. With more than one, the accumulator is an ``scf.for`` iter_arg, which the
+    layout rewrite cannot restate (an ``scf.for``'s operands and results are
+    outside what it retypes), so it stays logical, composes, and the numbering
+    falls back to being seeded by the inputs.
+    """
+    one_k_block = K <= BLOCK_K
+    iterators = (["reduction", "parallel", "parallel", "reduction", "parallel"]
+                 if one_k_block else
+                 ["reduction", "parallel", "reduction", "parallel", "parallel"])
+
+    def checks(t):
+        t.assert_absent("tt.spyre_tensor_layout")
+        t.assert_present("linalg.generic", doc="tt.dot")
+        # Five loops, not the logical three: the layout pass physicalizes this
+        # chain and folds the splits into the generic's indexing maps. A's K is
+        # split across sticks, and a split K is the case that adds a SECOND
+        # reduction (stick, elem) where the logical contraction had one -- M and N
+        # stay one parallel loop each. That second reduction is the whole point of
+        # this variant, so it is asserted rather than elided. The order is pinned
+        # so an unintended renumbering is still visible; see the docstring for why
+        # it is not the same order in both arms.
+        t.assert_iterators("linalg.generic", iterators, doc="tt.dot")
+        # The K-stick loop, whose trip count is the K-stick count.
+        t.assert_present("scf.for")
+        # The store path materializes a PHYSICAL tile, which used to be spelled as
+        # a tensor.insert_slice into a bigger tile. The generic layout pass emits
+        # no slicing at all -- the split lives in the indexing maps -- so what pins
+        # the physicalization now is the memory-view type: A and C both come out
+        # <K_or_N_sticks, M=64, lane=64>, where a logical chain would have left
+        # them rank-2 <64x128>/<64x256>. Only the trailing pair is spelled because
+        # K and N sweep over the four param combos.
+        t.assert_result_type("ktdp.construct_memory_view", "x64x64xf16")
+    return checks
+
+
 # ---------------------------------------------------------------------------
 # Reference (NumPy oracle) + input makers
 # ---------------------------------------------------------------------------
@@ -577,36 +623,7 @@ VARIANTS = {
         "output_key":   "c_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        "extra_checks": lambda t: (
-            t.assert_absent("tt.spyre_tensor_layout"),
-            t.assert_present("linalg.generic", doc="tt.dot"),
-            # Four loops, not three: the layout pass physicalizes this chain and
-            # folds the split into the generic's indexing maps. A's K is split
-            # across sticks, and a split K is the case that adds a SECOND
-            # reduction (stick, elem) where the logical contraction had one --
-            # M and N stay one parallel loop each. That second reduction is the
-            # whole point of this variant, so it is asserted rather than elided.
-            # The ORDER is a consequence of the loop numbering, not of the
-            # contraction: a reduced dim is placed where the input's physical
-            # order puts it, so a reduction can land anywhere in the list. The
-            # counts are the claim; the order is pinned so an unintended
-            # renumbering is still visible.
-            t.assert_iterators("linalg.generic",
-                               ["reduction", "parallel", "reduction",
-                                "parallel", "parallel"],
-                               doc="tt.dot"),
-            # The K-stick loop, whose trip count is the K-stick count.
-            t.assert_present("scf.for"),
-            # The store path materializes a PHYSICAL tile, which used to be
-            # spelled as a tensor.insert_slice into a bigger tile. The generic
-            # layout pass emits no slicing at all -- the split lives in the
-            # indexing maps -- so what pins the physicalization now is the
-            # memory-view type: A and C both come out
-            # <K_or_N_sticks, M=64, lane=64>, where a logical chain would have
-            # left them rank-2 <64x128>/<64x256>. Only the trailing pair is
-            # spelled because K and N sweep over the four param combos.
-            t.assert_result_type("ktdp.construct_memory_view", "x64x64xf16"),
-        ),
+        "extra_checks": _make_k_reduction_checks,
     },
     "spyre_stick_parallel": {
         # Case 1: parallel sticks. A stick-on-M, B & C stick-on-N. No K
@@ -641,9 +658,11 @@ VARIANTS = {
             # contraction: a reduced dim is placed where the input's physical
             # order puts it, so a reduction can land anywhere in the list. The
             # counts are the claim; the order is pinned so an unintended
-            # renumbering is still visible.
+            # renumbering is still visible. It moved once the accumulator stopped
+            # being logical: the numbering is seeded from the result's own
+            # physical order, and the result now has one.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "reduction", "parallel", "parallel",
+                               ["parallel", "parallel", "reduction", "parallel",
                                 "parallel"],
                                doc="tt.dot"),
             # Was assert_present("tensor.insert_slice") for the store sink
@@ -827,10 +846,12 @@ VARIANTS = {
             # contraction: a reduced dim is placed where the input's physical
             # order puts it, so a reduction can land anywhere in the list. The
             # counts are the claim; the order is pinned so an unintended
-            # renumbering is still visible.
+            # renumbering is still visible. It moved once the accumulator stopped
+            # being logical: the numbering is seeded from the result's own
+            # physical order, and the result now has one.
             t.assert_iterators("linalg.generic",
-                               ["reduction", "parallel", "parallel", "reduction",
-                                "parallel", "parallel"],
+                               ["reduction", "parallel", "parallel", "parallel",
+                                "reduction", "parallel"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
@@ -858,13 +879,15 @@ VARIANTS = {
         # and the two the split K contributes -- but a different ORDER, because
         # these markers put M first and the numbering follows each operand's
         # physical order. Two variants that agreed on the order while the
-        # reduction was always numbered last no longer do.
+        # reduction was always numbered last no longer do. The order also moved
+        # once the accumulator stopped being logical, for the reason the base
+        # states.
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "reduction", "reduction",
-                                "parallel", "parallel"],
+                               ["parallel", "reduction", "parallel", "parallel",
+                                "reduction", "parallel"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),

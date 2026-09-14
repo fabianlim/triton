@@ -18,7 +18,8 @@
 //
 //   Phase 1  physicalize each annotated descriptor: memory view, access tiles,
 //            loads. Stores have their access tile redirected.
-//   Phase 2  one rewrite over generics and stores, applied greedily.
+//   Phase 2a settle which layout every value carries, to a fixpoint.
+//   Phase 2b one rewrite over generics and stores, applied greedily.
 //   Phase 3  erase the markers and their now-dead bridge casts.
 //
 //===----------------------------------------------------------------------===//
@@ -46,6 +47,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
+#include <list>
 #include <optional>
 
 #define DEBUG_TYPE "rewrite-descriptor-layout-generic"
@@ -76,6 +78,12 @@ using namespace mlir::triton::ktdp;
 struct CoordMap {
   ArrayRef<int64_t> src, op, arg;
   unsigned logicalRank = 0;
+  /// True when the arrays came off a marker, false when the rewrite derived them
+  /// from a neighbouring operand. Only the provenance differs — a derived layout
+  /// is used exactly like a marker's — but the two are not interchangeable as
+  /// *sources*: a marker is ground truth and is never overridden, a derivation is
+  /// an inference and is only ever recorded where there is nothing yet.
+  bool fromMarker = true;
 
   unsigned physRank() const { return src.size(); }
   CoordOp opAt(unsigned p) const { return static_cast<CoordOp>(op[p]); }
@@ -210,12 +218,103 @@ FailureOr<RankedTensorType> physicalTensorType(const CoordMap &cm,
 }
 
 //===----------------------------------------------------------------------===//
+// Deriving one operand's layout from another's
+//===----------------------------------------------------------------------===//
+
+/// A layout the rewrite derived rather than read off a marker, owning its arrays.
+/// A marker's live in its attributes; these have nowhere else to live.
+struct DerivedLayout {
+  SmallVector<int64_t> src, op, arg;
+  unsigned logicalRank = 0;
+  /// Operand the layout was projected from. Provenance, for the trace.
+  unsigned donorOperand = 0;
+};
+
+/// Restate `donor`'s layout over the logical dims of the operand `targetMap`
+/// addresses. Both maps are the generic's LOGICAL ones.
+///
+/// The indexing maps are the only thing relating two operands: donor logical dim
+/// `d` and target logical dim `t` name the same loop, so whatever the donor's
+/// layout does to `d` is what the target must do to `t`. The projection is the
+/// donor's physical order with the dims the target does not name dropped.
+///
+/// Declines rather than approximating when:
+///   - the donor broadcasts — a replication axis gets a fresh loop per operand,
+///     so it is not a piece the two can share;
+///   - either map addresses a dim by anything but a bare loop dim, or two dims of
+///     one operand share a loop — there is then no dim-to-dim correspondence;
+///   - a target dim is left uncovered — the projection would have to invent a
+///     physical position for it;
+///   - the projection is all-identity, so physical would equal logical;
+///   - the physical extents are not static, so nothing could be retyped to them.
+std::optional<DerivedLayout> projectLayout(const CoordMap &donor,
+                                           AffineMap donorMap,
+                                           AffineMap targetMap,
+                                           RankedTensorType targetType) {
+  unsigned targetRank = targetMap.getNumResults();
+  if (targetRank != (unsigned)targetType.getRank())
+    return std::nullopt;
+
+  DenseMap<unsigned, unsigned> targetDimOfLoop;
+  for (unsigned t = 0; t < targetRank; ++t) {
+    auto dim = dyn_cast<AffineDimExpr>(targetMap.getResult(t));
+    if (!dim || !targetDimOfLoop.try_emplace(dim.getPosition(), t).second)
+      return std::nullopt;
+  }
+
+  DerivedLayout out;
+  out.logicalRank = targetRank;
+  SmallVector<int64_t> claimedBy(targetRank, -1);
+  for (unsigned p = 0, e = donor.physRank(); p < e; ++p) {
+    if (donor.opAt(p) == CoordOp::Broadcast)
+      return std::nullopt;
+    int64_t d = donor.src[p];
+    auto dim = dyn_cast<AffineDimExpr>(donorMap.getResult(d));
+    if (!dim)
+      return std::nullopt;
+    auto it = targetDimOfLoop.find(dim.getPosition());
+    if (it == targetDimOfLoop.end())
+      continue; // the target names no dim on this loop
+    unsigned t = it->second;
+    if (claimedBy[t] >= 0 && claimedBy[t] != d)
+      return std::nullopt;
+    claimedBy[t] = d;
+    out.src.push_back(t);
+    out.op.push_back(donor.op[p]);
+    out.arg.push_back(donor.arg[p]);
+  }
+  if (llvm::is_contained(claimedBy, -1))
+    return std::nullopt;
+  if (llvm::all_of(out.op, [](int64_t o) {
+        return o == (int64_t)CoordOp::Identity;
+      }))
+    return std::nullopt;
+
+  SmallVector<int64_t> physShape;
+  if (!applyCoordMap(targetType.getShape(), out.src, out.op, out.arg, physShape))
+    return std::nullopt;
+  return out;
+}
+
+/// What becomes of an operand carrying no layout of its own.
+///
+/// Two outcomes today. A third — decline the function rather than compose — is
+/// where this is expected to go, which is why this is an enum and not a bool.
+enum class Realization {
+  /// Take a layout derived from a neighbouring operand and be physicalized.
+  Derived,
+  /// Stay logical, and let the rebuild fold the physical/logical conversion into
+  /// this operand's indexing map as a composite.
+  Composed,
+};
+
+//===----------------------------------------------------------------------===//
 // Phase 2's map rebuild
 //===----------------------------------------------------------------------===//
 
 /// One value's place in the rebuild: its logical indexing map, and the layout
-/// it is physicalized under. `layout` is null for a value that carries no
-/// marker and therefore stays logical.
+/// it is physicalized under. `layout` is null for a value that carries none and
+/// therefore stays logical.
 struct RebuildOperand {
   AffineMap logicalMap;
   const CoordMap *layout = nullptr;
@@ -562,13 +661,18 @@ struct RewriteDescriptorLayoutGenericPass
   bool hwDataLayout = false;
 
   /// The layout every physicalized value carries. Phase 1 seeds it from the
-  /// loads it retypes; Phase 2 reads it to decide what each generic operand's
-  /// physical type must be, and extends it to the results it retypes.
+  /// loads it retypes; Phase 2a settles the rest; Phase 2b reads it to decide
+  /// what each generic operand's physical type must be.
   ///
   /// Absence is meaningful: a value with no entry is not on a physicalized
   /// chain, so it stays logical and its map keeps its unsplit dims. That is
   /// what leaves an unannotated kernel untouched.
   DenseMap<Value, CoordMap> layoutOf;
+
+  /// Backing store for the layouts Phase 2a derives. Every CoordMap in
+  /// `layoutOf` is a view onto one of these, so the container has to keep its
+  /// elements' addresses stable as it grows — which a vector does not.
+  std::list<DerivedLayout> derivedLayouts;
 
   /// Logical construct_memory_view ops superseded in Phase 1. They cannot be
   /// erased there: the marker's bridge cast still holds them, and that cast
@@ -1322,14 +1426,194 @@ struct RewriteDescriptorLayoutGenericPass
   }
 
   /// Give `v` the layout `cm`, and report whether that is new information.
-  /// A value already carrying a layout keeps it: layouts come from markers, and
-  /// a second opinion about one would mean two markers disagree.
-  bool assignLayout(Value v, const CoordMap &cm) {
+  /// A value already carrying a layout keeps it: a marker-derived one is ground
+  /// truth, and a second opinion about it would mean two markers disagree; a
+  /// derived one is what makes the inference below a fixpoint rather than a loop.
+  ///
+  /// By value, not by reference: the argument is routinely another entry of
+  /// `layoutOf`, and inserting can rehash.
+  bool assignLayout(Value v, CoordMap cm) {
     return layoutOf.try_emplace(v, cm).second;
   }
 
+  /// Record a derived layout against `v`, and report whether that is new.
+  bool assignLayout(Value v, DerivedLayout &&derived) {
+    if (layoutOf.count(v))
+      return false;
+    derivedLayouts.push_back(std::move(derived));
+    const DerivedLayout &owned = derivedLayouts.back();
+    return assignLayout(v, CoordMap{owned.src, owned.op, owned.arg,
+                                    owned.logicalRank, /*fromMarker=*/false});
+  }
+
   //===--------------------------------------------------------------------===//
-  // The rewrite
+  // Phase 2a — settle the layouts
+  //===--------------------------------------------------------------------===//
+
+  /// Values a layout on `v` inevitably lands on too.
+  ///
+  /// A generic's `outs` operand and the result it backs share one type, so
+  /// realizing either realizes both, and the relation chains when a result is
+  /// itself an `outs`. Asking about `v` alone is what would let a layout derived
+  /// for a fresh `tensor.empty` arrive, through the result, at a store the
+  /// `tensor.empty`'s own users say nothing about.
+  SmallVector<Value> tiedValues(Value v) {
+    SmallVector<Value> worklist{v}, out;
+    SmallPtrSet<Value, 4> seen{v};
+    auto push = [&](Value n) {
+      if (n && seen.insert(n).second)
+        worklist.push_back(n);
+    };
+    while (!worklist.empty()) {
+      Value cur = worklist.pop_back_val();
+      out.push_back(cur);
+      if (auto g = cur.getDefiningOp<linalg::GenericOp>())
+        push(g.getDpsInitOperand(cast<OpResult>(cur).getResultNumber())->get());
+      for (OpOperand &use : cur.getUses())
+        if (auto g = dyn_cast<linalg::GenericOp>(use.getOwner()))
+          if (g.isDpsInit(&use))
+            push(g.getTiedOpResult(&use));
+    }
+    return out;
+  }
+
+  /// Can the IR carry a physical type for `v` at all?
+  ///
+  /// Structural, and about the ops around `v` rather than about any layout. The
+  /// producer has to be one `retypeToPhysical` can restate. Every user has to be
+  /// a generic: a `ktdp.store` pins its data tile to its access tile's shape, so
+  /// a value reaching an unmarked destination is held logical by that memory, and
+  /// any other user would be left naming the logical type. Asked of everything a
+  /// layout on `v` would reach, not of `v` alone.
+  bool canRealizePhysically(Value v) {
+    return llvm::all_of(tiedValues(v), [](Value t) {
+      if (!isa<RankedTensorType>(t.getType()))
+        return false;
+      Operation *def = t.getDefiningOp();
+      if (!isa_and_nonnull<linalg::GenericOp, tensor::EmptyOp>(def)) {
+        auto cst = dyn_cast_or_null<arith::ConstantOp>(def);
+        if (!cst || !isa<SplatElementsAttr>(cst.getValue()))
+          return false;
+      }
+      return llvm::all_of(
+          t.getUsers(), [](Operation *u) { return isa<linalg::GenericOp>(u); });
+    });
+  }
+
+  /// Does operand `targetIdx` acquire a derived layout, or stay logical?
+  ///
+  /// The single place that choice is made; nothing else re-decides it. It is
+  /// deliberately unconditional today — physical wherever the maps and the ops
+  /// permit — because a composite map is not schedulable at any point a value
+  /// reaches memory, and in KTIR every tensor value does. The expected next move
+  /// is a third `Realization` here, declining a function the projection cannot
+  /// reach rather than composing for it.
+  ///
+  /// `layouts` is read rather than `layoutOf` so a caller settling several
+  /// operands of one generic sees its own earlier answers.
+  std::pair<Realization, std::optional<DerivedLayout>>
+  realizationOf(linalg::GenericOp op, unsigned targetIdx,
+                ArrayRef<AffineMap> maps,
+                ArrayRef<const CoordMap *> layouts) {
+    Value target = op->getOperand(targetIdx);
+    if (layouts[targetIdx] || !canRealizePhysically(target))
+      return {Realization::Composed, std::nullopt};
+    auto targetTy = cast<RankedTensorType>(target.getType());
+    // Operand order, first donor that projects. A donor whose own layout was
+    // derived is admissible: a chain of computes needs its second link to take
+    // its layout from the first.
+    for (auto [donorIdx, donor] : llvm::enumerate(layouts)) {
+      if (!donor || donorIdx == targetIdx)
+        continue;
+      auto derived =
+          projectLayout(*donor, maps[donorIdx], maps[targetIdx], targetTy);
+      if (!derived)
+        continue;
+      derived->donorOperand = donorIdx;
+      return {Realization::Derived, std::move(derived)};
+    }
+    return {Realization::Composed, std::nullopt};
+  }
+
+  /// Settle every value's layout before anything is rewritten.
+  ///
+  /// Separate from the rewrite because the rewrite retypes each generic exactly
+  /// once, restating its maps over the physical domain — a layout arriving after
+  /// that has no way in, and the op is consistent so nothing re-fires. So the
+  /// inference runs to a fixpoint first and the rewrite sees every operand at
+  /// once.
+  ///
+  /// Two rules, in this order so a marker is never second-guessed:
+  ///   1. a store's access tile carries its destination's marker, and ktdp.store
+  ///      requires the data tile to match it;
+  ///   2. per generic: a result and the `outs` operand backing it hold one layout
+  ///      between them, and an operand with none takes one from a neighbour.
+  LogicalResult inferLayouts(ModuleOp module) {
+    module.walk([&](mlir::ktdp::StoreOp st) {
+      if (const CoordMap *cm = layoutFor(st.getAccessTile()))
+        assignLayout(st.getDataTile(), *cm);
+    });
+
+    SmallVector<linalg::GenericOp> generics;
+    module.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+
+    // Two steps per link of a chain — derive, then carry across the result — so
+    // the bound is twice the chain length. Exceeding it means a rule is not
+    // reaching a fixpoint, which is a bug rather than something to accept.
+    unsigned cap = 2 * generics.size() + 2;
+    for (unsigned round = 0; round < cap; ++round) {
+      bool changed = false;
+      for (linalg::GenericOp op : generics) {
+        // A result takes its type from the `outs` operand backing it, so a layout
+        // on either is a layout on both. This is what carries a store's
+        // requirement back onto the accumulator, and a derived layout forward off
+        // it to the next compute. Run on both sides of the derivation below, so a
+        // layout crosses a whole op per round rather than one operand.
+        auto shareResultWithInit = [&] {
+          for (auto [res, init] :
+               llvm::zip_equal(op.getResults(), op.getDpsInits())) {
+            if (const CoordMap *cm = layoutFor(res))
+              changed |= assignLayout(init, *cm);
+            else if (const CoordMap *cm = layoutFor(init))
+              changed |= assignLayout(res, *cm);
+          }
+        };
+        shareResultWithInit();
+
+        SmallVector<AffineMap> maps = op.getIndexingMapsArray();
+        SmallVector<const CoordMap *> layouts;
+        for (Value v : op->getOperands())
+          layouts.push_back(layoutFor(v));
+        for (unsigned i = 0, e = layouts.size(); i < e; ++i) {
+          auto [what, derived] = realizationOf(op, i, maps, layouts);
+          if (what != Realization::Derived)
+            continue;
+          // Read before the move; the trace is its only reader, so a build with
+          // LLVM_DEBUG compiled out leaves it unused.
+          unsigned donor = derived->donorOperand;
+          (void)donor;
+          if (!assignLayout(op->getOperand(i), std::move(*derived)))
+            continue;
+          layouts[i] = layoutFor(op->getOperand(i));
+          changed = true;
+          LLVM_DEBUG({
+            llvm::dbgs() << "    derived operand " << i << " of the generic at "
+                         << op.getLoc() << " from operand " << donor << ": ";
+            printCoordMap(llvm::dbgs(), *layouts[i]);
+            llvm::dbgs() << "\n";
+          });
+        }
+        shareResultWithInit();
+      }
+      if (!changed)
+        return success();
+    }
+    return module.emitError("rewrite-descriptor-layout-generic: layout "
+                            "inference did not reach a fixpoint");
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Phase 2b — the rewrite
   //===--------------------------------------------------------------------===//
 
   /// Rewrite one generic so that it is consistent: retype every operand and
@@ -1417,6 +1701,8 @@ struct RewriteDescriptorLayoutGenericPass
                      << physMaps[i];
         if (!o.layout)
           llvm::dbgs() << " (no layout, stays logical)";
+        else if (!o.layout->fromMarker)
+          llvm::dbgs() << " (derived layout)";
         llvm::dbgs() << "\n";
       }
       llvm::dbgs() << "      iterators [";
@@ -1788,7 +2074,13 @@ struct RewriteDescriptorLayoutGenericPass
         return signalPassFailure();
 
     LLVM_DEBUG(llvm::dbgs()
-               << "[rewrite-descriptor-layout-generic] Phase 2: greedy "
+               << "[rewrite-descriptor-layout-generic] Phase 2a: settling "
+               << "layouts\n");
+    if (failed(inferLayouts(module)))
+      return signalPassFailure();
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "[rewrite-descriptor-layout-generic] Phase 2b: greedy "
                << "rewrite\n");
     if (failed(runRewrite(module)))
       return signalPassFailure();

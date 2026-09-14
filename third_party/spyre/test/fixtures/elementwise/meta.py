@@ -1017,9 +1017,16 @@ VARIANTS = {
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        # Nothing shape-specific to assert beyond the shared structural suite; the
-        # numbers are what these check, on ktir_cpu and on the device.
-        "extra_checks": None,
+        # One claim, and it is about the value BETWEEN the two computes. No marker
+        # mentions it -- the two that exist pin the input and the output -- and left
+        # logical it is addressed ``(d0, d1) -> (d0 * 32 + d1)`` by both computes,
+        # which dbo-opt rejects. Taking its layout from a neighbour instead makes
+        # every map here a projected permutation. None of that shows in a type, so
+        # the maps are what is asserted; the numbers are the rest of the check.
+        # Inherited by the three chain/DAG variants below, which need the same one.
+        "extra_checks": lambda t: (
+            t.assert_operand_maps_are_projected_permutations("linalg.generic"),
+        ),
     },
     "1d_device_chain_grid2": {
         # The multi-core counterpart, the way 1d_device_grid2 is 1d_device's: two
@@ -1096,9 +1103,12 @@ VARIANTS = {
         "output_key":   "output_ptr",
         "rtol":         1e-2,
         "atol":         5e-2,
-        # Nothing shape-specific to assert beyond the shared structural suite; the
-        # numbers are what this checks, on ktir_cpu and on the device.
-        "extra_checks": None,
+        # Same claim as 1d_device_chain, and it says more here: this kernel has
+        # four unmarked intermediates rather than one, and one of them is read
+        # twice, so a layout has to reach every one of them.
+        "extra_checks": lambda t: (
+            t.assert_operand_maps_are_projected_permutations("linalg.generic"),
+        ),
     },
 
 }
