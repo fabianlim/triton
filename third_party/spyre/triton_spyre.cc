@@ -90,6 +90,20 @@ void init_triton_spyre_passes_ttir_to_ktdp(py::module &&m) {
             mlir::triton::ktdp::RewriteDescriptorLayoutOptions{data_layout}));
       },
       py::arg("pm"), py::arg("data_layout") = "device");
+  // The replacement for the pass above, reading each op's dim roles from a
+  // linalg.generic's own indexing maps rather than from its op class. Both are
+  // bound so a pipeline can select either: the named-op pass is only correct for
+  // IR that still carries named compute ops, which LowerComputeOps no longer
+  // emits, and keeping both reachable is what lets the two be compared on the
+  // same kernel.
+  m.def(
+      "add_rewrite_descriptor_layout_generic",
+      [](mlir::PassManager &pm, const std::string &data_layout) {
+        pm.addPass(mlir::triton::ktdp::createRewriteDescriptorLayoutGeneric(
+            mlir::triton::ktdp::RewriteDescriptorLayoutGenericOptions{
+                data_layout}));
+      },
+      py::arg("pm"), py::arg("data_layout") = "device");
   // Not in add_convert_ttir_to_ktdp above: this is a fix pass, spliced into the
   // pipeline from Python via SpyreOptions.required_fixes. It must be anchored on
   // convert_elementwise_to_linalg, which is the pass that creates the ins/outs

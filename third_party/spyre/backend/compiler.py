@@ -131,14 +131,47 @@ def infer_base_addresses_from_ptr_types(mod) -> Tuple[int, ...]:
     return _segment_addresses(mod.get_function_signature(mod.get_function(entry)))
 
 
+# Which layout pass the core pipeline installs.
+#
+# "generic" (the default) reads each op's dim roles from a linalg.generic's own
+# indexing maps; "named" is the older pass that dispatches on op class. The
+# default is "generic" because LowerComputeOps emits every compute op as a
+# linalg.generic, and the named pass has no rule for one -- it reports the op it
+# cannot physicalize and the pipeline aborts. The named pass is kept selectable
+# so the two can be compared on the same kernel, and so IR that still carries
+# named compute ops (hand-written, or from another producer) has a path.
+#
+# Read from the environment rather than SpyreOptions because it selects a pass
+# rather than parameterising one: it is a migration switch, not a compile knob,
+# and nothing about the emitted artifact depends on which name is used once the
+# two agree.
+_LAYOUT_PASS_VARIANT = os.environ.get("TRITON_SPYRE_LAYOUT_PASS", "generic")
+
+_LAYOUT_PASSES = {
+    "generic": "rewrite_descriptor_layout_generic",
+    "named": "rewrite_descriptor_layout",
+}
+
+if _LAYOUT_PASS_VARIANT not in _LAYOUT_PASSES:
+    raise ValueError(
+        f"TRITON_SPYRE_LAYOUT_PASS={_LAYOUT_PASS_VARIANT!r} is not a layout "
+        f"pass; expected one of {sorted(_LAYOUT_PASSES)}"
+    )
+
+_LAYOUT_PASS = _LAYOUT_PASSES[_LAYOUT_PASS_VARIANT]
+
 # The TTIR→KTIR core pass sequence, as binding names on
 # spyre.passes.ttir_to_ktdp.
+#
+# Doubles as the set of legal `required_fixes` anchors, so the layout entry here
+# is the name a fix anchors on -- see the required_fixes default below, which
+# uses _LAYOUT_PASS for exactly that reason.
 _CORE_PIPELINE_PASSES = (
     "lower_descriptor_memory",
     "lower_scalar_load",
     "lower_compute_ops",
     "lower_inter_tile",
-    "rewrite_descriptor_layout",
+    _LAYOUT_PASS,
     "convert_functions",
 )
 
@@ -150,6 +183,7 @@ _PASS_OPTIONS = {
     "distribute_work": ("grid",),
     "materialize_base_addresses": ("base_addresses",),
     "rewrite_descriptor_layout": ("data_layout",),
+    "rewrite_descriptor_layout_generic": ("data_layout",),
     "convert_ttir_to_ktdp": ("data_layout",),
 }
 
@@ -482,14 +516,31 @@ class SpyreBackend(BaseBackend):
         # explicit override of a specific anchor still wins, but a caller that
         # passes nothing still gets them.
         #
-        # The anchor is rewrite_descriptor_layout, not lower_compute_ops.
-        # lower_compute_ops builds a linalg.generic with logical types before the
-        # layout pass physicalizes the descriptor to its stick shape; the types then
-        # disagree and the pipeline aborts.  rewrite_descriptor_layout runs after
-        # that physicalization, so the fixes see consistent types.
+        # Where these two anchor depends on which layout pass is installed, and
+        # the two variants want opposite answers.
+        #
+        # The generic pass restates a compute op by rebuilding a linalg.generic's
+        # indexing maps at physical rank, so it requires every compute op to
+        # ALREADY be a generic. A tensor-typed arith op is not one until
+        # convert_elementwise_to_linalg runs, so anchoring that fix after the
+        # layout pass leaves the layout pass looking at a bare `arith.addf` and it
+        # declines -- "the rewrite restates only linalg.generic". Hence
+        # lower_compute_ops: the fixes run between the emission and the layout
+        # pass, which is the window where the all-generic invariant holds.
+        #
+        # The named pass is the opposite. It retypes an elementwise chain
+        # structurally and does not need the arith ops converted first; running
+        # the conversion early instead hands it a generic it has no rule for,
+        # whose logical types then disagree with the physicalized descriptor.
+        # Hence the layout pass itself, so the fixes see already-consistent types.
+        #
+        # _LAYOUT_PASS rather than a literal in the named case, because a bad
+        # anchor is silently ignored and the fix never runs.
+        _fix_anchor = ("lower_compute_ops" if _LAYOUT_PASS_VARIANT == "generic"
+                       else _LAYOUT_PASS)
         parsed["required_fixes"] = {
-            "convert_elementwise_to_linalg": "rewrite_descriptor_layout",
-            "unalias_linalg_outs":           "rewrite_descriptor_layout",
+            "convert_elementwise_to_linalg": _fix_anchor,
+            "unalias_linalg_outs":           _fix_anchor,
             **parsed.get("required_fixes", {}),
         }
         return SpyreOptions(**parsed)
