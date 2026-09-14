@@ -414,6 +414,69 @@ class StructuralAssertions:
             + f": expected iterator_types {list(iterators)}, found {seen}"
         )
 
+    def assert_reduction_loops_positional(self, op_name: str, operand_idx: int, *,
+                                          doc: str = None, parent: str = None):
+        """Assert every REDUCTION loop this operand names sits at its own axis index.
+
+        For result position ``p`` of the *operand_idx*-th ``indexing_maps`` entry:
+        if that result is a bare loop-dim reference ``dK`` and loop ``K`` is a
+        reduction, then ``K == p``.
+
+        This states a PROPERTY, and that is the whole reason it exists rather than
+        a check that pins the printed map.
+
+        A linalg loop domain is defined only up to relabelling, so a generic's
+        maps have many equally valid spellings and every one of them prints,
+        verifies and executes. Pinning the text cannot distinguish a right answer
+        from a wrong one -- it only reports that the answer changed, which is how a
+        bad numbering once got recorded as expected output.
+
+        What is NOT free is this narrower thing. Downstream, the scheduler's
+        ``ReductionLoopExposurePass`` substitutes a loop index for an operand axis
+        index, and that substitution is sound only for the reduction dim: a
+        reduction loop moved off its own axis index makes the pass narrow the wrong
+        physical dim, and the diagnostic then names a tensor type that appears in no
+        input module. (The scheduler's KTIR frontend handles the permutation
+        correctly; the later pass discards that, so this is a defect being filed
+        upstream rather than a rule we were wrong to violate.)
+
+        Deliberately NOT "the map is the identity". Permuted maps are legal and are
+        required by the transpose cases; a full reversal of a reduce's operand maps
+        gets a correctly computed slice out of that same pass. Permuting the
+        PARALLEL dims must stay possible, so only the reduction dims are claimed.
+        A composite result (``stick * width + elem``) names no single loop and is
+        skipped: it is the operand holding a split dim whole, not a substitution.
+        """
+        from triton._C.libtriton import spyre
+        matches = self._find(op_name, parent, doc=doc)
+        assert matches, (
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + " not found in KTIR"
+        )
+        seen = []
+        for o in matches:
+            maps = spyre.ir_utils.get_affine_map_array_attr(o._op, "indexing_maps")
+            iters = spyre.ir_utils.get_str_array_attr(o._op, "iterator_types")
+            if not maps or not iters or operand_idx >= len(maps):
+                seen.append((maps, iters))
+                continue
+            entry = maps[operand_idx]
+            displaced = [
+                (p, k) for p, k in enumerate(entry["result_dims"])
+                if k is not None and k < len(iters)
+                and iters[k] == "reduction" and k != p
+            ]
+            if not displaced:
+                return
+            seen.append((entry["map_str"], list(iters), displaced))
+        raise AssertionError(
+            f"Op '{op_name}'"
+            + (f" with doc '{doc}'" if doc else "")
+            + f": indexing map {operand_idx} puts a reduction loop off its own "
+            + f"axis index (axis, loop) {seen}"
+        )
+
     def assert_affine_attr(self, op_name: str, attr_name: str, parent: str = None):
         """Assert at least one matching op has *attr_name* as an IntegerSet or AffineMap attribute."""
         from triton._C.libtriton import spyre

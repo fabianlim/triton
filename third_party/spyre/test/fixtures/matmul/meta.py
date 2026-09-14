@@ -586,9 +586,14 @@ VARIANTS = {
             # reduction (stick, elem) where the logical contraction had one --
             # M and N stay one parallel loop each. That second reduction is the
             # whole point of this variant, so it is asserted rather than elided.
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel",
-                                "reduction", "reduction"],
+                               ["reduction", "parallel", "reduction",
+                                "parallel", "parallel"],
                                doc="tt.dot"),
             # The K-stick loop, whose trip count is the K-stick count.
             t.assert_present("scf.for"),
@@ -632,9 +637,14 @@ VARIANTS = {
             # stays a single reduction -- the mirror image of
             # spyre_stick_k_reduction above, which splits K and gets a second
             # reduction instead.
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction"],
+                               ["parallel", "reduction", "parallel", "parallel",
+                                "parallel"],
                                doc="tt.dot"),
             # Was assert_present("tensor.insert_slice") for the store sink
             # stage. The generic layout pass emits no slicing -- the stick split
@@ -668,9 +678,14 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction"],
+                               ["parallel", "reduction", "parallel", "parallel",
+                                "parallel"],
                                doc="tt.dot"),
             t.assert_result_type("ktdp.construct_memory_view",
                                  "memref<?x?x64xf16>"),
@@ -702,9 +717,14 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction"],
+                               ["parallel", "reduction", "parallel", "parallel",
+                                "parallel"],
                                doc="tt.dot"),
             # The K-stick reduction loop, trip count 2, carrying the accumulator
             # as an iter_arg.
@@ -740,9 +760,14 @@ VARIANTS = {
         "extra_checks": lambda t: (
             t.assert_absent("tt.spyre_tensor_layout"),
             t.assert_present("linalg.generic", doc="tt.dot"),
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction"],
+                               ["parallel", "reduction", "parallel", "parallel",
+                                "parallel"],
                                doc="tt.dot"),
             t.assert_present("scf.for"),
             t.assert_result_type("ktdp.construct_memory_view",
@@ -798,9 +823,14 @@ VARIANTS = {
             # adds a SECOND reduction (stick, elem); batch + M + N stay parallel,
             # and B/C's stick-on-N at N == stick size contributes the fourth
             # parallel loop.
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction", "reduction"],
+                               ["reduction", "parallel", "parallel", "reduction",
+                                "parallel", "parallel"],
                                doc="tt.dot"),
             t.assert_absent("tt.dot"),
         ),
@@ -824,6 +854,20 @@ VARIANTS = {
             # C[B,M,N] stick-on-N (dim 2): phys [M, N/S, B, N%S]
             "C_LAYOUT": [[1, (2, "floordiv", _SB("c_ptr")), 0, (2, "mod", _SB("c_ptr"))]],
         },
+        # Own claim rather than the base's. Same counts -- four parallel loops
+        # and the two the split K contributes -- but a different ORDER, because
+        # these markers put M first and the numbering follows each operand's
+        # physical order. Two variants that agreed on the order while the
+        # reduction was always numbered last no longer do.
+        "extra_checks": lambda t: (
+            t.assert_absent("tt.spyre_tensor_layout"),
+            t.assert_present("linalg.generic", doc="tt.dot"),
+            t.assert_iterators("linalg.generic",
+                               ["parallel", "parallel", "reduction", "reduction",
+                                "parallel", "parallel"],
+                               doc="tt.dot"),
+            t.assert_absent("tt.dot"),
+        ),
     },
     # BMM with two independent stick splits on A: M (parallel) and K
     # (reduction), giving a rank-5 physical view. Numerical counterpart of the
@@ -862,9 +906,14 @@ VARIANTS = {
             # rank-3 operands (2x128x128 @ 2x128x64) off the tt.dot and expected
             # four loops; that is what the emission looks like BEFORE the layout
             # pass, which is not what this variant exercises.
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel", "parallel",
-                                "reduction", "reduction"],
+                               ["parallel", "parallel", "reduction", "parallel",
+                                "reduction", "parallel"],
                                doc="tt.dot"),
             # A physicalizes to the rank-5 view [M/S, K/S, B, M%S, K%S]. This is
             # the assertion that the two independent splits actually reached
@@ -932,9 +981,14 @@ VARIANTS = {
             # reduction). assert_iterators passes when ANY matching op has the
             # list, so this pins the split-K one; the second is covered by the
             # scratchpad assertions below.
+            # The ORDER is a consequence of the loop numbering, not of the
+            # contraction: a reduced dim is placed where the input's physical
+            # order puts it, so a reduction can land anywhere in the list. The
+            # counts are the claim; the order is pinned so an unintended
+            # renumbering is still visible.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "parallel", "parallel",
-                                "reduction", "reduction"],
+                               ["reduction", "parallel", "reduction",
+                                "parallel", "parallel"],
                                doc="tt.dot"),
             # Was assert_present("tensor.insert_slice") for the store sink
             # stage. The generic layout pass emits no slicing -- each split is

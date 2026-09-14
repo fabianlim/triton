@@ -19,14 +19,14 @@
 // scf.for.
 
 // CHECK-DAG: #[[ID4:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-// A splits K, so it names the two K loops (d4, d5) as a plain projected
-// permutation.
-// CHECK-DAG: #[[A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d4, d0, d1, d5)>
+// A splits K, and A's physical order is what places the two K loops, so A's map
+// comes out the rank-4 identity: (stick-K, batch, M, lane-K) in A's own order.
+// CHECK-DAG: #[[A:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>
 // B holds K whole, so it is the operand that carries the composite.
-// CHECK-DAG: #[[B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d2, d0, d4 * 64 + d5, d3)>
+// CHECK-DAG: #[[B:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d4, d1, d0 * 64 + d3, d5)>
 // The accumulator is an unmarked splat constant, so it stays logical and composes
 // the N split it does not carry.
-// CHECK-DAG: #[[ACC:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2 * 64 + d3)>
+// CHECK-DAG: #[[ACC:.+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d4 * 64 + d5)>
 // The result copy is numbered from its own result, so its output map is the
 // rank-4 identity -- ID4 above, reused below rather than pinned again -- and the
 // composite for the N split lands on RESIN, the f32 accumulator that holds N
@@ -46,8 +46,12 @@
 // CHECK:         scf.for
 // CHECK:           ktdp.load %{{.*}} : <2x4x64x64xindex> -> tensor<2x4x64x64xf16>
 // CHECK:           ktdp.load %{{.*}} : <1x4x128x64xindex> -> tensor<1x4x128x64xf16>
-// Two reduction loops for the split K; batch, M and the N split are parallel.
-// CHECK:           linalg.generic {indexing_maps = [#[[A]], #[[B]], #[[ACC]]], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%{{.*}}, %{{.*}} : tensor<2x4x64x64xf16>, tensor<1x4x128x64xf16>) outs(%{{.*}} : tensor<4x64x64xf32>)
+// Two reduction loops for the split K; batch, M and the N split are parallel. K
+// is not last in the numbering any more: it sits where A's physical order puts
+// it, which is what makes A's map the identity. The relation is unchanged -- the
+// substitution d4->d0, d0->d1, d1->d2, d5->d3, d2->d4, d3->d5 carries the old
+// triple of maps and iterators onto this one.
+// CHECK:           linalg.generic {indexing_maps = [#[[A]], #[[B]], #[[ACC]]], iterator_types = ["reduction", "parallel", "parallel", "reduction", "parallel", "parallel"]} ins(%{{.*}}, %{{.*}} : tensor<2x4x64x64xf16>, tensor<1x4x128x64xf16>) outs(%{{.*}} : tensor<4x64x64xf32>)
 // CHECK:           tensor.empty() : tensor<1x4x64x64xf16>
 // CHECK:           linalg.generic {indexing_maps = [#[[RESIN]], #[[ID4]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<4x64x64xf32>) outs(%{{.*}} : tensor<1x4x64x64xf16>)
 // The store's data tile agrees with its access tile with no widening stage.

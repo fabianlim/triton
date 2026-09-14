@@ -9,11 +9,17 @@
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1) -> (d0, d1)>
-// Four loop dims: d0 = row (parallel), d1/d2 = the split K's stick and lane
-// halves (both reduction), d3 = the broadcast lane axis. d3 is absent from the
-// input map and present in the output map -- that asymmetry IS the case.
-// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d0, d2)>
-// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d3)>
+// Four loop dims: d0/d2 = the split K's stick and lane halves (both reduction),
+// d1 = row (parallel), d3 = the broadcast lane axis. d3 is absent from the input
+// map and present in the output map -- that asymmetry IS the case.
+//
+// K is reduced, so the result names neither of its halves and the input's
+// physical order is what places them -- which is why the input's map is the
+// identity and the result's is (d1, d3) rather than (d0, d3). The result's own
+// two pieces still appear in its own order; they are simply no longer a prefix
+// of the domain.
+// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3) -> (d1, d3)>
 // CHECK: #[[$ATTR_4:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 
@@ -52,7 +58,7 @@ module {
 // CHECK:           %[[VAL_13:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_14:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_2]], %[[VAL_13]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_5]]} : memref<256x64xf32> -> !ktdp.access_tile<256x64xindex>
 // CHECK:           %[[VAL_15:.*]] = tensor.empty() : tensor<256x64xf32>
-// CHECK:           %[[VAL_16:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]]], iterator_types = ["parallel", "reduction", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x256x64xf32>) outs(%[[VAL_15]] : tensor<256x64xf32>) {
+// CHECK:           %[[VAL_16:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]]], iterator_types = ["reduction", "parallel", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x256x64xf32>) outs(%[[VAL_15]] : tensor<256x64xf32>) {
 // CHECK:           ^bb0(%[[VAL_17:.*]]: f32, %[[VAL_18:.*]]: f32):
 // CHECK:             %[[VAL_19:.*]] = arith.addf %[[VAL_17]], %[[VAL_18]] : f32
 // CHECK:             linalg.yield %[[VAL_19]] : f32

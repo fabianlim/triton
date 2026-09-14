@@ -7,10 +7,9 @@
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3, d2)>
-// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
-// CHECK: #[[$ATTR_4:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
-// CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+// CHECK: #[[$ATTR_3:.+]] = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+// CHECK: #[[$ATTR_4:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic | FileCheck %s
 
 // Case 4a -- reduction OFF the stick axis.
@@ -20,6 +19,20 @@
 // any other case, and the reduced dim is simply absent from the output map. No
 // reduce-specific rule -- what makes this a reduction is the iterator kind the
 // input already carries, and the rebuild inherits it.
+//
+// The property to read here is WHERE the reduction loop sits: the input's map
+// sends loop d2 to axis 2, the axis it reduces. The result never names the
+// reduced dim, so the result's physical order cannot number it; the input's order
+// can, and does -- the reduced dim lands at the position the input's physical
+// order gives it. Numbering it last instead states the same relation with the
+// input's last two dims transposed, putting the reduction loop at an axis that is
+// not its own: legal linalg, prints fine, and the scheduler's
+// ReductionLoopExposurePass then substitutes a loop index for the wrong axis.
+//
+// That the map comes out the identity here is a consequence, not the claim.
+// -transpose-split.mlir and reduce/meta.py's middle_axis_spyre_stick are cases
+// where an operand map legitimately permutes; permuting the PARALLEL dims is
+// free, and only the reduction dims are constrained.
 
 #in  = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 #out = affine_map<(d0, d1, d2) -> (d0, d2)>
@@ -32,22 +45,22 @@ module {
 // CHECK-SAME:  %[[VAL_0:.*]]: !tt.ptr<f32>, %[[VAL_1:.*]]: !tt.ptr<f32>) {
 // CHECK:           %[[VAL_2:.*]] = arith.constant 0 : index
 // CHECK:           %[[VAL_3:.*]] = builtin.unrealized_conversion_cast %[[VAL_0]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [2, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64x64xf32>
+// CHECK:           %[[VAL_4:.*]] = ktdp.construct_memory_view %[[VAL_3]], sizes: [2, 2, 64, 64], strides: [8192, 4096, 64, 1] {coordinate_set = #[[$ATTR_3]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64x64xf32>
 // CHECK:           %[[VAL_5:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_6:.*]] = arith.divsi %[[VAL_2]], %[[VAL_5]] : index
 // CHECK:           %[[VAL_7:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_8:.*]] = arith.remsi %[[VAL_2]], %[[VAL_7]] : index
-// CHECK:           %[[VAL_9:.*]] = ktdp.construct_access_tile %[[VAL_4]]{{\[}}%[[VAL_6]], %[[VAL_2]], %[[VAL_2]], %[[VAL_8]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_4]]} : memref<2x2x64x64xf32> -> !ktdp.access_tile<2x2x64x64xindex>
+// CHECK:           %[[VAL_9:.*]] = ktdp.construct_access_tile %[[VAL_4]]{{\[}}%[[VAL_6]], %[[VAL_2]], %[[VAL_2]], %[[VAL_8]]] {access_tile_order = #[[$ATTR_0]], access_tile_set = #[[$ATTR_3]]} : memref<2x2x64x64xf32> -> !ktdp.access_tile<2x2x64x64xindex>
 // CHECK:           %[[VAL_10:.*]] = ktdp.load %[[VAL_9]] : <2x2x64x64xindex> -> tensor<2x2x64x64xf32>
 // CHECK:           %[[VAL_11:.*]] = builtin.unrealized_conversion_cast %[[VAL_1]] : !tt.ptr<f32> to index
-// CHECK:           %[[VAL_12:.*]] = ktdp.construct_memory_view %[[VAL_11]], sizes: [2, 2, 64], strides: [128, 64, 1] {coordinate_set = #[[$ATTR_5]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64xf32>
+// CHECK:           %[[VAL_12:.*]] = ktdp.construct_memory_view %[[VAL_11]], sizes: [2, 2, 64], strides: [128, 64, 1] {coordinate_set = #[[$ATTR_4]], memory_space = #ktdp.memory_space<global>} : memref<2x2x64xf32>
 // CHECK:           %[[VAL_13:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_14:.*]] = arith.divsi %[[VAL_2]], %[[VAL_13]] : index
 // CHECK:           %[[VAL_15:.*]] = arith.constant 64 : index
 // CHECK:           %[[VAL_16:.*]] = arith.remsi %[[VAL_2]], %[[VAL_15]] : index
-// CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]], %[[VAL_2]], %[[VAL_16]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_5]]} : memref<2x2x64xf32> -> !ktdp.access_tile<2x2x64xindex>
+// CHECK:           %[[VAL_17:.*]] = ktdp.construct_access_tile %[[VAL_12]]{{\[}}%[[VAL_14]], %[[VAL_2]], %[[VAL_16]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_4]]} : memref<2x2x64xf32> -> !ktdp.access_tile<2x2x64xindex>
 // CHECK:           %[[VAL_18:.*]] = tensor.empty() : tensor<2x2x64xf32>
-// CHECK:           %[[VAL_19:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]]], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%[[VAL_10]] : tensor<2x2x64x64xf32>) outs(%[[VAL_18]] : tensor<2x2x64xf32>) {
+// CHECK:           %[[VAL_19:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_2]]], iterator_types = ["parallel", "parallel", "reduction", "parallel"]} ins(%[[VAL_10]] : tensor<2x2x64x64xf32>) outs(%[[VAL_18]] : tensor<2x2x64xf32>) {
 // CHECK:           ^bb0(%[[VAL_20:.*]]: f32, %[[VAL_21:.*]]: f32):
 // CHECK:             %[[VAL_22:.*]] = arith.addf %[[VAL_20]], %[[VAL_21]] : f32
 // CHECK:             linalg.yield %[[VAL_22]] : f32

@@ -223,6 +223,48 @@ void init_triton_spyre_ir_utils(py::module &&m) {
           return out;
         });
 
+  // get_affine_map_array_attr: an ArrayAttr of AffineMapAttr as a list of
+  // dicts, one per map, carrying the printed form plus which loop dim each
+  // result position names.
+  //
+  // `indexing_maps` on a linalg.generic is that kind of attribute. `result_dims`
+  // is what makes a caller able to state a claim about the map's STRUCTURE
+  // rather than about its text: entry `p` is the loop dim of result position `p`
+  // when that result is a bare dim reference, and None when it is anything else
+  // — a composite `stick * width + elem`, or a constant. Answered by MLIR rather
+  // than by a regex over the printed map, and deliberately not accompanied by an
+  // `is_identity` flag: identity-ness is not the property any consumer needs,
+  // and offering it would invite a test that over-claims (permuted maps are
+  // legal, and the transpose cases require them).
+  m.def("get_affine_map_array_attr",
+        [](mlir::Operation &self, const std::string &name) -> py::object {
+          auto arr = self.getAttrOfType<mlir::ArrayAttr>(name);
+          if (!arr)
+            return py::none();
+          py::list out;
+          for (mlir::Attribute a : arr) {
+            auto ma = mlir::dyn_cast<mlir::AffineMapAttr>(a);
+            if (!ma)
+              return py::none();
+            mlir::AffineMap map = ma.getValue();
+            std::string str;
+            llvm::raw_string_ostream os(str);
+            map.print(os);
+            py::list resultDims;
+            for (mlir::AffineExpr e : map.getResults()) {
+              if (auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(e))
+                resultDims.append(py::int_(dim.getPosition()));
+              else
+                resultDims.append(py::none());
+            }
+            py::dict d;
+            d["map_str"] = str;
+            d["result_dims"] = resultDims;
+            out.append(d);
+          }
+          return out;
+        });
+
   // Introspect the type of a result value.  Returns a dict with keys that
   // depend on the type kind.  For any ShapedType (tensor, memref, …):
   //   {"type_str": "memref<1024xf16>", "shape": [1024], "elem_type": "f16"}

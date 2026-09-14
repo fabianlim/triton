@@ -536,8 +536,8 @@ VARIANTS = {
         # its 64-wide dim unsplit, while the input arrives physical [2,16,96,32].
         # The generic bridges the two by folding the input's stick/lane pair back
         # into the output's single axis as a COMPOSITE output map:
-        #   ins  (d0,d1,d2,d3) -> (d2, d0, d1, d3)
-        #   outs (d0,d1,d2,d3) -> (d0, d2 * 32 + d3)
+        #   ins  (d0,d1,d2,d3) -> (d1, d0, d2, d3)
+        #   outs (d0,d1,d2,d3) -> (d0, d1 * 32 + d3)
         # That op verifies as linalg and dataflow-scheduler-opt
         # --ktir-legality-check accepts it, so the emission is fine. ktir-cpu is
         # what cannot run it, and the gap is asymmetric: _gather_input has a
@@ -585,14 +585,31 @@ VARIANTS = {
             # Four loops, not the logical three: stick-on-D2 splits a PARALLEL
             # axis, and a split parallel axis adds a PARALLEL loop while the
             # reduced D1 stays a single reduction. The loops are numbered off the
-            # generic's own maps, not off the physical tile, so the list reads
-            # parallel(D0), reduction(D1), parallel(D2 stick), parallel(D2 lane)
-            # -- the input map (d0,d1,d2,d3) -> (d2,d0,d1,d3) permutes them onto
-            # the physical [D2/S, D0, D1, S]. "reduction" is still not last,
-            # which is the point.
+            # operands' PHYSICAL orders, so the list reads parallel(D2 stick),
+            # parallel(D0), reduction(D1), parallel(D2 lane) -- the input's
+            # physical [D2/S, D0, D1, S] read straight off, which is what makes
+            # the input map the identity. "reduction" is still not last, which is
+            # the point.
             t.assert_iterators("linalg.generic",
-                               ["parallel", "reduction", "parallel", "parallel"],
+                               ["parallel", "parallel", "reduction", "parallel"],
                                doc="tt.reduce"),
+            # The property the Level D sibling below turns a binary on, asserted
+            # here too and on a harder shape: the reduced dim sits in the MIDDLE of
+            # a rank-4 physical order, and the input map is NOT the identity --
+            # (d1, d0, d2, d3), because the unannotated output's own dim order
+            # [D0, D2] and the input's physical [D2/S, D0, D1, S] genuinely
+            # disagree about whether D0 or D2's stick comes first, and the result
+            # is what fixes the frame. That parallel-dim transposition is fine.
+            # What matters is that the reduction loop d2 stays at axis 2, the axis
+            # it reduces -- which is exactly what placing the reduced dim by the
+            # input's physical order buys, and what appending it last would break.
+            #
+            # Worth asserting here as well as at Level D because this arm runs in
+            # the ordinary tier -- no dbo-opt needed -- so a renumbering is caught
+            # without the tool, where the device tier would only say "exit 1". And
+            # it is the case that shows the claim is not a disguised identity
+            # check: this map permutes and passes.
+            t.assert_reduction_loops_positional("linalg.generic", 0, doc="tt.reduce"),
         ),
     },
 
@@ -718,6 +735,30 @@ VARIANTS = {
             # device story turns on. `parallel: False` above says there is no
             # distribution loop; this says there is no stick loop either.
             t.assert_absent("scf.for"),
+            # THE property this variant's binary depends on, and the one no
+            # FileCheck test in this repo can guard.
+            #
+            # A loop domain is defined only up to relabelling, so this reduce has
+            # several equally valid spellings and all of them verify and print.
+            # `ins (d0, d2, d1)` / `outs (d0, d1)` with iterators
+            # [parallel, parallel, reduction] is one of them, and it is what
+            # RewriteDescriptorLayoutGeneric emitted while it numbered the reduced
+            # dim LAST. dbo-opt stops on it, in ReductionLoopExposurePass, which
+            # substitutes a loop index for an operand axis index -- sound only
+            # while the reduction loop is AT the axis it reduces. There the
+            # reduction is loop d2 sitting at axis 1, so the wrong physical dim is
+            # narrowed and the report names a tensor type that is in no input
+            # module. A lit test pins the printed maps, and both forms print
+            # legally -- which is exactly how the permuted form got recorded as
+            # expected output.
+            #
+            # Note what is NOT claimed. Not "the input map is the identity":
+            # permuted maps are legal, that same pass slices a fully reversed
+            # version of this reduce correctly, and the transpose cases need the
+            # permutation. Only the reduction loops are pinned to their own axes;
+            # the rest of the numbering stays free, which is what lets `outs` be
+            # (d0, d2) here without the assertion caring.
+            t.assert_reduction_loops_positional("linalg.generic", 0, doc="tt.reduce"),
         ),
     },
 
@@ -756,6 +797,15 @@ VARIANTS = {
         # (3.2 ulp) is already generous. Inheriting the sibling's 0.25 would
         # check it 20x looser than it needs for no reason.
         "atol":        5e-2,
+        # Inherits the sibling's checks, including its reduction-axis claim, and
+        # that is worth a word because this arm's input map is
+        # ``(d0, d1 * 64 + d3, d2)`` -- not a permutation at all. Folding N
+        # destroys the stick structure, so the output descriptor re-sticks M while
+        # the INPUT holds M whole, and an operand holding whole a dim the domain
+        # splits addresses it as ``stick * width + elem``. The claim still holds:
+        # the reduction loops are N's two halves, d0 and d2, and they sit at axes 0
+        # and 2. The composite at axis 1 names no single loop and is skipped, which
+        # is the right answer -- it is not a substitution site.
     },
     "one_tile_then_sqrt": {
         # A reduce with an elementwise op after it: two computes, the second
@@ -799,6 +849,22 @@ VARIANTS = {
         # presence check would fail on a kernel that is correct.
         "parallel":    False,
         "data_layout": "host",
+        # Still declared, and still red at dbo-opt -- but no longer for a reason
+        # in this fixture's own subject. The reduce here now emits the identity
+        # input map that ``one_tile`` asserts, so the numbering is right; what
+        # stops it is the SECOND compute. Two chained computes are split through
+        # HBM, and the spill buffer is allocated at the LOGICAL shape while the
+        # computes are physical, so a linearizing map ``(d0, d1) -> (d0 * 32 + d1)``
+        # gets folded onto the spill load and store and dbo-opt rejects it
+        # ("unsupported affine expression in operand indexing map for
+        # data_transfer size computation"). The four
+        # ``elementwise__1d_device_{chain,chain3,chain_grid2,dag}`` variants are red
+        # with the identical diagnostic on the identical ops, which is what says it
+        # is one bug in the spill and not a reduce story.
+        #
+        # Left declared rather than flipped to False: the field is what makes the
+        # gap visible in the device tier, and the shape it is waiting on is a
+        # decision about where the spill buffer lives, not about this variant.
         "compiles_to_binary": True,
         "reference":   run_sum_then_sqrt,
         "inputs":      make_inputs_positive_axis0,

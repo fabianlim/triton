@@ -7,9 +7,9 @@
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d3, d0, d4)>
-// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d1, d3 * 64 + d4, d2)>
-// CHECK: #[[$ATTR_4:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1 * 64 + d2)>
+// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
+// CHECK: #[[$ATTR_3:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d3, d0 * 64 + d2, d4)>
+// CHECK: #[[$ATTR_4:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d1, d3 * 64 + d4)>
 // CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // CHECK: #[[$ATTR_6:.+]] = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 // RUN: spyre-triton-opt %s --rewrite-descriptor-layout-generic | FileCheck %s
@@ -26,6 +26,11 @@
 //
 // The output descriptor carries no marker, so the result stays logical by design
 // and its map names only the unsplit dims, composing the split ones.
+//
+// K is reduced, so its two halves are placed by A's physical order rather than
+// appended, which makes A's map the identity. B and the result are unchanged up
+// to the relabelling that follows: substituting d3->d0, d0->d1, d4->d2, d1->d3,
+// d2->d4 into the previous three maps yields these.
 //
 // Input produced from rewrite-descriptor-layout-matmul.mlir Test 1
 // (@matmul_single_stick) by lowering to pre-pass IR and running
@@ -62,7 +67,7 @@ module {
 // CHECK:           %[[VAL_21:.*]] = ktdp.construct_memory_view %[[VAL_20]], sizes: [64, 64], strides: [64, 1] {coordinate_set = #[[$ATTR_6]], memory_space = #ktdp.memory_space<global>} : memref<64x64xf32>
 // CHECK:           %[[VAL_22:.*]] = ktdp.construct_access_tile %[[VAL_21]]{{\[}}%[[VAL_3]], %[[VAL_3]]] {access_tile_order = #[[$ATTR_1]], access_tile_set = #[[$ATTR_6]]} : memref<64x64xf32> -> !ktdp.access_tile<64x64xindex>
 // CHECK:           %[[VAL_23:.*]] = ktdp.load %[[VAL_22]] : <64x64xindex> -> tensor<64x64xf32>
-// CHECK:           %[[VAL_24:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]], #[[$ATTR_4]]], iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%[[VAL_11]], %[[VAL_19]] : tensor<1x64x64xf32>, tensor<1x64x64xf32>) outs(%[[VAL_23]] : tensor<64x64xf32>) {
+// CHECK:           %[[VAL_24:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_3]], #[[$ATTR_4]]], iterator_types = ["reduction", "parallel", "reduction", "parallel", "parallel"]} ins(%[[VAL_11]], %[[VAL_19]] : tensor<1x64x64xf32>, tensor<1x64x64xf32>) outs(%[[VAL_23]] : tensor<64x64xf32>) {
 // CHECK:           ^bb0(%[[VAL_25:.*]]: f32, %[[VAL_26:.*]]: f32, %[[VAL_27:.*]]: f32):
 // CHECK:             %[[VAL_28:.*]] = arith.mulf %[[VAL_25]], %[[VAL_26]] : f32
 // CHECK:             %[[VAL_29:.*]] = arith.addf %[[VAL_27]], %[[VAL_28]] : f32
