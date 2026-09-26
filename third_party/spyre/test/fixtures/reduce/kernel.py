@@ -521,7 +521,8 @@ def softmax_on_stick(
     Python ``1.0`` is an fp32 scalar.
 
     THE NUMERATOR BEING EXACTLY ONE IS LOAD-BEARING and must stay that way:
-    ``LowerSpyreOps`` matches a numerator of one and emits the UNARY
+    ``CombineSpyreOps`` matches a numerator of one and rewrites the
+    ``spyreop.realdiv`` ``LowerSpyreOps`` emitted into the UNARY
     ``spyreop.reciprocal``, so no float immediate reaches the device. Rewriting
     this group in any way that keeps the constant alive changes the answer -- see
     the variant's banner in ``meta.py``.

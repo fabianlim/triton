@@ -1,9 +1,10 @@
 // Declarations for the TTIR -> KTIR conversions, in namespace
-// mlir::triton::spyre.  One of three Passes.h under third_party/spyre: this one
-// for passes that cross a dialect boundary, Dialect/KTDP/Transforms/ for those
-// whose subject is ktdp's own abstractions -- the only one in
-// mlir::triton::ktdp -- and Transforms/ for the rest.  The criterion and the
-// per-pass contracts are in the Passes.td beside this file.
+// mlir::triton::spyre.  One of five Passes.h under third_party/spyre: this one
+// for passes that cross a dialect boundary, one per dialect whose own
+// abstractions are a pass's subject -- Dialect/KTDP/Transforms/,
+// Dialect/SpyreOp/Transforms/ and Dialect/TTS/Transforms/, each in that
+// dialect's own namespace -- and Transforms/ for the rest.  The criterion and
+// the per-pass contracts are in the Passes.td beside this file.
 
 #ifndef TRITON_SPYRE_CONVERSION_TRITONTOKTIR_PASSES_H
 #define TRITON_SPYRE_CONVERSION_TRITONTOKTIR_PASSES_H

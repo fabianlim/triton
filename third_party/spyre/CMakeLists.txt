@@ -21,9 +21,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
   # MLIRLinalgTransforms is for this file's own
   # createConvertElementwiseToLinalgPass, which the plugin exposes as
   # add_convert_elementwise_to_linalg.  
-  # The three pass libraries stay named: unlike spyre-triton-opt, this file
-  # reaches individual create*Pass factories, not just the registration entry
-  # point.
+  # The pass libraries stay named: unlike spyre-triton-opt, this file reaches
+  # individual create*Pass factories, not just the registration entry point.
   #
   # TTSIR is for the one op builder this file exposes to the frontend. Reached
   # transitively through SpyreRegisterEverything, but named because
@@ -38,7 +37,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
     LINK_LIBS SpyreRegisterEverything
               SpyrePipeline
-              TritonToKTIR KTDPTransforms SpyreTransforms
+              TritonToKTIR KTDPTransforms SpyreOpTransforms SpyreTransforms
               TTSIR
               # getDescriptorLogicalLayout, for the descriptor-layout query.
               SpyreUtils

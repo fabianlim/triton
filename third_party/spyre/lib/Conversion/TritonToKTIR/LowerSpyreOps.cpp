@@ -12,9 +12,15 @@
 // convertible and an unsupported type (e.g. f64) is reported as illegal
 // rather than left alone.
 //
-// arith.divf has two targets rather than one: a numerator of constant 1
-// becomes the unary spyreop.reciprocal and everything else the binary
-// spyreop.realdiv.
+// ONE RULE PER OP, and no policy: this pass decides which op a computation
+// becomes, never which of two spyreop spellings of the same computation the
+// device prefers. arith.divf therefore has one target, spyreop.realdiv, whatever
+// its numerator is. The preference for the unary spyreop.reciprocal when that
+// numerator is one is CombineSpyreOps', in Dialect/SpyreOp/Transforms -- a
+// different question, answerable only once the numerator is in the form the
+// preference is stated over, and so with a position of its own. Held here as a
+// pattern instead, the two shared one position and moving this pass moved the
+// preference with it.
 //
 // arith.addi/arith.muli are different: plain scalar integer add/mul is used
 // throughout a kernel for loop indices, offsets, and tile addressing, not
@@ -37,7 +43,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -125,9 +130,12 @@ struct ConvertMathRsqrt : public OpConversionPattern<math::RsqrtOp> {
 };
 
 //===----------------------------------------------------------------------===//
-// arith.divf -> spyreop.realdiv, or spyreop.reciprocal when the numerator is 1
+// arith.divf -> spyreop.realdiv
 //===----------------------------------------------------------------------===//
 
+/// Unconditional on the numerator, per ONE RULE PER OP in the header: a constant
+/// one is not a different lowering, it is a reason to prefer a different spyreop
+/// spelling, and CombineSpyreOps holds that preference.
 struct ConvertArithDivF : public OpConversionPattern<arith::DivFOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -136,20 +144,6 @@ struct ConvertArithDivF : public OpConversionPattern<arith::DivFOp> {
                   ConversionPatternRewriter &rewriter) const override {
     if (!isSpyreOpScalarType(op.getType()))
       return failure();
-    // A numerator of one becomes the UNARY intrinsic, so no float immediate
-    // reaches the device at all. Matched through m_OneFloat, which accepts a
-    // scalar float constant or a splat, so no shape is assumed here.
-    if (matchPattern(adaptor.getLhs(), m_OneFloat())) {
-      // The numerator's own op goes with it when the divide was its only
-      // reader. Guarded, because a CSE'd constant may have another.
-      Operation *numerator = adaptor.getLhs().getDefiningOp();
-      bool sole = numerator && adaptor.getLhs().hasOneUse();
-      rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
-                                                       adaptor.getRhs());
-      if (sole)
-        rewriter.eraseOp(numerator);
-      return success();
-    }
     rewriter.replaceOpWithNewOp<spyreop::RealDiv>(
         op, op.getType(), adaptor.getLhs(), adaptor.getRhs());
     return success();

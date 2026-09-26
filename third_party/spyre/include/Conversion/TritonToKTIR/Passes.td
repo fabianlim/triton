@@ -145,8 +145,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
         - math.exp   (operand f16 or f32)        → spyreop.exp
         - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
-        - arith.divf (operand f16 or f32)        → spyreop.realdiv,
-          or spyreop.reciprocal when the numerator is a constant 1.0
+        - arith.divf (operand f16 or f32)        → spyreop.realdiv
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
@@ -160,11 +159,18 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         they are left legal, quietly, since ConvertElementwiseToLinalg (not
         this pass) is what will eventually scalarize them.
 
-        arith.divf splits on its NUMERATOR as well as its type: a numerator
-        of one goes to the UNARY spyreop.reciprocal, so no float immediate
-        reaches the device at all. Matched by value with m_OneFloat, which
-        accepts a scalar float constant or a splat. No other value is
-        special-cased.
+        ONE RULE PER OP, and no policy. This pass decides which op a scalar
+        computation becomes; it does not decide which of two spyreop spellings
+        of the SAME computation the device prefers. So arith.divf has one
+        target whatever its numerator is, and the preference for the unary
+        spyreop.reciprocal when that numerator is a constant one belongs to
+        [CombineSpyreOps], in Dialect/SpyreOp/Transforms/Passes.td. The two are
+        separable because they are separate questions, and worth separating
+        because they have different correct POSITIONS: the preference is stated
+        over a numerator already folded into the generic's body, which is
+        FoldDataMovementGenerics' doing, while this pass only needs
+        ConvertElementwiseToLinalg. Held here as a pattern, the two shared one
+        position, and moving this pass moved the preference with it.
 
         arith.addi/arith.muli are different: plain scalar integer add/mul is
         also used throughout a kernel for loop indices, offsets, and tile
@@ -180,8 +186,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         tensor-typed and left alone, never reaching its spyreop intrinsic.
 
         Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
-        scalar type (a divf by a constant-1.0 numerator leaving its constant
-        behind, dead, for the pipeline's own cleanup); no arith.addi/muli at
+        scalar type; no arith.addi/muli at
         a supported bit-width remains
         inside a linalg.generic. The corresponding spyreop intrinsic is
         introduced in its place. Everything else -- unsupported types or

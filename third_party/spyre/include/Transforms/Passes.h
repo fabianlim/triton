@@ -1,10 +1,11 @@
 // Declarations for transforms on upstream structure or the whole program, in
-// namespace mlir::triton::spyre.  One of three Passes.h under
-// third_party/spyre: this one for passes that are about neither a dialect
-// boundary nor ktdp's own abstractions, Conversion/TritonToKTIR/ for the former
-// (also mlir::triton::spyre), Dialect/KTDP/Transforms/ for the latter (the one
-// namespace mlir::triton::ktdp).  The criterion and the per-pass contracts are
-// in the Passes.td beside this file.
+// namespace mlir::triton::spyre.  One of five Passes.h under
+// third_party/spyre, and the residual one: this is for passes that are about
+// neither a dialect boundary nor any one dialect's own abstractions.
+// Conversion/TritonToKTIR/ holds the former (also mlir::triton::spyre), and
+// Dialect/KTDP/Transforms/, Dialect/SpyreOp/Transforms/ and
+// Dialect/TTS/Transforms/ the latter, each in its dialect's own namespace.  The
+// criterion and the per-pass contracts are in the Passes.td beside this file.
 
 #ifndef TRITON_SPYRE_TRANSFORMS_PASSES_H
 #define TRITON_SPYRE_TRANSFORMS_PASSES_H

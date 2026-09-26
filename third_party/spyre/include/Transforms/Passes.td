@@ -102,10 +102,14 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
 
         1. It rewrites WITHIN upstream dialects — source and target both
            upstream ops. Crossing a dialect boundary is a conversion and
-           belongs in Conversion/, not here — which is why the reciprocal
-           peephole, arith.divf → spyreop.reciprocal, sits in LowerSpyreOps.
-           Rule 1 draws the line by what a rewrite touches, not by what
-           motivates it.
+           belongs in Conversion/; a rewrite with spyreop on BOTH sides is that
+           dialect's own peephole and belongs in
+           Dialect/SpyreOp/Transforms/. The reciprocal is the worked example of
+           the second, and of why rule 1 draws the line by what a rewrite
+           touches rather than by what motivates it: its motive is a device
+           behaviour, exactly like the patterns here, but the rewrite it
+           produces is spyreop.realdiv → spyreop.reciprocal, so it is
+           [CombineSpyreOps]'.
         2. The input is VALID IR that some downstream consumer refuses or
            mis-lowers, not a defect being fixed. A defect is a bug in whatever
            produced it, and patching it here hides that.

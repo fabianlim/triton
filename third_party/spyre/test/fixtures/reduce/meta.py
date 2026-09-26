@@ -1287,10 +1287,19 @@ VARIANTS = {
     #
     # THE RECIPROCAL GROUP CARRIES NO FLOAT IMMEDIATE, and that is load-bearing:
     # ``tl.fdiv(one, s)`` lowers to the UNARY ``spyreop.reciprocal``, not to
-    # ``spyreop.realdiv`` with a ``1.0`` operand, because LowerSpyreOps matches a
-    # numerator of one and drops it. A float immediate reaching the device is not
-    # read back as it was written, so this kernel must not be rewritten in a way
-    # that keeps the constant alive.
+    # ``spyreop.realdiv`` with a ``1.0`` operand. A float immediate reaching the
+    # device is not read back as it was written, so this kernel must not be
+    # rewritten in a way that keeps the constant alive.
+    #
+    # Two passes get it there, and the second has a precondition the first does
+    # not: LowerSpyreOps emits ``spyreop.realdiv`` unconditionally, and
+    # CombineSpyreOps rewrites it to the unary form -- but only when the ``1.0``
+    # is a constant VISIBLE FROM THE DIVIDE. What makes it one is
+    # FoldDataMovementGenerics, whose elementwise fusion folds the splat's
+    # producer into the generic's body; before that pass the numerator is a block
+    # argument and the combiner declines. So this variant is also the end-to-end
+    # cover for that ordering edge, and a regression shows up here as a numerical
+    # answer rather than as a diagnostic.
     "softmax_on_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",

@@ -275,3 +275,32 @@ tt.func @muli_i32_outside_generic_survives(%a: i32, %b: i32) -> i32 {
   tt.return %0 : i32
 }
 }
+
+// -----
+
+// ONE RULE PER OP: a numerator of constant 1.0 gets the SAME target as any other
+// numerator, constant and all. Preferring the unary spyreop.reciprocal here is a
+// different question -- which of two spyreop spellings of one computation the
+// device wants -- and CombineSpyreOps answers it, in
+// test/Dialect/SpyreOp/CombineSpyreOps/reciprocal.mlir. This case is the
+// observable half of that split: before it was made, this input left the pass
+// with a reciprocal and no constant.
+//
+// Last in the file rather than beside @divf_f32 on purpose. The generated checks
+// capture each module's affine_map definitions at the END of the preceding
+// module's block, so a case inserted between two of them breaks a capture chain
+// it has nothing to do with.
+module {
+// CHECK-LABEL:   tt.func @divf_one_over_x_f32(
+// CHECK-SAME:  %[[VAL_0:.*]]: f32) -> f32 {
+// CHECK-NOT:       spyreop.reciprocal
+// CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
+// CHECK:           %[[VAL_2:.*]] = spyreop.realdiv %[[VAL_1]], %[[VAL_0]] : f32
+// CHECK:           tt.return %[[VAL_2]] : f32
+// CHECK:         }
+tt.func @divf_one_over_x_f32(%x: f32) -> f32 {
+  %one = arith.constant 1.0 : f32
+  %0 = arith.divf %one, %x : f32
+  tt.return %0 : f32
+}
+}

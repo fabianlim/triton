@@ -1,10 +1,11 @@
-// Declarations for transforms on KTDP's own abstractions.  One of three
-// Passes.h under third_party/spyre, and the only one in namespace
-// mlir::triton::ktdp -- it earns the dialect's name because the dialect is its
-// subject: ktdp memory views and access tiles.  Conversion/TritonToKTIR/ holds
-// those that cross a dialect boundary and Transforms/ the rest, both in
-// mlir::triton::spyre.  The criterion and the per-pass contracts are in the
-// Passes.td beside this file.
+// Declarations for transforms on KTDP's own abstractions.  One of five
+// Passes.h under third_party/spyre, and the first of the three in a dialect's
+// own namespace (mlir::triton::ktdp, as Dialect/SpyreOp/Transforms/ is in
+// mlir::triton::spyreop and Dialect/TTS/Transforms/ in mlir::triton::tts) -- it
+// earns the dialect's name because the dialect is its subject: ktdp memory views
+// and access tiles.  Conversion/TritonToKTIR/ holds those that cross a dialect
+// boundary and Transforms/ the rest, both in mlir::triton::spyre.  The criterion
+// and the per-pass contracts are in the Passes.td beside this file.
 
 #ifndef TRITON_SPYRE_DIALECT_KTDP_TRANSFORMS_PASSES_H
 #define TRITON_SPYRE_DIALECT_KTDP_TRANSFORMS_PASSES_H

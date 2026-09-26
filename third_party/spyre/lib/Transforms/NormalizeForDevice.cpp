@@ -10,8 +10,12 @@
 //
 //   1. Source and target are both upstream ops (arith, linalg, tensor, scf,
 //      ...). Crossing a dialect boundary is a conversion and belongs in
-//      Conversion/ -- which is why the reciprocal peephole, arith.divf ->
-//      spyreop.reciprocal, sits in LowerSpyreOps and not here.
+//      Conversion/; a rewrite with spyreop on BOTH sides is that dialect's own
+//      peephole and belongs in Dialect/SpyreOp/Transforms/. The reciprocal is
+//      the worked example of the second, and of why the line is drawn by what a
+//      rewrite touches rather than by what motivates it: the motive is a device
+//      behaviour, exactly like the patterns here, but the rewrite it produces is
+//      spyreop.realdiv -> spyreop.reciprocal, so it is CombineSpyreOps'.
 //   2. The input is valid IR that a downstream consumer refuses or mis-lowers,
 //      not a defect. A defect is a bug in whatever produced it, and patching it
 //      here hides that.

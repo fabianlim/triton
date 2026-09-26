@@ -1,7 +1,7 @@
 //===- Pipeline.cpp - The Spyre backend's compile stages as pipelines -----===//
 //
 // The pass lists, once. Each per-pass ordering constraint is stated by the pass
-// itself, in the Passes.td of whichever of the three libraries it belongs to;
+// itself, in the Passes.td of whichever of the five libraries it belongs to;
 // what is recorded here is only what the *sequence* has to get right, which no
 // single pass can say.
 //
@@ -11,6 +11,7 @@
 
 #include "Conversion/TritonToKTIR/Passes.h"
 #include "Dialect/KTDP/Transforms/Passes.h"
+#include "Dialect/SpyreOp/Transforms/Passes.h"
 #include "Dialect/TTS/Transforms/Passes.h"
 #include "Transforms/Passes.h"
 
@@ -181,6 +182,11 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // behaviour it changes -- left in place, a data-movement generic has no layout
   // marker, so that pass leaves its result logical and bridges the gap with a
   // linearizing operand map the scheduler cannot project loop IVs through.
+  //
+  // A third neighbour depends on it for a reason that is nothing to do with
+  // coordinates: its elementwise fusion is also what folds a splat constant's
+  // producer into a generic's body, which is the form CombineSpyreOps below
+  // states its preference over. See that pass's placement note.
   pm.addPass(createFoldDataMovementGenericsPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
@@ -210,10 +216,36 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   pm.addPass(mlir::createCanonicalizerPass());
 
   // Scalar math/arith (math.sqrt/exp/rsqrt, arith.divf, arith.addi/muli inside
-  // a linalg.generic body) -> the spyreop spelling the scheduler expects. After
-  // ConvertElementwiseToLinalg above -- which is now in this stage rather than the
-  // previous one -- so the op it matches is already inside a linalg.generic body.
+  // a linalg.generic body) -> the spyreop spelling the scheduler expects. One
+  // rule per op and no policy: which op a computation becomes, never which of two
+  // spyreop spellings of it the device prefers. That is the pass below.
+  //
+  // After ConvertElementwiseToLinalg above -- which is now in this stage rather
+  // than the previous one -- so the op it matches is already inside a
+  // linalg.generic body.
   pm.addPass(createLowerSpyreOpsPass());
+
+  // spyreop -> spyreop: the division by a constant one becomes the unary
+  // reciprocal, so no float immediate reaches the device.
+  //
+  // Separate from the lowering above because the two answer different questions
+  // and so have different correct positions -- fused, they share one, and moving
+  // the lowering moves the preference with it. This one's position is fixed by a
+  // constraint the lowering does not have: the preference is stated over a
+  // numerator that is a CONSTANT VISIBLE FROM THE DIVIDE, and what puts it in
+  // that form is FoldDataMovementGenerics, whose elementwise fusion folds the
+  // splat's producer into the generic's body. Measured, on
+  // reduce/softmax_on_stick: after ConvertElementwiseToLinalg alone the numerator
+  // is a BLOCK ARGUMENT fed by a splat `ins` operand, which no constant matcher
+  // reads; only after FoldDataMovementGenerics is it a scalar arith.constant
+  // hoisted above the generic. So this pass cannot precede that one, which is
+  // the load-bearing edge in this stage's order and was previously unwritten --
+  // the note above used to credit only ConvertElementwiseToLinalg.
+  //
+  // Nothing erases the 1.0 it orphans: the greedy driver inside the pass removes
+  // an op that becomes trivially dead, so a numerator shared with another reader
+  // needs no special case.
+  pm.addPass(spyreop::createCombineSpyreOpsPass());
 
   if (options.bindBaseAddresses) {
     // The one genuine choice in this stage: symbolic and bound are real
