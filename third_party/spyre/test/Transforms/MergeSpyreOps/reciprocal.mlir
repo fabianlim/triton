@@ -153,13 +153,18 @@ func.func @divf_two_over_x(%t: tensor<4xf16>) -> tensor<4xf16> {
 // -----
 
 // The numerator specifically, not "an operand is constant": a constant
-// DENOMINATOR still needs the binary op. The constant is 1.0 here, so the only
-// thing distinguishing this from the first case is the position.
-// CHECK-LABEL:   func.func @divf_x_over_one(
+// DENOMINATOR still needs the binary op.
+//
+// The constant is 2.0 and not 1.0, which would have been the sharper test of
+// position: once the splat is folded into the body, `x / 1.0` is folded to `x` by
+// arith's own folder before any rule sees it, and the case would pass for the
+// wrong reason. That fold is in this pass because the greedy driver folds as well
+// as rewrites.
+// CHECK-LABEL:   func.func @divf_x_over_two(
 // CHECK-NOT:       spyreop.reciprocal
 // CHECK:           arith.divf
-func.func @divf_x_over_one(%t: tensor<4xf16>) -> tensor<4xf16> {
-  %splat = arith.constant dense<1.0> : tensor<4xf16>
+func.func @divf_x_over_two(%t: tensor<4xf16>) -> tensor<4xf16> {
+  %splat = arith.constant dense<2.0> : tensor<4xf16>
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
       indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,

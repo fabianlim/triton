@@ -14,17 +14,85 @@
 // The line this file holds is the NaN semantics. `spyreop.compare` is ordered for
 // every predicate, `notequal` included, so arith's ordered six map exactly and its
 // unordered six do not map at all.
+//
+// TWO SHAPES OF INPUT, and the first is the one that matters. A rule matches ops
+// in ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a body
+// of its own -- so this group starts out spread over TWO generics with a
+// `tensor<i1>` between them, which no rule can see. The pass's own fusion is what
+// brings it together, so the cases below that start from tensor-level arith are
+// the ones that prove the rule fires on what the pipeline actually produces. The
+// later cases hand-build the single body instead, to isolate a decline from the
+// question of whether fusion happened.
 
-// `m != 0` as a float mask, ordered. The cmpf goes; the zero operand STAYS,
-// because the compare still reads it.
+//===----------------------------------------------------------------------===//
+// From tensor-level arith: the shape the pipeline really produces
+//===----------------------------------------------------------------------===//
+
+// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --merge-spyre-ops -split-input-file | FileCheck %s --check-prefix=FROMTENSOR
+
+// Two tensor ops, and therefore two generics with a `tensor<4xi1>` between them
+// before this pass runs. Out comes ONE generic holding one intrinsic, and no `i1`
+// of any kind -- neither as a tensor nor in a body. Nothing else in the pipeline
+// is needed: this pass fuses what it needs fused.
+//
+// FROMTENSOR-LABEL: func.func @from_tensor_mask(
+// FROMTENSOR-NOT:     tensor<4xi1>
+// FROMTENSOR-NOT:     arith.cmpf
+// FROMTENSOR-NOT:     arith.uitofp
+// FROMTENSOR:         %[[C:.*]] = arith.constant 0.000000e+00 : f16
+// FROMTENSOR:         linalg.generic
+// FROMTENSOR:           spyreop.compare <notequal> %{{.*}}, %[[C]] : f16
+// FROMTENSOR-NOT:     linalg.generic
+func.func @from_tensor_mask(%m: tensor<4xf16>) -> tensor<4xf16> {
+  %zero = arith.constant dense<0.0> : tensor<4xf16>
+  %c = arith.cmpf one, %m, %zero : tensor<4xf16>
+  %f = arith.uitofp %c : tensor<4xi1> to tensor<4xf16>
+  return %f : tensor<4xf16>
+}
+
+// -----
+
+// THE DECLINE, from tensor level. `une` has no counterpart, so no rule fires --
+// but the fusion still does, because it is gated on the `i1` and not on the rules.
+// The `tensor<4xi1>` is gone, which is always right, and the two arith ops are
+// left together in one body for the tier below to deal with.
+//
+// This is the decline documented in Passes.td under NaN semantics, and it is worth
+// seeing what it leaves: an `i1` inside a body, which the scheduler will not take
+// either. Nothing here diagnoses that -- see the DECLINES section of the contract.
+//
+// FROMTENSOR-LABEL: func.func @from_tensor_unordered_declined(
+// FROMTENSOR-NOT:     spyreop.compare
+// FROMTENSOR-NOT:     tensor<4xi1>
+// FROMTENSOR:         arith.cmpf une
+// FROMTENSOR:         arith.uitofp
+func.func @from_tensor_unordered_declined(%m: tensor<4xf16>) -> tensor<4xf16> {
+  %zero = arith.constant dense<0.0> : tensor<4xf16>
+  %c = arith.cmpf une, %m, %zero : tensor<4xf16>
+  %f = arith.uitofp %c : tensor<4xi1> to tensor<4xf16>
+  return %f : tensor<4xf16>
+}
+
+//===----------------------------------------------------------------------===//
+// Single-body inputs: one decision per case, fusion taken as read
+//===----------------------------------------------------------------------===//
+
+// `m != 0` as a float mask, ordered.
+//
+// Two things happen and only one is the rule. The splat zero is folded out of the
+// `ins` list into a SCALAR constant the body reads directly -- upstream's
+// splat-constant fold, which rides along with the fusion patterns and is not gated
+// by the control function -- and then the compare and the cast become one
+// intrinsic. So the generic comes out reading one input, with the zero an operand
+// of the intrinsic rather than a tensor.
 // CHECK-LABEL:   func.func @mask_notequal_f16(
 // CHECK-SAME:  %[[M:.*]]: tensor<4xf16>) -> tensor<4xf16> {
 // CHECK-NOT:       arith.cmpf
 // CHECK-NOT:       arith.uitofp
-// CHECK:           %[[Z:.*]] = arith.constant dense<0.000000e+00> : tensor<4xf16>
-// CHECK:           linalg.generic {{.*}} ins(%[[M]], %[[Z]] :
-// CHECK:           ^bb0(%[[A:.*]]: f16, %[[ZS:.*]]: f16, %[[OUT:.*]]: f16):
-// CHECK:             %[[R:.*]] = spyreop.compare <notequal> %[[A]], %[[ZS]] : f16
+// CHECK:           %[[Z:.*]] = arith.constant 0.000000e+00 : f16
+// CHECK:           linalg.generic {{.*}} ins(%[[M]] : tensor<4xf16>)
+// CHECK:           ^bb0(%[[A:.*]]: f16, %[[OUT:.*]]: f16):
+// CHECK:             %[[R:.*]] = spyreop.compare <notequal> %[[A]], %[[Z]] : f16
 // CHECK:             linalg.yield %[[R]] : f16
 func.func @mask_notequal_f16(%m: tensor<4xf16>) -> tensor<4xf16> {
   %zero = arith.constant dense<0.0> : tensor<4xf16>
@@ -108,6 +176,9 @@ func.func @all_ordered_inequalities(%x: tensor<4xf16>, %y: tensor<4xf16>) -> ten
 // CHECK-NOT:       spyreop.compare
 // CHECK:             arith.cmpf une
 // CHECK:             arith.uitofp
+// What it leaves behind is an `i1` INSIDE a body. The tensor form is gone, which
+// the fusion guarantees regardless of any rule, but the scheduler will not take
+// this either and nothing here says so -- see DECLINES in the contract.
 func.func @unordered_declined(%m: tensor<4xf16>) -> tensor<4xf16> {
   %zero = arith.constant dense<0.0> : tensor<4xf16>
   %init = tensor.empty() : tensor<4xf16>
@@ -202,8 +273,8 @@ func.func @width_change_declined(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor
 // dead-op elimination.
 // CHECK-LABEL:   func.func @cmpf_shared(
 // CHECK:             %[[C:.*]] = arith.cmpf oeq
-// CHECK:             spyreop.compare <equal>
-// CHECK:             arith.select %[[C]]
+// CHECK:             %[[R:.*]] = spyreop.compare <equal>
+// CHECK:             arith.select %[[C]], %[[R]]
 func.func @cmpf_shared(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {

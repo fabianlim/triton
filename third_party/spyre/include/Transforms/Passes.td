@@ -155,6 +155,35 @@ def MergeSpyreOps : Pass<"merge-spyre-ops", "mlir::ModuleOp"> {
         - arith.divf(1.0, x) → spyreop.reciprocal(x), the numerator read
           through the body so both the hoisted-scalar and the splat-`ins` form
           match
+        - arith.cmpf + arith.uitofp → spyreop.compare, carrying the predicate,
+          for a comparison whose answer is wanted as a number rather than as a
+          flag
+
+        GETTING A GROUP INTO ONE BODY. A rule matches ops in one body, and
+        ConvertElementwiseToLinalg gives every tensor-level op a body of its
+        own — so a group spanning two tensor ops arrives spread over two
+        generics with a tensor between them, which no rule can see. Rule 1's
+        group is one tensor op and needs nothing; rule 2's is two, and without
+        a fusion step it would never fire on anything the pipeline produces.
+
+        So the pass drives upstream's elementwise fusion alongside its rules,
+        in the same fixpoint, under one policy: fuse across a value whose
+        element type is `i1`. That is a property of the IR rather than a guess
+        about the rule set — no spyreop op produces or consumes an `i1`, and the
+        scheduler will not take one in a compute body, so such a value must not
+        cross a generic boundary whatever happens next. The same fact is why a
+        compare is not independently selectable, so one condition serves both.
+
+        Gating the fusion on the rules instead would make the policy change
+        with every new rule, and would leave an `i1` tensor standing whenever no
+        rule matched — the one outcome that is always wrong.
+
+        Two things ride along with those upstream patterns and are worth knowing
+        because they change the output: a splat constant `ins` operand is folded
+        into the body as a scalar, and the greedy driver folds as well as
+        rewrites. Together they mean an operand list can shrink for reasons
+        other than a rule firing, and that `x / 1.0` is folded to `x` before any
+        rule sees it.
 
         Output: every matched group replaced by its single op. A group no rule
         claims is left exactly as it was — there is no conversion target here,
@@ -213,9 +242,56 @@ def MergeSpyreOps : Pass<"merge-spyre-ops", "mlir::ModuleOp"> {
            the component, what it does — so a reader can check whether it still
            holds.
 
+        DECLINES — what this pass leaves alone, and what that costs. A decline is
+        never silent in a trace (`--debug-only=merge-spyre-ops` names the reason)
+        but it is never a diagnostic either: this tier is opportunistic, so
+        "no rule matched" is its normal outcome and cannot be an error. What
+        happens next therefore differs case by case, and only some of the cases
+        end well.
+
+        Declines that are FINE, because the 1:1 tier has a correct answer:
+        - a numerator that is not a constant one, or a constant in the
+          DENOMINATOR instead. Left as arith.divf, lowered to spyreop.realdiv.
+        - a numerator that resolves to a non-splat constant tensor. Reading an
+          operand through the body is sound only for a value uniform across it,
+          so a mixed constant matches nothing. Lowered to realdiv.
+        - anything outside a linalg.generic body. Not compute as far as this
+          pass is concerned; the 1:1 tier applies its own rules there.
+
+        Declines that are FINE, because they are reported later:
+        - a float width spyreop has no intrinsic for, f64 among them. A rule
+          must not select an intrinsic the 1:1 lowering would have refused, so
+          it declines and [LowerSpyreOps] reports the op.
+
+        Declines that leave a program NOTHING downstream accepts, and which
+        nothing currently diagnoses — the gap worth knowing about:
+        - an UNORDERED arith.cmpf predicate. `spyreop.compare` is ordered for
+          every predicate, `notequal` included, so `une` and its five siblings
+          differ from it on exactly the NaN input and mapping them across would
+          change the computed value. Declined for correctness.
+        - `ord` and `uno`, which ask about NaN-ness rather than an ordering, and
+          the constant predicates, which ask nothing. No counterpart exists.
+        - `arith.sitofp` in place of `uitofp`: an `i1` read as signed is 0 or
+          -1, so the cast gives -1.0 where the predicate holds. A different
+          computation.
+        - a compare at one width whose result is cast to another.
+          spyreop.compare has SameOperandsAndResultType and cannot do both.
+
+        In every case in that last group the fusion still runs, since it is
+        gated on the `i1` and not on the rules, so the tensor-typed `i1` does go
+        away. What is left is an `i1` INSIDE a body — which the scheduler will
+        not take either, and which no pass in this tree reports, because
+        arith.cmpf is not in [LowerSpyreOps]' illegal set. The kernel fails
+        downstream with a diagnostic naming neither the op nor this pass.
+        Turning those into a frontend refusal or an illegal op in the 1:1 tier
+        is the obvious follow-up and is deliberately not done here: it is a
+        behaviour change, and this pass is the wrong tier to report from.
+
         Ordering: after the passes that make every compute a linalg.generic,
         since the body is the scope. Before [LowerSpyreOps], per the two-tier
-        argument above. Nothing is owed to FoldDataMovementGenerics.
+        argument above. Nothing is owed to FoldDataMovementGenerics — this pass
+        fuses what it needs fused and reads constants through the body, so
+        neither of that pass's two side effects is load-bearing here.
     }];
 
     let dependentDialects = [

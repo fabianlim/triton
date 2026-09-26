@@ -41,8 +41,16 @@
 // predicate is a proxy -- which is what made the integer gate in LowerSpyreOps an
 // over-claim.
 //
-// THE TWO THINGS EVERY RULE SHARES, and the reason they are helpers here rather
+// THE THREE THINGS EVERY RULE SHARES, and the reason they are the pass's rather
 // than repeated per rule:
+//
+//   the fusion that gets a group INTO one body
+//            A rule matches ops in one body, and ConvertElementwiseToLinalg gives
+//            every tensor-level op a body of its OWN -- so a group spanning two
+//            tensor ops starts out spread over two generics and no rule can see
+//            it. The pass drives upstream's elementwise fusion under one policy,
+//            stated at isUnrepresentableIntermediate below. Without it rule 2
+//            never fires on anything the pipeline produces.
 //
 //   resolveThroughBody   An operand of a body op may be a BLOCK ARGUMENT, in
 //            which case the value it really names is the generic's matching `ins`
@@ -68,9 +76,10 @@
 // matches both forms, so the pass has no ordering constraint against that one at
 // all -- which is the difference between a written-down accident and no accident.
 //
-// The mechanism is upstream's -- the greedy driver, and the operand erasure --
-// and the POLICY is ours: which groups of ops the device has one op for, and on
-// what evidence.
+// The mechanism is upstream's throughout -- the greedy driver, the elementwise
+// fusion, the operand erasure -- and the POLICY is ours: which groups of ops the
+// device has one op for, on what evidence, and which fusions are needed to see a
+// group at all.
 //
 // WHAT MAY BE ADDED HERE, so the pass does not become a junk drawer. A rule
 // belongs here only if all three hold.
@@ -92,9 +101,17 @@
 //   3. The preference names the downstream behaviour it is for -- the tool, the
 //      component, what it does -- so a reader can check whether it still holds.
 //
+// DECLINES ARE NEVER A DIAGNOSTIC, and that is the tier rather than an oversight:
+// this pass is opportunistic, so "no rule matched" is its normal outcome and
+// cannot be an error. Passes.td has the full list and what each one costs. The one
+// worth knowing here: a declined compare leaves an `i1` inside a body, which the
+// scheduler will not take and which nothing in this tree reports, because
+// arith.cmpf is not in LowerSpyreOps' illegal set. Reporting it belongs to the
+// exhaustive tier or to the frontend, not here.
+//
 // `--debug-only=merge-spyre-ops` traces the decisions rather than the control
 // flow: one line per candidate root a rule looked at and what it concluded, with
-// the operand form named when a match was declined.
+// the operand form named when a match was declined, and one line per fusion.
 //
 //===----------------------------------------------------------------------===//
 
@@ -279,6 +296,58 @@ struct DivFOneToReciprocal : public OpRewritePattern<arith::DivFOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// Getting a group INTO one body: the fusion policy
+//===----------------------------------------------------------------------===//
+
+/// True iff fusing across `fusedOperand` is one this pass needs, which is asked
+/// of the VALUE crossing the boundary rather than of either op: its element type
+/// is `i1`.
+///
+/// WHY THERE IS A FUSION STEP AT ALL. A rule matches ops in ONE body, and
+/// ConvertElementwiseToLinalg gives every tensor-level op a body of its OWN. A
+/// group spread over two ops is therefore spread over two generics with a tensor
+/// between them, and no rule can see it. `1.0 / x` is one tensor op and so needs
+/// nothing; `cmpf` then `uitofp` is two, and without this the rule never fires on
+/// anything the pipeline actually produces.
+///
+/// WHY `i1` IS THE WHOLE POLICY. It is a property of the IR rather than a guess
+/// about the rule set, which is what makes it safe to state once. A `tensor<i1>`
+/// is not something the device can be handed: no spyreop op produces or consumes
+/// one, and the scheduler will not take an `i1` in a compute body. So a generic
+/// whose result is an `i1` tensor has to be fused into its consumer whatever
+/// happens next -- and that same fact is why a compare is not independently
+/// selectable, which is rule 1 in the header. One condition, two consequences.
+///
+/// Gating on the rules instead -- "fuse if some pattern might match" -- would make
+/// the fusion policy change every time a rule is added, and would leave an `i1`
+/// tensor standing whenever no rule matched, which is the one outcome that is
+/// always wrong.
+///
+/// NOT GATED ON hasOneUse, deliberately, and unlike upstream's own pass: an `i1`
+/// producer read by two consumers is fused into each and then dies. Duplicating
+/// the compare costs an op and removes a type the device has no form for, which is
+/// the trade every time.
+///
+/// The fusion itself is upstream's `populateElementwiseOpsFusionPatterns`; this is
+/// only the control function it consults. Same division as
+/// FoldDataMovementGenerics, whose control function asks a different question
+/// about a different hazard -- that one permits a pure-data-movement producer and
+/// so declines a compare, which is why its fusion is not the one that gets this
+/// group into a body.
+bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
+  Type elem = getElementTypeOrSelf(fusedOperand->get().getType());
+  bool fuse = elem.isInteger(1);
+  LLVM_DEBUG(if (fuse) {
+    llvm::dbgs() << "[" DEBUG_TYPE "] fusing across an i1 intermediate into "
+                 << fusedOperand->getOwner()->getName() << " at "
+                 << fusedOperand->getOwner()->getLoc()
+                 << ": no spyreop op has that type, so it must not cross a "
+                    "generic boundary\n";
+  });
+  return fuse;
+}
+
+//===----------------------------------------------------------------------===//
 // Rule 2: arith.cmpf feeding arith.uitofp -> spyreop.compare
 //===----------------------------------------------------------------------===//
 
@@ -370,6 +439,14 @@ struct MergeSpyreOpsPass
     RewritePatternSet patterns(ctx);
     // One line per rule: the only edit a new rule needs outside its own pattern.
     patterns.add<DivFOneToReciprocal, CmpFUIToFPToCompare>(ctx);
+
+    // Upstream's fusion, under our policy, and in the SAME fixpoint as the rules
+    // rather than as a pass before them: a rule matches ops in one body, and a
+    // group of more than one tensor-level op starts out spread over one generic
+    // each. Fusing first and matching second is one fixpoint's work, and the
+    // greedy driver does not have to be told the order.
+    linalg::populateElementwiseOpsFusionPatterns(patterns,
+                                                 isUnrepresentableIntermediate);
 
     // Upstream's, and load-bearing rather than tidying: a rule that stops reading
     // a block argument leaves an `ins` operand, that argument and its indexing
