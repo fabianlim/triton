@@ -181,7 +181,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // behaviour it changes -- left in place, a data-movement generic has no layout
   // marker, so that pass leaves its result logical and bridges the gap with a
   // linearizing operand map the scheduler cannot project loop IVs through.
-  pm.addPass(createFuseComputeBodiesPass());
+  pm.addPass(createFuseComputeAndDataMovementPass());
 
   // Logical descriptors -> physical (stick-tiled) layout, rooted on the
   // `tts.tensor_layout` attribute LowerTTSMarkers wrote onto each annotated
@@ -218,7 +218,7 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
   // op alone.
   //
-  // And it needs FuseComputeBodies to have run, which it has, well above. A rule
+  // And it needs FuseComputeAndDataMovement to have run, which it has, well above. A rule
   // matches ops in ONE body while ConvertElementwiseToLinalg gives every
   // tensor-level op a body of its own, so a group spanning two tensor ops is two
   // generics until something fuses them -- that pass's `i1` clause is what does,

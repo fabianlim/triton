@@ -6,7 +6,7 @@ include "mlir/Pass/PassBase.td"
 // ============================================================================
 // Transforms whose subject is upstream structure or the whole program rather
 // than any one dialect's abstractions.  UnaliasLinalgOuts,
-// DropReductionInitFill and FuseComputeBodies act on linalg form --
+// DropReductionInitFill and FuseComputeAndDataMovement act on linalg form --
 // generic bodies, indexing maps, reshape reassociations; NormalizeForDevice on
 // upstream ops the toolchain downstream of this tree will not take, wherever
 // they appear; MaterializeBaseAddresses acts on the entry function's signature.
@@ -21,7 +21,7 @@ include "mlir/Pass/PassBase.td"
 //
 // All five are members of a fixed stage pipeline in lib/Pipeline.cpp, not
 // opt-in, and all five run in `spyrecode`: NormalizeForDevice at that stage's
-// head, DropReductionInitFill, UnaliasLinalgOuts and FuseComputeBodies in
+// head, DropReductionInitFill, UnaliasLinalgOuts and FuseComputeAndDataMovement in
 // its shaping prefix, MaterializeBaseAddresses at its tail and only when
 // `bindBaseAddresses` is set.
 // A pass's position there is chosen in C++ from a typed factory, so there is no
@@ -105,7 +105,7 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
            same file: a rewrite whose target is a spyreop intrinsic belongs in
            [LowerSpyreOps], whether it takes one op or a group, and a rewrite
            that changes which generic an op sits in belongs in
-           [FuseComputeBodies]. The reciprocal is the worked example: its motive
+           [FuseComputeAndDataMovement]. The reciprocal is the worked example: its motive
            is a device behaviour exactly like the patterns here, but its target
            is `spyreop.reciprocal`, so it is a selection rule and not a
            normalization.
@@ -144,7 +144,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
     let description = [{
         Input: KTIR whose computes are linalg.generic — so after
         ConvertElementwiseToLinalg and LinalgGeneralizeNamedOps, and after
-        [FuseComputeBodies], on which see the contract below. Bodies hold
+        [FuseComputeAndDataMovement], on which see the contract below. Bodies hold
         arith/math ops. KTIR in, KTIR out: nothing here reads a `tt` op, which
         is why the pass is here and not in Conversion/TritonToKTIR/, whose
         criterion is a `tt` source dialect.
@@ -199,7 +199,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         once scalarized — and holds today only because the tensor-of-pointers
         tt.load path is unimplemented.
 
-        WHAT THIS PASS RELIES ON [FuseComputeBodies] FOR. A rule matches ops in
+        WHAT THIS PASS RELIES ON [FuseComputeAndDataMovement] FOR. A rule matches ops in
         ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a
         body of its own — so a group spanning two tensor ops arrives spread over
         two generics unless something fused them. That pass's `i1` clause exists
@@ -243,7 +243,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         diagnostic names neither this pass nor the predicate that caused it.
 
         Ordering: after the passes that make every compute a linalg.generic, and
-        after [FuseComputeBodies] per the contract above.
+        after [FuseComputeAndDataMovement] per the contract above.
 
         Output: the selected ops replaced by their intrinsics. Everything else
         unchanged.
@@ -324,8 +324,8 @@ def DropReductionInitFill : Pass<"drop-reduction-init-fill", "mlir::ModuleOp"> {
 }
 
 
-def FuseComputeBodies
-    : Pass<"fuse-compute-bodies", "mlir::ModuleOp"> {
+def FuseComputeAndDataMovement
+    : Pass<"fuse-compute-and-data-movement", "mlir::ModuleOp"> {
     let summary = "Fold a pure data-movement linalg.generic into the indexing "
                   "map of the op that consumes it.";
     let description = [{
@@ -465,7 +465,7 @@ def FuseComputeBodies
         earlier and says which property of the op is the problem.
 
         The store side is REJECTION ONLY, never absorption; the header of
-        FuseComputeBodies.cpp says why, and what the eventual fix would
+        FuseComputeAndDataMovement.cpp says why, and what the eventual fix would
         have to choose between.
 
         Rejection is DERIVED, not a declared op list: the condition is exactly
@@ -473,7 +473,7 @@ def FuseComputeBodies
         of the same function the absorber asks. Teaching that function a static
         `tensor.reshape` stops the rejection for it with nothing else to update.
 
-        `--debug-only=fuse-compute-bodies` traces the decisions: each
+        `--debug-only=fuse-compute-and-data-movement` traces the decisions: each
         restatement asked for and the answer, each operand the absorber considered
         with the composition spelled out, the gate's seeds and scope, and each
         rejection with the path that reached it.

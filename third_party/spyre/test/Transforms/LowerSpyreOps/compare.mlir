@@ -18,7 +18,7 @@
 // TWO SHAPES OF INPUT, and the first is the one that matters. A rule matches ops
 // in ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a body
 // of its own -- so this group starts out spread over TWO generics with a
-// `tensor<i1>` between them, which no rule can see. FuseComputeBodies is what
+// `tensor<i1>` between them, which no rule can see. FuseComputeAndDataMovement is what
 // brings it together, so the cases below that run that pass first are the ones
 // proving the rule fires on what the pipeline actually produces. The later cases
 // hand-build the single body instead, to isolate a decline from the question of
@@ -28,10 +28,10 @@
 // From tensor-level arith: the shape the pipeline really produces
 //===----------------------------------------------------------------------===//
 
-// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --fuse-compute-bodies --lower-spyre-ops -split-input-file | FileCheck %s --check-prefix=FROMTENSOR
+// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --fuse-compute-and-data-movement --lower-spyre-ops -split-input-file | FileCheck %s --check-prefix=FROMTENSOR
 
 // Two tensor ops, and therefore two generics with a `tensor<4xi1>` between them
-// until FuseComputeBodies fuses across the `i1`. Out comes ONE generic holding one
+// until FuseComputeAndDataMovement fuses across the `i1`. Out comes ONE generic holding one
 // intrinsic, and no `i1` of any kind -- neither as a tensor nor in a body.
 //
 // The RUN line names that pass explicitly, which is the point of these cases: this
@@ -56,7 +56,7 @@ func.func @from_tensor_mask(%m: tensor<4xf16>) -> tensor<4xf16> {
 // -----
 
 // THE DECLINE, from tensor level. `une` has no counterpart, so no rule fires --
-// but FuseComputeBodies still fuses, because its clause is gated on the `i1` and
+// but FuseComputeAndDataMovement still fuses, because its clause is gated on the `i1` and
 // not on this pass's rules.
 // The `tensor<4xi1>` is gone, which is always right, and the two arith ops are
 // left together in one body for the tier below to deal with.

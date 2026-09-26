@@ -3,7 +3,7 @@
 // A prefix of its own, with nothing but NOT directives, so it scans the whole
 // output rather than the span between two positive checks.
 // RUN: spyre-triton-opt %s --spyre-ttir-to-ktir --spyre-prepare-spyrecode | FileCheck %s --check-prefix=NOIMM
-// The same stage with FuseComputeBodies taken OUT of it, spelled as the
+// The same stage with FuseComputeAndDataMovement taken OUT of it, spelled as the
 // stage's pass list minus that one pass since a registered pipeline cannot have a
 // pass removed from the CLI. It is checked with the same prefixes as the full
 // stage, which is the claim: removing that pass changes nothing here.
@@ -30,14 +30,14 @@
 // THE LAST TWO RUN LINES ARE THE INTERESTING ONES. They assert a NON-dependency,
 // and only for this rule: the reciprocal reads its numerator through the generic's
 // body, so a splat `ins` and a folded-in scalar constant answer the same question,
-// and dropping FuseComputeBodies leaves the result identical. Matching on the body
+// and dropping FuseComputeAndDataMovement leaves the result identical. Matching on the body
 // value instead would make that pass load-bearing here -- it is the only thing in
 // the pipeline that folds a splat constant into a body -- and the failure would
 // surface as a numerical answer rather than as a diff. The two prefixes are reused
 // rather than given negated twins precisely so the two spellings cannot drift.
 //
 // The compare rule is the opposite case and is NOT covered here: it genuinely
-// needs FuseComputeBodies, because its group spans two tensor ops and arrives as
+// needs FuseComputeAndDataMovement, because its group spans two tensor ops and arrives as
 // two generics. test/Transforms/LowerSpyreOps/compare.mlir names that pass in its
 // own RUN line for exactly that reason.
 //

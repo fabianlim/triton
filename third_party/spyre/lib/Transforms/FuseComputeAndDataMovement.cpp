@@ -1,4 +1,4 @@
-//===- FuseComputeBodies.cpp - Fold re-indexing into consumers -----===//
+//===- FuseComputeAndDataMovement.cpp - One generic per compute ----------===//
 //
 // Folds a *data-movement* op into the indexing map of the op that consumes it,
 // so no op whose only effect is to re-index survives into the emitted KTIR --
@@ -16,8 +16,25 @@
 // instead, the coordinate change becomes part of an operand map the layout pass
 // restates at physical rank like any other.
 //
-// So the standing goal is: leave NOTHING between a load and a compute except
-// indexing maps. Three parts, and they are separable on purpose --
+// So the standing goal has two halves, and the name carries both:
+//
+//   DATA MOVEMENT INTO COMPUTE   leave NOTHING between a load and a compute
+//            except indexing maps. A coordinate change becomes an operand
+//            map on its consumer, and a data-movement generic is fused into
+//            its consumers and dies.
+//   COMPUTE WITH COMPUTE         leave nothing UNREPRESENTABLE between two
+//            computes. An `i1` is the case: no spyreop op has that type, so a
+//            generic yielding a `tensor<i1>` must be fused into its consumer
+//            whatever happens next. See isUnrepresentableIntermediate.
+//
+// Both halves are fusions and both are policy clauses of one control function,
+// which is why the pass is named for the pair rather than either. The second
+// half also happens to be what makes a compare SELECTABLE downstream -- a rule
+// in LowerSpyreOps matches ops in ONE body, and `cmpf` then `uitofp` arrives as
+// two generics until this pass joins them -- but that is a consequence, not the
+// reason: the `i1` has to go regardless of whether any rule wanted the pair.
+//
+// The first half is the bulk of this file. Three parts, separable on purpose --
 //
 //   resultToSourceMap    given one shape op, the map from its RESULT
 //            coordinates to its SOURCE coordinates. Knows about reassociations
@@ -177,10 +194,10 @@
 //   linearizeStickLane, a plain compute chain included. That is not this
 //   gate's, because absorption is not its fix.
 //
-// `--debug-only=fuse-compute-bodies` traces the decisions rather than the
-// control flow: one line per restatement asked for and the answer, one per
-// operand the absorber considered with the composition spelled out, the gate's
-// seeds and scope, and each rejection with the PATH that reached it.
+// `--debug-only=fuse-compute-and-data-movement` traces the decisions rather
+// than the control flow: one line per restatement asked for and the answer, one
+// per operand the absorber considered with the composition spelled out, the
+// gate's seeds and scope, and each rejection with the PATH that reached it.
 //
 // Position in the pipeline: after unalias_linalg_outs, and in any case after
 // convert_elementwise_to_linalg and linalg_generalize_named_ops -- fusion
@@ -218,12 +235,12 @@
 
 #include <string>
 
-#define DEBUG_TYPE "fuse-compute-bodies"
+#define DEBUG_TYPE "fuse-compute-and-data-movement"
 
 using namespace mlir;
 
 namespace mlir::triton::spyre {
-#define GEN_PASS_DEF_FUSECOMPUTEBODIES
+#define GEN_PASS_DEF_FUSECOMPUTEANDDATAMOVEMENT
 #include "Transforms/Passes.h.inc"
 } // namespace mlir::triton::spyre
 
@@ -699,7 +716,8 @@ private:
 /// derived from the same answer the absorption was.
 void rejectUnabsorbable(Operation *op, StringRef why) {
   op->emitError(
-      "fuse-compute-bodies: this op re-indexes a value on a path the "
+      "fuse-compute-and-data-movement: this op re-indexes a value on a path "
+      "the "
       "layout pass will physicalize and it cannot be restated as an indexing "
       "map on its consumer (")
       << why
@@ -836,9 +854,9 @@ LogicalResult rejectOnPhysicalizedPaths(ModuleOp mod, Tally &tally) {
   return result;
 }
 
-struct FuseComputeBodiesPass
-    : public mlir::triton::spyre::impl::FuseComputeBodiesBase<
-          FuseComputeBodiesPass> {
+struct FuseComputeAndDataMovementPass
+    : public mlir::triton::spyre::impl::FuseComputeAndDataMovementBase<
+          FuseComputeAndDataMovementPass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     MLIRContext *ctx = &getContext();
@@ -889,8 +907,9 @@ struct FuseComputeBodiesPass
 
 namespace mlir::triton::spyre {
 
-std::unique_ptr<OperationPass<ModuleOp>> createFuseComputeBodiesPass() {
-  return std::make_unique<FuseComputeBodiesPass>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createFuseComputeAndDataMovementPass() {
+  return std::make_unique<FuseComputeAndDataMovementPass>();
 }
 
 } // namespace mlir::triton::spyre
