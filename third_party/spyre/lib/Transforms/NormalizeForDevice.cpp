@@ -9,12 +9,12 @@
 // belongs here only if all three hold:
 //
 //   1. ONE op into ONE op, both of them upstream. Both halves matter, and each
-//      excludes a neighbour: a rewrite of a GROUP belongs in MergeSpyreOps, whose
-//      rules are indivisible choices over several ops, and a 1:1 rewrite whose
-//      target is a spyreop intrinsic belongs in LowerSpyreOps, which is
-//      exhaustive and reports what it cannot do. The reciprocal is the worked
-//      example of the first -- its motive is a device behaviour exactly like the
-//      patterns here, but `1.0 / x` is two ops the device does in one.
+//      excludes a neighbour: a rewrite whose target is a spyreop intrinsic
+//      belongs in LowerSpyreOps, whether it takes one op or a group, and one that
+//      changes which generic an op sits in belongs in FuseComputeBodies. The
+//      reciprocal is the worked example -- its motive is a device behaviour
+//      exactly like the patterns here, but its target is spyreop.reciprocal, so
+//      it is a selection rule.
 //   2. The input is valid IR that a downstream consumer refuses or mis-lowers,
 //      not a defect. A defect is a bug in whatever produced it, and patching it
 //      here hides that.

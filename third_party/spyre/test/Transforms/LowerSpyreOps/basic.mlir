@@ -280,9 +280,9 @@ tt.func @muli_i32_outside_generic_survives(%a: i32, %b: i32) -> i32 {
 
 // ONE OP TO ONE OP: a numerator of constant 1.0 gets the same target as any
 // other numerator. Preferring the unary spyreop.reciprocal is a statement about a
-// GROUP of ops -- the constant and the divide -- which is MergeSpyreOps' rule 1,
+// GROUP of ops -- the constant and the divide -- which is LowerSpyreOps' rule 1,
 // asked before this pass runs and covered in
-// test/Transforms/MergeSpyreOps/reciprocal.mlir. A divf reaching here therefore
+// test/Transforms/LowerSpyreOps/reciprocal.mlir. A divf reaching here therefore
 // already means no rule claimed it, and the right answer is the binary op.
 //
 // Last in the file rather than beside @divf_f32 on purpose: the generated checks

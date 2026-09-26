@@ -3,21 +3,22 @@
 // A prefix of its own, with nothing but NOT directives, so it scans the whole
 // output rather than the span between two positive checks.
 // RUN: spyre-triton-opt %s --spyre-ttir-to-ktir --spyre-prepare-spyrecode | FileCheck %s --check-prefix=NOIMM
-// The same stage with FoldDataMovementGenerics taken OUT of it, spelled as the
+// The same stage with FuseComputeBodies taken OUT of it, spelled as the
 // stage's pass list minus that one pass since a registered pipeline cannot have a
 // pass removed from the CLI. It is checked with the same prefixes as the full
 // stage, which is the claim: removing that pass changes nothing here.
-// RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --merge-spyre-ops --lower-spyre-ops | FileCheck %s --check-prefix=PHYS
-// RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --merge-spyre-ops --lower-spyre-ops | FileCheck %s --check-prefix=NOIMM
+// RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --lower-spyre-ops | FileCheck %s --check-prefix=PHYS
+// RUN: spyre-triton-opt %s --spyre-ttir-to-ktir | spyre-triton-opt --normalize-for-device --drop-reduction-init-fill --convert-elementwise-to-linalg --linalg-generalize-named-ops --unalias-linalg-outs --lower-spyre-ops | FileCheck %s --check-prefix=NOIMM
 
 // That a division by one leaves the stage as the unary intrinsic, with no float
 // immediate anywhere -- and that no other pass in the stage is load-bearing for
 // it.
 //
-// No single pass can make this claim, which is why it is here. MergeSpyreOps'
-// rule 1 is what chooses the intrinsic, LowerSpyreOps is what would have chosen
-// the binary op had no rule claimed the divide, and the order between them is the
-// sequence's to get right.
+// No single pass can make this claim, which is why it is here. LowerSpyreOps'
+// group rule chooses the unary intrinsic and its 1:1 rule would have chosen the
+// binary one, so what is under test is not which rule wins -- that is the pass's
+// own test -- but that the stage delivers a body in the form the group rule can
+// read at all.
 //
 // WHY THE CONSTANT HAS TO GO. A float immediate reaching a Spyre compute unit is
 // not read back as it was written, so a divide by a rounded one is not the divide
@@ -26,14 +27,19 @@
 // failure. `reduce/softmax_on_stick` is the kernel that depends on it; this file is
 // the same claim at a size a lit test can read.
 //
-// THE LAST TWO RUN LINES ARE THE INTERESTING ONES. They assert a NON-dependency:
-// the rule reads its operand through the generic's body, so a splat `ins` and a
-// folded-in scalar constant answer the same question, and dropping
-// FoldDataMovementGenerics leaves the result identical. Matching on the body value
-// instead would make that pass load-bearing here -- it is the only thing in the
-// pipeline that folds a splat constant into a body -- and the failure would surface
-// as a numerical answer rather than as a diff. The two prefixes are reused rather
-// than given negated twins precisely so the two spellings cannot drift apart.
+// THE LAST TWO RUN LINES ARE THE INTERESTING ONES. They assert a NON-dependency,
+// and only for this rule: the reciprocal reads its numerator through the generic's
+// body, so a splat `ins` and a folded-in scalar constant answer the same question,
+// and dropping FuseComputeBodies leaves the result identical. Matching on the body
+// value instead would make that pass load-bearing here -- it is the only thing in
+// the pipeline that folds a splat constant into a body -- and the failure would
+// surface as a numerical answer rather than as a diff. The two prefixes are reused
+// rather than given negated twins precisely so the two spellings cannot drift.
+//
+// The compare rule is the opposite case and is NOT covered here: it genuinely
+// needs FuseComputeBodies, because its group spans two tensor ops and arrives as
+// two generics. test/Transforms/LowerSpyreOps/compare.mlir names that pass in its
+// own RUN line for exactly that reason.
 //
 // The kernel is the smallest thing carrying the shape: a 1-D reciprocal whose
 // numerator is a splat `arith.constant` beside the divide, which is how

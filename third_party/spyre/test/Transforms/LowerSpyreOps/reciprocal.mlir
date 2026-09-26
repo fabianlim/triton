@@ -1,4 +1,4 @@
-// RUN: spyre-triton-opt %s --merge-spyre-ops -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
 // Rule 1: `1.0 / x` is two ops, and the device does it in one.
 //
@@ -6,8 +6,13 @@
 // operand and the numerator in the body is a BLOCK ARGUMENT. Reading the operand
 // through the body is what sees it, and upstream's unused-operand erasure is what
 // takes the operand, its block argument and its indexing map away afterwards. So
-// the rule needs nothing to have folded the constant in first, which is the whole
-// difference from matching on the body value.
+// this rule needs nothing to have folded the constant in first -- unlike the
+// compare rule, which does need its group brought into one body. This whole file
+// therefore runs --lower-spyre-ops alone.
+//
+// Every case where the group rule DECLINES shows `spyreop.realdiv`, not
+// `arith.divf`: selection is one pass, so what the group rule leaves the 1:1 rule
+// takes, in the same fixpoint.
 //
 // `func.func`, not `tt.func`, because that is what this pass sees: it runs in the
 // `spyrecode` stage, long after ConvertFunctions.
@@ -113,15 +118,17 @@ func.func @recip_shared_numerator(%t: tensor<4xf16>) -> tensor<4xf16> {
 
 // -----
 
-// THE SCOPE, as a test. The same divide OUTSIDE any generic body is not matched:
-// the body is where compute is, and a rule that fired anywhere would be claiming
-// to know that an op it found elsewhere is compute. LowerSpyreOps still lowers
-// this one to a `realdiv` afterwards, which is the correct 1:1 answer for an op no
-// rule claimed.
+// THE SCOPE, as a test, and the clearest case of the two rule kinds meeting. The
+// same divide OUTSIDE any generic body is not matched by the GROUP rule -- the body
+// is where compute is, and a rule that fired anywhere would be claiming to know
+// that an op found elsewhere is compute. The 1:1 realdiv rule has no such scope and
+// takes it, in the same pass and the same fixpoint. So the constant stays alive and
+// the binary op ships, which is the right answer for a divide nobody could prove
+// was a reciprocal.
 // CHECK-LABEL:   func.func @recip_outside_a_body(
 // CHECK-NOT:       spyreop.reciprocal
 // CHECK:           %[[ONE:.*]] = arith.constant 1.000000e+00 : f16
-// CHECK:           %[[R:.*]] = arith.divf %[[ONE]], %{{.*}} : f16
+// CHECK:           %[[R:.*]] = spyreop.realdiv %[[ONE]], %{{.*}} : f16
 func.func @recip_outside_a_body(%x: f16) -> f16 {
   %one = arith.constant 1.0 : f16
   %0 = arith.divf %one, %x : f16
@@ -130,11 +137,12 @@ func.func @recip_outside_a_body(%x: f16) -> f16 {
 
 // -----
 
-// A numerator that is not one keeps its divide, constant and all. The match is on
-// the VALUE, not on "there is a constant on the left".
+// A numerator that is not one gets the BINARY intrinsic, constant and all. The
+// group rule matches on the VALUE, not on "there is a constant on the left", and
+// what it declines the 1:1 rule takes.
 // CHECK-LABEL:   func.func @divf_two_over_x(
 // CHECK-NOT:       spyreop.reciprocal
-// CHECK:           arith.divf
+// CHECK:           spyreop.realdiv
 func.func @divf_two_over_x(%t: tensor<4xf16>) -> tensor<4xf16> {
   %splat = arith.constant dense<2.0> : tensor<4xf16>
   %init = tensor.empty() : tensor<4xf16>
@@ -156,13 +164,11 @@ func.func @divf_two_over_x(%t: tensor<4xf16>) -> tensor<4xf16> {
 // DENOMINATOR still needs the binary op.
 //
 // The constant is 2.0 and not 1.0, which would have been the sharper test of
-// position: once the splat is folded into the body, `x / 1.0` is folded to `x` by
-// arith's own folder before any rule sees it, and the case would pass for the
-// wrong reason. That fold is in this pass because the greedy driver folds as well
-// as rewrites.
+// position: with the splat folded into the body `x / 1.0` folds to `x` by arith's
+// own folder before any rule sees it, and the case would pass for the wrong reason.
 // CHECK-LABEL:   func.func @divf_x_over_two(
 // CHECK-NOT:       spyreop.reciprocal
-// CHECK:           arith.divf
+// CHECK:           spyreop.realdiv
 func.func @divf_x_over_two(%t: tensor<4xf16>) -> tensor<4xf16> {
   %splat = arith.constant dense<2.0> : tensor<4xf16>
   %init = tensor.empty() : tensor<4xf16>
@@ -186,7 +192,7 @@ func.func @divf_x_over_two(%t: tensor<4xf16>) -> tensor<4xf16> {
 // Without that, element 0 being 1.0 would have been taken for the whole tensor.
 // CHECK-LABEL:   func.func @divf_nonsplat_numerator(
 // CHECK-NOT:       spyreop.reciprocal
-// CHECK:           arith.divf
+// CHECK:           spyreop.realdiv
 func.func @divf_nonsplat_numerator(%t: tensor<2xf16>) -> tensor<2xf16> {
   %mixed = arith.constant dense<[1.0, 3.0]> : tensor<2xf16>
   %init = tensor.empty() : tensor<2xf16>
@@ -204,9 +210,9 @@ func.func @divf_nonsplat_numerator(%t: tensor<2xf16>) -> tensor<2xf16> {
 
 // -----
 
-// An unsupported float width has no intrinsic, so the rule declines and leaves
-// the divide for LowerSpyreOps to report. A rule must not select an intrinsic the
-// 1:1 lowering would have refused.
+// An unsupported float width has no intrinsic, so BOTH rules decline and the
+// divide flows through to the backend as arith. The only case in this file where
+// no spyreop op appears at all -- see unsupported-types.mlir for the rest.
 // CHECK-LABEL:   func.func @divf_f64_declined(
 // CHECK-NOT:       spyreop
 // CHECK:           arith.divf
