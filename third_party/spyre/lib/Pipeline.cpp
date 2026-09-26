@@ -209,10 +209,26 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // dbo-opt's compute-group extraction aborts. See issue #161.
   pm.addPass(mlir::createCanonicalizerPass());
 
-  // Scalar math/arith (math.sqrt/exp/rsqrt, arith.divf, arith.addi/muli inside
-  // a linalg.generic body) -> the spyreop spelling the scheduler expects. After
-  // ConvertElementwiseToLinalg above -- which is now in this stage rather than the
-  // previous one -- so the op it matches is already inside a linalg.generic body.
+  // Instruction selection, in two tiers, and the order between them is the whole
+  // of what this pair gets right.
+  //
+  // First the MANY-to-one rules: a group of ops inside a compute body replaced by
+  // the one op the device does that group in. Opportunistic -- a group no rule
+  // claims is left alone. Then the ONE-to-one lowering, exhaustive, which reports
+  // an op it should have handled and could not.
+  //
+  // Merge has to be first. After the 1:1 selection every op has already been
+  // committed to an intrinsic and the multi-op shape a rule wants to see whole is
+  // gone: `1.0 / sqrt(x)` is one three-op match on the way in and
+  // `reciprocal(sqrt(x))` on the way out, two intrinsics that would have to be
+  // un-chosen before the right one could be chosen.
+  //
+  // Both need every compute to be a linalg.generic, which is what the passes
+  // above make it -- for the merge because the generic BODY is its scope, and for
+  // the lowering because a tensor-typed op is left alone. Neither owes anything to
+  // FoldDataMovementGenerics: a merge rule reads an operand through the body, so a
+  // splat `ins` and a folded-in scalar constant answer the same question.
+  pm.addPass(createMergeSpyreOpsPass());
   pm.addPass(createLowerSpyreOpsPass());
 
   if (options.bindBaseAddresses) {

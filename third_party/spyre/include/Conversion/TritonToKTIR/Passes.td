@@ -145,8 +145,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - math.sqrt  (operand f16 or f32)        → spyreop.sqrt
         - math.exp   (operand f16 or f32)        → spyreop.exp
         - math.rsqrt (operand f16 or f32)        → spyreop.rsqrt
-        - arith.divf (operand f16 or f32)        → spyreop.realdiv,
-          or spyreop.reciprocal when the numerator is a constant 1.0
+        - arith.divf (operand f16 or f32)        → spyreop.realdiv
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
@@ -160,11 +159,17 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         they are left legal, quietly, since ConvertElementwiseToLinalg (not
         this pass) is what will eventually scalarize them.
 
-        arith.divf splits on its NUMERATOR as well as its type: a numerator
-        of one goes to the UNARY spyreop.reciprocal, so no float immediate
-        reaches the device at all. Matched by value with m_OneFloat, which
-        accepts a scalar float constant or a splat. No other value is
-        special-cased.
+        ONE OP TO ONE OP, and no policy. This pass decides which op a scalar
+        computation becomes; it decides nothing about a GROUP of ops, and
+        nothing about which of two spellings of one computation the device
+        prefers. So arith.divf has one target whatever its numerator is.
+
+        Groups are [MergeSpyreOps]', which runs BEFORE this pass and is
+        opportunistic where this one is exhaustive — the two together are
+        two-tier instruction selection, and an op reaching here means no rule of
+        that pass claimed it. A numerator of one is that pass's rule 1, because
+        `1.0 / x` is two ops the device does in one; see its description for why
+        the many-to-one rules have to be asked first.
 
         arith.addi/arith.muli are different: plain scalar integer add/mul is
         also used throughout a kernel for loop indices, offsets, and tile
@@ -180,9 +185,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         tensor-typed and left alone, never reaching its spyreop intrinsic.
 
         Output: no math.sqrt/exp/rsqrt or arith.divf remains on a supported
-        scalar type (a divf by a constant-1.0 numerator leaving its constant
-        behind, dead, for the pipeline's own cleanup); no arith.addi/muli at
-        a supported bit-width remains
+        scalar type; no arith.addi/muli at a supported bit-width remains
         inside a linalg.generic. The corresponding spyreop intrinsic is
         introduced in its place. Everything else -- unsupported types or
         widths, tensor/vector operands, or index arithmetic outside a

@@ -1287,10 +1287,11 @@ VARIANTS = {
     #
     # THE RECIPROCAL GROUP CARRIES NO FLOAT IMMEDIATE, and that is load-bearing:
     # ``tl.fdiv(one, s)`` lowers to the UNARY ``spyreop.reciprocal``, not to
-    # ``spyreop.realdiv`` with a ``1.0`` operand, because LowerSpyreOps matches a
-    # numerator of one and drops it. A float immediate reaching the device is not
-    # read back as it was written, so this kernel must not be rewritten in a way
-    # that keeps the constant alive.
+    # ``spyreop.realdiv`` with a ``1.0`` operand, because MergeSpyreOps' rule 1
+    # matches the constant and the divide as one group and the device does that
+    # group in one op. A float immediate reaching the device is not read back as it
+    # was written, so this kernel must not be rewritten in a way that keeps the
+    # constant alive.
     "softmax_on_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",

@@ -17,6 +17,7 @@ add_triton_library(SpyreTransforms
   NormalizeForDevice.cpp
   DropReductionInitFill.cpp
   FoldDataMovementGenerics.cpp
+  MergeSpyreOps.cpp
   MaterializeBaseAddresses.cpp
 
   DEPENDS
@@ -37,6 +38,10 @@ add_triton_library(SpyreTransforms
   KTDPUtils
   TTSIR
   KTIR::KtdpDialect
+  # MergeSpyreOps emits spyreop intrinsics -- the one dialect here that is a
+  # TARGET rather than a subject.  Its rules match arith and math; see that pass's
+  # header on why the name is about what it emits.
+  KTIR::SpyreOpDialect
   MLIRIR
   MLIRPass
   MLIRArithDialect

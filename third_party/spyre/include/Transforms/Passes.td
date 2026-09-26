@@ -100,12 +100,15 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
         junk drawer without a rule, so: a pattern belongs here only if all
         three hold.
 
-        1. It rewrites WITHIN upstream dialects — source and target both
-           upstream ops. Crossing a dialect boundary is a conversion and
-           belongs in Conversion/, not here — which is why the reciprocal
-           peephole, arith.divf → spyreop.reciprocal, sits in LowerSpyreOps.
-           Rule 1 draws the line by what a rewrite touches, not by what
-           motivates it.
+        1. It rewrites ONE op into ONE op, both of them upstream. Those two
+           together are the line, and each half excludes a neighbour in this
+           same file: a rewrite of a GROUP belongs in [MergeSpyreOps], whose
+           rules are indivisible choices over several ops, and a 1:1 rewrite
+           whose target is a spyreop intrinsic belongs in [LowerSpyreOps], which
+           is exhaustive and reports what it cannot do. The reciprocal is the
+           worked example of the first: its motive is a device behaviour exactly
+           like the patterns here, but `1.0 / x` is two ops the device does in
+           one, so it is a merge rule and not a normalization.
         2. The input is VALID IR that some downstream consumer refuses or
            mis-lowers, not a defect being fixed. A defect is a bug in whatever
            produced it, and patching it here hides that.
@@ -132,6 +135,93 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
 
     let dependentDialects = [
         "mlir::arith::ArithDialect"
+    ];
+}
+
+def MergeSpyreOps : Pass<"merge-spyre-ops", "mlir::ModuleOp"> {
+    let summary = "Replace a group of compute ops with the device's own spelling "
+                  "of that group.";
+    let description = [{
+        Input: KTIR whose computes are linalg.generic — so after
+        ConvertElementwiseToLinalg and LinalgGeneralizeNamedOps. Bodies hold
+        arith/math ops; nothing outside a generic body is read at all.
+
+        A RULE HOST. Each rule matches a group of ops inside a compute body and
+        replaces it with the device's own spelling of that group. Adding a rule
+        is a pattern plus one line in the pass — no change here, no CMake
+        change, no pipeline change.
+
+        Rules:
+        - arith.divf(1.0, x) → spyreop.reciprocal(x), the numerator read
+          through the body so both the hoisted-scalar and the splat-`ins` form
+          match
+
+        Output: every matched group replaced by its single op. A group no rule
+        claims is left exactly as it was — there is no conversion target here,
+        because unmatched is the normal case. A generic that stops reading an
+        `ins` operand comes out with one fewer input, its block argument and
+        indexing map removed with it.
+
+        TWO-TIER INSTRUCTION SELECTION, which is why this is not part of
+        [LowerSpyreOps]. This pass is OPPORTUNISTIC and many-ops-to-one; that
+        one is EXHAUSTIVE and one-op-to-one, a dialect conversion that reports
+        an op it should have handled and could not. Merge runs FIRST, and the
+        order is the point: after the 1:1 selection every op has been committed
+        to an intrinsic and the multi-op shape a rule wants to see whole is
+        gone. `1.0 / sqrt(x)` is a three-op match on the way in and
+        `reciprocal(sqrt(x))` on the way out — two intrinsics that would have to
+        be un-chosen before the one right one could be chosen. So the bigger
+        patterns get first refusal and the 1:1 rules mop up.
+
+        THE GENERIC BODY IS THE SCOPE, not a predicate. Every compute reaches
+        this pass as a linalg.generic, so "inside a generic body" is not a guess
+        about whether an op is compute — it is where the compute is. A rule
+        rooted in a body never asks: `arith.addi` on an element type in a body
+        is compute, and the addi of a loop index or a tile address is not in a
+        body at all. Exact as a scope, where the same test as a per-op predicate
+        is a proxy.
+
+        WHAT EVERY RULE GETS FOR FREE, and so does not repeat:
+        - an operand is read THROUGH the body, so a block argument resolves to
+          the generic's matching `ins` operand. This is what makes a rule
+          independent of whether anything folded a constant into the body, and
+          it is why this pass has NO ordering constraint against
+          FoldDataMovementGenerics — `tl.full([M, S], 1.0)` arrives as a splat
+          `ins` with the numerator a block argument, and the rule sees the splat
+          either way.
+        - the operand a rule consumed is dropped by upstream's
+          populateEraseUnusedOperandsAndResultsPatterns, in the same fixpoint.
+          So a rule is purely BODY-LOCAL and never touches the operand list.
+
+        WHAT MAY BE ADDED HERE, so the pass does not become a junk drawer. A
+        rule belongs here only if all three hold.
+
+        1. THE GROUP IS WHAT IS SELECTABLE: no member of it could have been
+           selected on its own. That is the criterion, and NOT the op count — a
+           rule may well come out two ops long. `arith.cmpf` is the clean case:
+           its result is an `i1`, which no spyreop op produces and the scheduler
+           will not take in a body, so the compare is not selectable by itself.
+           What its CONSUMER is decides what it becomes — a `uitofp` makes the
+           pair one `spyreop.compare`, an `arith.select` makes it a `compare` fed
+           to a `spyreop.select`, still two ops and still one indivisible choice.
+           Where a single op IS independently selectable, the rewrite is a
+           lowering ([LowerSpyreOps]) or a normalization
+           ([NormalizeForDevice]), and both already have a home.
+        2. The group and what replaces it compute the same value. A rule is a
+           PREFERENCE between spellings, not a repair.
+        3. The preference names the downstream behaviour it is for — the tool,
+           the component, what it does — so a reader can check whether it still
+           holds.
+
+        Ordering: after the passes that make every compute a linalg.generic,
+        since the body is the scope. Before [LowerSpyreOps], per the two-tier
+        argument above. Nothing is owed to FoldDataMovementGenerics.
+    }];
+
+    let dependentDialects = [
+        "mlir::spyreop::SpyreOpDialect",
+        "mlir::arith::ArithDialect",
+        "mlir::linalg::LinalgDialect"
     ];
 }
 
