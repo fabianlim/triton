@@ -21,8 +21,8 @@ include "mlir/Pass/PassBase.td"
 //
 // All five are members of a fixed stage pipeline in lib/Pipeline.cpp, not
 // opt-in, and all five run in `spyrecode`: NormalizeForDevice at that stage's
-// head, DropReductionInitFill, UnaliasLinalgOuts and FuseComputeAndDataMovement in
-// its shaping prefix, MaterializeBaseAddresses at its tail and only when
+// head, DropReductionInitFill, UnaliasLinalgOuts and
+// FuseComputeAndDataMovement in its shaping prefix, MaterializeBaseAddresses at its tail and only when
 // `bindBaseAddresses` is set.
 // A pass's position there is chosen in C++ from a typed factory, so there is no
 // caller hook for inserting one at a named point.
@@ -105,10 +105,10 @@ def NormalizeForDevice : Pass<"normalize-for-device", "mlir::ModuleOp"> {
            same file: a rewrite whose target is a spyreop intrinsic belongs in
            [LowerSpyreOps], whether it takes one op or a group, and a rewrite
            that changes which generic an op sits in belongs in
-           [FuseComputeAndDataMovement]. The reciprocal is the worked example: its motive
-           is a device behaviour exactly like the patterns here, but its target
-           is `spyreop.reciprocal`, so it is a selection rule and not a
-           normalization.
+           [FuseComputeAndDataMovement]. The reciprocal is the worked example:
+           its motive is a device behaviour exactly like the patterns here, but
+           its target is `spyreop.reciprocal`, so it is a selection rule and not
+           a normalization.
         2. The input is VALID IR that some downstream consumer refuses or
            mis-lowers, not a defect being fixed. A defect is a bug in whatever
            produced it, and patching it here hides that.
@@ -178,12 +178,37 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         `spyreop.compare`, an `arith.select` would make it a compare feeding a
         `spyreop.select`, two ops and still one indivisible choice.
 
-        EVERYTHING UNMATCHED FLOWS THROUGH. There is no conversion target and
-        nothing is reported: an op with no device form reaches the backend, which
-        is the component that knows what it can take, and it refuses there. So
-        this pass has no notion of an illegal input — it selects what it can and
+        EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
+        conversion target: an op with no device form reaches the backend, which is
+        the component that knows what it can take, and it refuses there. So this
+        pass has no notion of an unsupported input — it selects what it can and
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
+
+        The exception is an `i1`, and it is a different kind of thing rather than
+        a carve-out. Flows-through is about a CAPABILITY gap: an f64 math.sqrt is
+        valid IR that a future device or a future rule may do. An `i1` in a
+        compute body is UNREPRESENTABLE — no spyreop intrinsic produces or
+        consumes that type, so no rule anyone could add would ever remove it. That
+        is a property of the dialect, not of a device generation, and it makes the
+        program unlowerable rather than unsupported. It is reported HERE because
+        this is the only place that still knows the PREDICATE; by the time the
+        backend sees it, the failure names an op several lowerings below the one
+        the author wrote.
+
+        WHAT THE i1 CHECK REFUSES, precisely, because the scope is narrower than
+        "any i1 in a body". It reads op RESULTS only and skips one that is
+        yielded, so what it refuses is an i1 this pass produced and KEPT: made
+        inside one body and read inside the same body. That is exactly a group it
+        had the chance to select and did not.
+
+        An i1 crossing a generic BOUNDARY is the other pass's finding. It is the
+        tensor form, [FuseComputeAndDataMovement] has the clause that removes it,
+        and before that pass has run every compare sits in a generic of its own
+        yielding precisely that — so refusing it here would report IR a
+        predecessor was meant to reshape, while naming the wrong cause. The two
+        shapes are indistinguishable at this point, which is why the line is drawn
+        by where the value lives rather than by how it got there.
 
         THE GENERIC BODY IS THE SCOPE for a group rule, and not a predicate.
         Every compute reaches this pass as a linalg.generic, so "inside a body"
@@ -199,8 +224,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         once scalarized — and holds today only because the tensor-of-pointers
         tt.load path is unimplemented.
 
-        WHAT THIS PASS RELIES ON [FuseComputeAndDataMovement] FOR. A rule matches ops in
-        ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a
+        WHAT THIS PASS RELIES ON [FuseComputeAndDataMovement] FOR. A rule
+        matches ops in ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a
         body of its own — so a group spanning two tensor ops arrives spread over
         two generics unless something fused them. That pass's `i1` clause exists
         for exactly this: the compare rule sees its pair only because that pass
@@ -237,10 +262,12 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - a compare at one width whose result is cast to another.
           spyreop.compare has SameOperandsAndResultType and cannot do both
 
-        The compare declines are the ones to know: each leaves an `i1` INSIDE a
-        body, which the backend will not take either. It is refused there rather
-        than here, which is the point of the rule above — but it means the
-        diagnostic names neither this pass nor the predicate that caused it.
+        Each of the compare declines leaves an `i1` INSIDE a body, so each is
+        REFUSED by the check above rather than passed through — they are the
+        exception, not the rule. The diagnostic names the predicate and says
+        which kind of decline it was: one with no counterpart at all, or one whose
+        predicate was fine and whose READER was the problem. That distinction is
+        what an author can act on.
 
         Ordering: after the passes that make every compute a linalg.generic, and
         after [FuseComputeAndDataMovement] per the contract above.

@@ -462,6 +462,104 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// After selection: an i1 left in a compute body
+//===----------------------------------------------------------------------===//
+
+/// Refuse every `i1` value still inside a compute body once selection has had
+/// its chance.
+///
+/// THE ONE EXCEPTION TO FLOWS-THROUGH, and it is a different kind of thing
+/// rather than a carve-out. That rule is about a CAPABILITY gap: an f64
+/// `math.sqrt` has no intrinsic today, the IR is valid, and a future device or
+/// a future rule may well do it -- so the backend is the right place to judge.
+/// An `i1` in a compute body is not a capability gap, it is UNREPRESENTABLE: no
+/// spyreop op produces or consumes that type, so no rule anyone could add would
+/// ever select it. That is a property of the dialect, not of a device
+/// generation.
+///
+/// And this is the only place that can say WHY. Reaching the backend, the
+/// failure names an op several lowerings below the one the author wrote, and
+/// nothing about the predicate that caused it. Here the predicate is in hand.
+///
+/// AFTER THE FIXPOINT, NOT DURING IT, and not in the fusion pass either. Before
+/// selection an `i1` between a compare and its consumer is the expected shape
+/// -- it is exactly what the compare rule matches -- so the fusion pass that
+/// removes the TENSOR form cannot refuse the scalar one. Only once no rule has
+/// claimed it is its presence evidence.
+LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
+  LogicalResult result = success();
+  mod.walk([&](linalg::GenericOp generic) {
+    Block *body = generic.getBlock();
+    if (!body)
+      return;
+    // RESULTS ONLY, not block arguments. An i1 arriving as an `ins` operand is
+    // the TENSOR form crossing into a body, and removing that is the fusion
+    // pass's clause -- and it is indistinguishable here from an unfused
+    // compare, whose own generic yields a `tensor<i1>` that the next generic
+    // reads as an i1 argument. Refusing it would report IR a pass ahead of this
+    // one was meant to reshape.
+    SmallVector<Value> values;
+    for (Operation &op : *body)
+      values.append(op.getResults().begin(), op.getResults().end());
+
+    for (Value v : values) {
+      if (!getElementTypeOrSelf(v.getType()).isInteger(1))
+        continue;
+      // Nor one that LEAVES the body. Yielded, it is again the tensor form, and
+      // before fusion has run every compare sits in a generic of its own
+      // yielding exactly that.
+      //
+      // What the two tests leave is an i1 this pass PRODUCED AND KEPT: made
+      // inside one body and read inside the same body. That is precisely a
+      // group this pass had the chance to select and did not, which is why it
+      // is this pass's finding and not its predecessor's.
+      if (llvm::any_of(v.getUsers(), [](Operation *user) {
+            return isa<linalg::YieldOp>(user);
+          }))
+        continue;
+      result = failure();
+
+      InFlightDiagnostic diag = mlir::emitError(v.getLoc());
+      diag << "lower-spyre-ops: an i1 value survives inside a compute body, "
+              "which the Spyre device has no form for at all -- no spyreop "
+              "intrinsic produces or consumes that type, so no selection rule "
+              "can ever remove it";
+
+      // The actionable half. A compare is how an i1 gets into a body in
+      // practice, and which predicate it used is the whole of what an author
+      // can change.
+      if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
+        StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
+        if (spyrePredicateFor(cmp.getPredicate()))
+          diag.attachNote(cmp.getLoc())
+              << "the predicate '" << pred
+              << "' does have a spyreop.compare counterpart, so this compare "
+                 "was "
+                 "selectable and something about its READER was not: "
+                 "spyreop.compare answers in the width compared, so the reader "
+                 "must be an arith.uitofp at that same width";
+        else
+          diag.attachNote(cmp.getLoc())
+              << "the predicate '" << pred
+              << "' has no spyreop.compare counterpart. That intrinsic is "
+                 "ORDERED for every predicate, `notequal` included -- it "
+                 "answers "
+                 "zero when either operand is NaN -- so an unordered predicate "
+                 "would compute a different value, and `ord`/`uno` ask a "
+                 "question it does not answer at all. Where NaN operands are "
+                 "not "
+                 "expected, the ordered spelling is selectable";
+      }
+
+      for (Operation *user : v.getUsers())
+        diag.attachNote(user->getLoc())
+            << "read here, by '" << user->getName() << "'";
+    }
+  });
+  return result;
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -492,7 +590,15 @@ struct LowerSpyreOpsPass
     // op with no device form flows through to the backend, which is the
     // component that knows what it can take. A failure from the driver would
     // mean the rewrite diverged, not that an op went unhandled.
-    if (failed(applyPatternsGreedily(module, std::move(patterns))))
+    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
+
+    // The one thing this pass does report. Not a selection failure -- see
+    // rejectSurvivingBooleans on why an unrepresentable TYPE is a different
+    // kind of thing from an op the device happens not to do.
+    if (failed(rejectSurvivingBooleans(module)))
       signalPassFailure();
   }
 };

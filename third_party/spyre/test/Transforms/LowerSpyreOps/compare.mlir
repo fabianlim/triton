@@ -1,81 +1,19 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
-// Rule 2: a comparison whose answer is wanted as a NUMBER rather than as a flag.
-//
-// `arith.cmpf` + `arith.uitofp` is the mask shape -- `(m != 0)` used
+// The compare rule: a comparison whose answer is wanted as a NUMBER rather than as
+// a flag. `arith.cmpf` + `arith.uitofp` is the mask shape -- `(m != 0)` used
 // multiplicatively -- and `spyreop.compare` is one op that does it, its answer
 // coming "in the width compared rather than as a boolean".
 //
 // Why the pair is one choice and not two: `arith.cmpf` alone gives an `i1`, which
-// no spyreop op produces and the scheduler will not take in a compute body, so the
-// compare is not selectable by itself. What consumes the `i1` is what decides what
-// the pair becomes.
+// no spyreop op produces and the device cannot represent in a compute body, so the
+// compare is not selectable by itself. What consumes the `i1` decides what the pair
+// becomes.
 //
-// The line this file holds is the NaN semantics. `spyreop.compare` is ordered for
-// every predicate, `notequal` included, so arith's ordered six map exactly and its
-// unordered six do not map at all.
-//
-// TWO SHAPES OF INPUT, and the first is the one that matters. A rule matches ops
-// in ONE body, and ConvertElementwiseToLinalg gives every tensor-level op a body
-// of its own -- so this group starts out spread over TWO generics with a
-// `tensor<i1>` between them, which no rule can see. FuseComputeAndDataMovement is what
-// brings it together, so the cases below that run that pass first are the ones
-// proving the rule fires on what the pipeline actually produces. The later cases
-// hand-build the single body instead, to isolate a decline from the question of
-// whether fusion happened.
-
-//===----------------------------------------------------------------------===//
-// From tensor-level arith: the shape the pipeline really produces
-//===----------------------------------------------------------------------===//
-
-// RUN: spyre-triton-opt %s --convert-elementwise-to-linalg --fuse-compute-and-data-movement --lower-spyre-ops -split-input-file | FileCheck %s --check-prefix=FROMTENSOR
-
-// Two tensor ops, and therefore two generics with a `tensor<4xi1>` between them
-// until FuseComputeAndDataMovement fuses across the `i1`. Out comes ONE generic holding one
-// intrinsic, and no `i1` of any kind -- neither as a tensor nor in a body.
-//
-// The RUN line names that pass explicitly, which is the point of these cases: this
-// rule fires only because the group was brought into one body first, and running
-// --lower-spyre-ops alone on the tensor-level input selects nothing.
-//
-// FROMTENSOR-LABEL: func.func @from_tensor_mask(
-// FROMTENSOR-NOT:     tensor<4xi1>
-// FROMTENSOR-NOT:     arith.cmpf
-// FROMTENSOR-NOT:     arith.uitofp
-// FROMTENSOR:         %[[C:.*]] = arith.constant 0.000000e+00 : f16
-// FROMTENSOR:         linalg.generic
-// FROMTENSOR:           spyreop.compare <notequal> %{{.*}}, %[[C]] : f16
-// FROMTENSOR-NOT:     linalg.generic
-func.func @from_tensor_mask(%m: tensor<4xf16>) -> tensor<4xf16> {
-  %zero = arith.constant dense<0.0> : tensor<4xf16>
-  %c = arith.cmpf one, %m, %zero : tensor<4xf16>
-  %f = arith.uitofp %c : tensor<4xi1> to tensor<4xf16>
-  return %f : tensor<4xf16>
-}
-
-// -----
-
-// THE DECLINE, from tensor level. `une` has no counterpart, so no rule fires --
-// but FuseComputeAndDataMovement still fuses, because its clause is gated on the `i1` and
-// not on this pass's rules.
-// The `tensor<4xi1>` is gone, which is always right, and the two arith ops are
-// left together in one body for the tier below to deal with.
-//
-// This is the decline documented in Passes.td under NaN semantics, and it is worth
-// seeing what it leaves: an `i1` inside a body, which the scheduler will not take
-// either. Nothing here diagnoses that -- see the DECLINES section of the contract.
-//
-// FROMTENSOR-LABEL: func.func @from_tensor_unordered_declined(
-// FROMTENSOR-NOT:     spyreop.compare
-// FROMTENSOR-NOT:     tensor<4xi1>
-// FROMTENSOR:         arith.cmpf une
-// FROMTENSOR:         arith.uitofp
-func.func @from_tensor_unordered_declined(%m: tensor<4xf16>) -> tensor<4xf16> {
-  %zero = arith.constant dense<0.0> : tensor<4xf16>
-  %c = arith.cmpf une, %m, %zero : tensor<4xf16>
-  %f = arith.uitofp %c : tensor<4xi1> to tensor<4xf16>
-  return %f : tensor<4xf16>
-}
+// EVERY CASE HERE IS HAND-BUILT INTO ONE BODY, so what is under test is a rule's
+// own decision rather than whether fusion happened. compare-from-tensor.mlir drives
+// the shape the pipeline actually produces; compare-invalid.mlir holds every way of
+// failing to select the pair, each of which leaves an `i1` behind and is refused.
 
 //===----------------------------------------------------------------------===//
 // Single-body inputs: one decision per case, fusion taken as read
@@ -83,9 +21,9 @@ func.func @from_tensor_unordered_declined(%m: tensor<4xf16>) -> tensor<4xf16> {
 
 // `m != 0` as a float mask, ordered.
 //
-// Hand-built into one body, and driven WITHOUT the fusion pass, so the splat zero
-// is still an `ins` operand and the body reads it as a block argument. The rule
-// does not care: it reads the compare's operands as the body holds them.
+// Hand-built into one body and driven WITHOUT the fusion pass, so the splat zero is
+// still an `ins` operand and the body reads it as a block argument. The rule does
+// not care: it reads the compare's operands as the body holds them.
 // CHECK-LABEL:   func.func @mask_notequal_f16(
 // CHECK-SAME:  %[[M:.*]]: tensor<4xf16>) -> tensor<4xf16> {
 // CHECK-NOT:       arith.cmpf
@@ -135,8 +73,9 @@ func.func @mask_equal_f32(%m: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 
-// All four ordered inequalities, in one body, so the predicate table is covered
-// rather than sampled.
+// All four ordered inequalities in one body, so the predicate table is covered
+// rather than sampled. The two ordered equalities are the cases above, which makes
+// all six accounted for.
 // CHECK-LABEL:   func.func @all_ordered_inequalities(
 // CHECK-NOT:       arith.cmpf
 // CHECK:             spyreop.compare <greaterthan>
@@ -169,133 +108,11 @@ func.func @all_ordered_inequalities(%x: tensor<4xf16>, %y: tensor<4xf16>) -> ten
 
 // -----
 
-// THE NaN LINE. `une` is true where either operand is NaN and
-// `spyreop.compare <notequal>` is zero there, so the two are different
-// computations and the rule declines. Both ops survive; nothing is silently
-// mapped onto the ordered predicate.
-// CHECK-LABEL:   func.func @unordered_declined(
-// CHECK-NOT:       spyreop.compare
-// CHECK:             arith.cmpf une
-// CHECK:             arith.uitofp
-// What it leaves behind is an `i1` INSIDE a body. The tensor form is gone, which
-// the fusion guarantees regardless of any rule, but the scheduler will not take
-// this either and nothing here says so -- see DECLINES in the contract.
-func.func @unordered_declined(%m: tensor<4xf16>) -> tensor<4xf16> {
-  %zero = arith.constant dense<0.0> : tensor<4xf16>
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%m, %zero : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %z: f16, %out: f16):
-    %c = arith.cmpf une, %a, %z : f16
-    %f = arith.uitofp %c : i1 to f16
-    linalg.yield %f : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// `ord` asks about NaN-ness rather than about an ordering, so it has no
-// counterpart of any kind and is declined for a different reason than `une` --
-// not a NaN disagreement, but nothing to map onto.
-// CHECK-LABEL:   func.func @ord_declined(
-// CHECK-NOT:       spyreop.compare
-// CHECK:             arith.cmpf ord
-func.func @ord_declined(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    %c = arith.cmpf ord, %a, %b : f16
-    %f = arith.uitofp %c : i1 to f16
-    linalg.yield %f : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// `sitofp` is NOT this rule. An `i1` read as signed is 0 or -1, so the cast gives
-// -1.0 where the predicate holds -- a different computation, declined rather than
-// folded in.
-// CHECK-LABEL:   func.func @sitofp_declined(
-// CHECK-NOT:       spyreop.compare
-// CHECK:             arith.cmpf
-// CHECK:             arith.sitofp
-func.func @sitofp_declined(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    %c = arith.cmpf oeq, %a, %b : f16
-    %f = arith.sitofp %c : i1 to f16
-    linalg.yield %f : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// A COMPARE AT ONE WIDTH CAST TO ANOTHER is declined: spyreop.compare has
-// SameOperandsAndResultType, so it cannot both compare f32 and give f16. Left for
-// the 1:1 lowering, which will report the cmpf rather than mis-select it.
-// CHECK-LABEL:   func.func @width_change_declined(
-// CHECK-NOT:       spyreop.compare
-// CHECK:             arith.cmpf
-// CHECK:             arith.uitofp
-func.func @width_change_declined(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf32>, tensor<4xf32>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f32, %b: f32, %out: f16):
-    %c = arith.cmpf oeq, %a, %b : f32
-    %f = arith.uitofp %c : i1 to f16
-    linalg.yield %f : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// A cmpf with a SECOND reader is still merged, and survives for the other reader.
-// Nothing in the rule asks about use counts: the compare goes, or does not go, by
-// dead-op elimination.
-// CHECK-LABEL:   func.func @cmpf_shared(
-// CHECK:             %[[C:.*]] = arith.cmpf oeq
-// CHECK:             %[[R:.*]] = spyreop.compare <equal>
-// CHECK:             arith.select %[[C]], %[[R]]
-func.func @cmpf_shared(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    %c = arith.cmpf oeq, %a, %b : f16
-    %f = arith.uitofp %c : i1 to f16
-    %s = arith.select %c, %f, %b : f16
-    linalg.yield %s : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// THE SCOPE. The same pair outside any generic body is not matched, for the same
-// reason rule 1's is not: the body is where compute is.
+// THE SCOPE, and it is the scope of the DIAGNOSTIC too. The same pair outside any
+// generic body is not matched -- the body is where compute is -- and it is not
+// refused either, because the `i1` check walks generic bodies and nothing else. An
+// `i1` in ordinary scalar code is not this pass's business, and a mask on the
+// address path is exactly that.
 // CHECK-LABEL:   func.func @outside_a_body(
 // CHECK-NOT:       spyreop.compare
 // CHECK:           arith.cmpf
