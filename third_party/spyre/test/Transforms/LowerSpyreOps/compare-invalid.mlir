@@ -132,31 +132,3 @@ func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
   return %0 : tensor<4xf16>
 }
 
-// -----
-
-// A compare with a SECOND reader. The `uitofp` is selected -- so a
-// `spyreop.compare` does appear -- but the `arith.select` keeps the `i1` alive, and
-// an i1-conditioned select has no device form either. So the kernel is refused even
-// though one rule fired, which is the case that shows the check is about the TYPE
-// surviving and not about whether selection happened.
-//
-// This replaces a case that asserted the opposite: it used to document the compare
-// surviving for its other reader as fine, which it never was.
-func.func @cmpf_with_second_reader(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %b: f16, %out: f16):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'oeq' does have a spyreop.compare counterpart}}
-    %c = arith.cmpf oeq, %a, %b : f16
-    %f = arith.uitofp %c : i1 to f16
-    // expected-note @below {{read here, by 'arith.select'}}
-    %s = arith.select %c, %f, %b : f16
-    linalg.yield %s : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}

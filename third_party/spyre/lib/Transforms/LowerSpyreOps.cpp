@@ -419,6 +419,194 @@ struct SelectCompare : public OpRewritePattern<arith::UIToFPOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// A group to one: arith.cmpf feeding arith.select -> spyreop.select
+//===----------------------------------------------------------------------===//
+
+/// Whether a comparison against zero in front of a select asks the question the
+/// select is about to ask anyway, and whether reading the compared value in its
+/// place inverts the choice.
+///
+/// `spyreop.select` takes `true_value` "where `condition` is not zero"
+/// (SpyreOp.td) -- it compares against zero itself, in the device. So a
+/// comparison against zero feeding a select recomputes what the select performs,
+/// and the select can read the COMPARED VALUE and no comparison need exist.
+///
+/// Three predicates qualify:
+///
+///   `one` (ordered not-equal) IS the select's own question. Arms as written.
+///
+///   `oeq` is its exact negation, so reading the compared value inverts the
+///     choice -- corrected by EXCHANGING the arms, which costs nothing, rather
+///     than by computing a negation, which would need an op the device lacks.
+///
+///   `une` agrees with `one` on every value EXCEPT NaN, where `une` is true and
+///     the device's ordered comparison answers zero. Folding it therefore assumes
+///     the condition is not NaN, and the failure mode is worth naming because it
+///     is sharper than a missed optimisation: a NaN lane selects the WRONG ARM,
+///     since the fold flips which side of "not zero" that lane falls on. It is
+///     folded because `!=` is the spelling an author reaches for -- Triton emits
+///     `une` for it -- and because a NaN reaching a Spyre tensor is a problem
+///     upstream of this pass.
+///
+/// The ORDERING predicates are not folded, each because it disagrees with "not
+/// zero" on a value a mask can hold: `ogt` (`m > 0`) is false for a negative lane
+/// where "not zero" is true, `oge` is additionally true at zero itself, and
+/// `olt`/`ole` mirror those. A mask read back from memory has no provenance this
+/// pass can inspect -- the comparison that produced it may be in another kernel
+/// entirely -- so nothing here can prove it non-negative. Those become their own
+/// `spyreop.compare` feeding the select, which is correct and one op larger.
+/// What `spyreop.select` can do with a comparison on its own, without that
+/// comparison being emitted.
+///
+/// `spyreop.select` tests its condition against zero itself. So when the
+/// comparison in front of it is ALSO a test against zero, the comparison is
+/// asking a question the select already answers, and the select can take the
+/// compared value as its condition instead. These are the three ways that can
+/// turn out.
+enum class SelectFromZeroTest {
+  /// Not a zero test, or a zero test asking something else -- so the comparison
+  /// is real work and has to be emitted.
+  NeedsCompare,
+  /// The comparison agrees with the select's own test, so the compared value is
+  /// the condition and the two values keep the order the kernel wrote.
+  ConditionDirect,
+  /// The comparison is the OPPOSITE of the select's own test, so the compared
+  /// value is still the condition but the two values must be exchanged -- the
+  /// select would otherwise pick the arm the kernel meant to reject.
+  ConditionDirectValuesExchanged,
+};
+
+/// Which of those three applies to `cmp`, read as the condition of a select.
+///
+/// Only a comparison whose right-hand side is zero can qualify: that is the one
+/// question `spyreop.select` performs for free.
+///
+///   `one` (ordered not-equal) is the select's own test. Direct.
+///   `oeq` (ordered equal) is its opposite. Direct, values exchanged.
+///   `une` (UNORDERED not-equal) agrees with `one` except on NaN. Taken as
+///     direct, on the assumption -- recorded at SelectSelect -- that a mask
+///     holds no NaN.
+///
+/// Everything else needs its comparison. `ogt` is the one worth naming: `m > 0`
+/// is false for a negative value where "not zero" is true, so taking it as
+/// direct would change the result. `oge`, `olt` and `ole` fail the same way.
+SelectFromZeroTest selectFromZeroTest(arith::CmpFOp cmp) {
+  if (!matchPattern(cmp.getRhs(), m_AnyZeroFloat()))
+    return SelectFromZeroTest::NeedsCompare;
+  switch (cmp.getPredicate()) {
+  case arith::CmpFPredicate::ONE:
+  case arith::CmpFPredicate::UNE:
+    return SelectFromZeroTest::ConditionDirect;
+  case arith::CmpFPredicate::OEQ:
+    return SelectFromZeroTest::ConditionDirectValuesExchanged;
+  default:
+    return SelectFromZeroTest::NeedsCompare;
+  }
+}
+
+/// A ternary over a comparison -- `tl.where(a > b, p, q)` -- is two ops in arith
+/// and one or two on the device.
+///
+/// The two are an indivisible choice, for the reason SelectCompare gives: an
+/// `arith.cmpf` alone yields an `i1`, which no spyreop op produces, so what
+/// consumes the `i1` decides which device op the pair is. Here the consumer is a
+/// select, and `spyreop.select` takes its condition as "an ordinary value of the
+/// width being selected, not a boolean" -- `SameOperandsAndResultType` binds the
+/// condition, both arms and the result to one type -- so the comparison's answer,
+/// already one-or-zero in that width, IS the condition.
+///
+/// ROOTED ON THE SELECT, matching SelectCompare: the consumer identifies the rule
+/// and the match reads down a def-use edge it already holds. The compare is left
+/// to dead-op elimination, and where it has another reader it stays and both
+/// readers are correct, so nothing here asks about its use count.
+///
+/// Two shapes, and `selectFromZeroTest` decides which:
+///
+///   a comparison AGAINST ZERO is what the device performs anyway, so the
+///     compared value becomes the condition directly and NO compare is built.
+///     One device op for the pair.
+///   any other comparison becomes a `spyreop.compare` whose answer is the
+///     condition. Two device ops, in separate bodies only if a later pass puts
+///     them there -- here they are adjacent in this one.
+///
+/// A condition that is not an `arith.cmpf` is left alone. Building a float
+/// condition from an arbitrary `i1` would mean choosing an encoding for true, and
+/// a guess there is a wrong answer that compiles. rejectSurvivingBooleans reports
+/// it, which is the right outcome: the author can see the predicate.
+struct SelectSelect : public OpRewritePattern<arith::SelectOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::SelectOp op,
+                                PatternRewriter &rewriter) const override {
+    linalg::GenericOp generic = computeBodyOf(op);
+    if (!generic)
+      return failure();
+    Type selected = op.getType();
+    if (!isSpyreOpScalarType(selected)) {
+      traceDecline(op, "no spyreop intrinsic for this result type");
+      return failure();
+    }
+
+    // Resolved through the body for the reason SelectCompare states: the
+    // comparison may have been computed outside this generic and carried in, in
+    // which case there is nothing here to merge with.
+    auto cmp = resolveThroughBody(generic, op.getCondition())
+                   .getDefiningOp<arith::CmpFOp>();
+    if (!cmp) {
+      traceDecline(op, "condition is not an arith.cmpf");
+      return failure();
+    }
+    // The compared width is the intrinsic's whole type, by
+    // SameOperandsAndResultType -- selecting f16 on an f32 comparison is a
+    // narrowing one spyreop.select cannot express.
+    if (cmp.getLhs().getType() != selected) {
+      traceDecline(op, "the compared type and the selected type differ, which "
+                       "one spyreop.select cannot express");
+      return failure();
+    }
+
+    // Every decline is above this line, so what follows only builds -- which is
+    // the shape SelectCompare has, and the reason it is worth keeping: a decline
+    // reached after a `create` would leave a half-written body behind.
+    SelectFromZeroTest fromZeroTest = selectFromZeroTest(cmp);
+    StringRef predicateName = arith::stringifyCmpFPredicate(cmp.getPredicate());
+    std::optional<spyreop::ComparePredicate> predicate =
+        spyrePredicateFor(cmp.getPredicate());
+    if (fromZeroTest == SelectFromZeroTest::NeedsCompare && !predicate) {
+      traceDecline(op, llvm::Twine("spyreop.compare has no counterpart for "
+                                   "predicate '") +
+                           predicateName + "'");
+      return failure();
+    }
+
+    // The condition, and with it whether a comparison is emitted at all.
+    Value condition = cmp.getLhs();
+    if (fromZeroTest == SelectFromZeroTest::NeedsCompare) {
+      traceMatch(op, llvm::Twine("arith.cmpf '") + predicateName +
+                         "' + arith.select -> spyreop.compare feeding "
+                         "spyreop.select");
+      condition = spyreop::Compare::create(
+          rewriter, op.getLoc(), selected, cmp.getLhs(), cmp.getRhs(),
+          spyreop::ComparePredicateAttr::get(op.getContext(), *predicate));
+    } else {
+      traceMatch(op, llvm::Twine("arith.cmpf '") + predicateName +
+                         "' tests against zero, which spyreop.select does to its "
+                         "own condition -> spyreop.select alone");
+    }
+
+    // An opposite zero test reaches the same condition value, so the exchange is
+    // what keeps it meaning the same thing.
+    Value trueValue = op.getTrueValue(), falseValue = op.getFalseValue();
+    if (fromZeroTest == SelectFromZeroTest::ConditionDirectValuesExchanged)
+      std::swap(trueValue, falseValue);
+
+    rewriter.replaceOpWithNewOp<spyreop::Select>(op, selected, condition,
+                                                 trueValue, falseValue);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // One op to one: the integer ops
 //===----------------------------------------------------------------------===//
 
@@ -574,7 +762,7 @@ struct LowerSpyreOpsPass
     // One line per rule, group rules and 1:1 rules in one set: specificity
     // rather than a declared order is what decides between two that could both
     // match. See ONE PASS FOR ALL SELECTION in the header.
-    patterns.add<SelectReciprocal, SelectCompare>(ctx);
+    patterns.add<SelectReciprocal, SelectCompare, SelectSelect>(ctx);
     patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
                  SelectUnaryFloat<math::ExpOp, spyreop::Exp>,
