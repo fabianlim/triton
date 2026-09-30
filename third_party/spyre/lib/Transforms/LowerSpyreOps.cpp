@@ -52,14 +52,14 @@
 // all. The integer 1:1 rules use the same test as a per-op PREDICATE, which is
 // a proxy and is known to be one; see isInsideLinalgGeneric.
 //
-// NO NaN REACHES A COMPUTE BODY. Every rule here assumes it, and it is the
-// one assumption this pass makes about VALUES rather than about IR shape.
-// Under it, each unordered `arith.cmpf` predicate computes the same answer as
-// its ordered counterpart (`une` as `one`, `ueq` as `oeq`, and so on), so both
-// spellings select the same `spyreop.compare`; and a comparison against zero
-// in front of a select can be dropped whatever the device does with a NaN
-// condition. A NaN in a Spyre kernel's inputs therefore gives an unspecified
-// result on the NaN lanes -- which is the contract, not a bug in a rule.
+// NO NaN REACHES A COMPUTE BODY. Every rule assumes it, which lets the pass:
+//
+//   - select an unordered predicate as its ordered one, e.g. `une` (Triton's
+//     `!=`) as `spyreop.compare <notequal>`;
+//   - drop a zero test in front of a select, e.g. `select(m != 0, p, q)` ->
+//     `spyreop.select %m, %p, %q`.
+//
+// A NaN input gives an unspecified result on its lane.
 //
 // The mechanism is upstream's -- the greedy driver, and the unused-operand
 // erasure -- and the POLICY is ours: which ops and which groups the device has
@@ -206,20 +206,12 @@ Value resolveThroughBody(linalg::GenericOp generic, Value v) {
   return generic.getDpsInputs()[n];
 }
 
-/// The spyreop predicate computing the same thing as `p`, or nothing when none
-/// does.
+/// The spyreop predicate computing the same thing as `p`, or nothing:
 ///
-/// Each ordering maps from BOTH its ordered and its unordered spelling: `oeq`
-/// and `ueq` to `equal`, `one` and `une` to `notequal`, and so on. The two
-/// spellings differ only when an operand is NaN (`spyreop.compare` is ordered,
-/// so it answers as the `o` form does), and this pass assumes no NaN -- see NO
-/// NaN REACHES A COMPUTE BODY in the header. Mapping the unordered six matters
-/// because Triton emits `une` for `!=`: without it, `(a != b).to(f16)` and
-/// `tl.where(a != b, ...)` have no device form.
-///
-/// `ord`, `uno` and the two constant predicates have no counterpart: they ask
-/// about NaN-ness or about nothing, and a comparison intrinsic answers
-/// neither.
+///   - an ordering maps from both spellings, e.g. `oeq` and `ueq` -> `equal`
+///     (they differ only on NaN; see NO NaN REACHES A COMPUTE BODY);
+///   - `ord`/`uno` ask about NaN and `false`/`true` about nothing, so they have
+///     no counterpart.
 std::optional<spyreop::ComparePredicate>
 spyrePredicateFor(arith::CmpFPredicate p) {
   switch (p) {
@@ -434,20 +426,26 @@ struct SelectCompare : public OpRewritePattern<arith::UIToFPOp> {
 // A group to one: arith.cmpf feeding arith.select -> spyreop.select
 //===----------------------------------------------------------------------===//
 
-/// A comparison against uniform zero that a select can perform directly.
-/// `condition` is the original scalar body value, not the tensor used to prove
-/// that the other operand is zero. Equality exchanges the selected values;
-/// inequality preserves them. Both rely on the pass's no-NaN input contract.
+/// A zero test that `spyreop.select` performs itself, found by
+/// selectFromZeroTest. `condition` is the scalar already in the body.
 struct ZeroTestSelect {
   Value condition;
   bool exchangeValues;
 };
 
-/// Recognize an equality or inequality with positive or negative uniform zero
-/// on either side. Input body arguments are resolved only for constant
-/// matching; a successful result always names the scalar value already inside
-/// the body. Nonuniform tensors and ordering predicates retain their
-/// comparison.
+/// Finds a comparison the select can drop, because `spyreop.select` already
+/// tests its condition against zero:
+///
+///   - `m != 0` (`one`/`une`) -> condition `m`, values in order;
+///   - `m == 0` (`oeq`/`ueq`) -> condition `m`, values exchanged;
+///   - zero on either side, as a scalar or a uniform input tensor, and -0.0,
+///     e.g. `0 != m`, or `%z` fed by `dense<0.0>`.
+///
+/// Returns nothing for the rest, which keep their compare:
+///
+///   - an ordering, e.g. `m > 0` is false for a negative `m` that "not zero"
+///     calls true;
+///   - a non-uniform constant, e.g. `dense<[0.0, 1.0]>`.
 std::optional<ZeroTestSelect> selectFromZeroTest(linalg::GenericOp generic,
                                                  arith::CmpFOp cmp) {
   bool exchangeValues;
@@ -470,35 +468,22 @@ std::optional<ZeroTestSelect> selectFromZeroTest(linalg::GenericOp generic,
   return std::nullopt;
 }
 
-/// `arith.cmpf` feeding `arith.select` -> `spyreop.select`, optionally fed by a
-/// `spyreop.compare`. This is the shape `tl.where(a > b, p, q)` lowers to.
+/// Lowers `arith.cmpf` feeding `arith.select` (e.g. `tl.where(a > b, p, q)`)
+/// in one of two ways, chosen by selectFromZeroTest:
 ///
-///   - WHY A GROUP. `arith.cmpf` alone yields an `i1`, which no spyreop op
-///     produces, so the compare cannot be selected on its own; its consumer
-///     decides the device op. `spyreop.select` takes a condition of the same
-///     float type as its values (`SameOperandsAndResultType`), and
-///     `spyreop.compare` answers 1.0 / 0.0 in that type, so the compare's
-///     answer can be the condition.
-///   - ROOTED ON THE SELECT, as SelectCompare is rooted on its cast: the
-///     consumer identifies the rule. The `arith.cmpf` is left to dead-op
-///     elimination; if it has another reader it stays, and both readers are
-///     correct.
-///   - OUTPUT, decided by selectFromZeroTest:
-///       `select(m != 0, p, q)` -> `spyreop.select %m, %p, %q`       (1 op)
-///       `select(m == 0, p, q)` -> `spyreop.select %m, %q, %p`       (1 op)
-///       `select(a > b, p, q)`  -> `%c = spyreop.compare <greaterthan> %a, %b`
-///                                 `spyreop.select %c, %p, %q`       (2 ops)
-///   - DECLINES, leaving the `arith` ops in place:
-///       - the selected type has no `spyreop.select` (f64, bf16, any integer);
-///       - the condition is not produced by an `arith.cmpf` (for example an
-///         `i1` passed in as a function argument). Building a float condition
-///         from an arbitrary `i1` would mean guessing an encoding for true;
-///       - the compared type differs from the selected type (an f32 compare
-///         selecting f16);
-///       - the comparison is not folded and its predicate has
-///         no `spyreop.compare` counterpart: `ord`, `uno`, `false`, `true`.
-///     An `i1` a decline leaves produced and read inside the body is then
-///     reported by rejectSurvivingBooleans.
+///   - a zero test -> `spyreop.select %m, %p, %q` alone;
+///   - otherwise -> `%c = spyreop.compare <greaterthan> %a, %b` then
+///     `spyreop.select %c, %p, %q`.
+///
+/// Rooted on the select, because the cmpf's reader decides the device op. The
+/// cmpf is left for dead-code removal. Declines, leaving the arith ops, when:
+///
+///   - the selected type has no `spyreop.select`, e.g. i32 or f64;
+///   - the condition is not a cmpf, e.g. an `i1` function argument;
+///   - the compared and selected widths differ, e.g. f32 compared, f16 picked;
+///   - a kept compare has no counterpart, e.g. `ord`.
+///
+/// A declined cmpf is then reported by rejectSurvivingBooleans.
 struct SelectWhere : public OpRewritePattern<arith::SelectOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -618,43 +603,22 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 // After selection: an i1 left in a compute body
 //===----------------------------------------------------------------------===//
 
-/// Report each `i1` that selection left behind inside a compute body, once the
-/// greedy fixpoint has finished.
+/// Reports an `i1` that selection left in a compute body, because no spyreop
+/// op takes that type, so the backend would refuse it without naming the
+/// predicate. Runs after the fixpoint, since until then such an `i1` is what
+/// the group rules match.
 ///
-/// WHAT IS REPORTED: an `i1` that is the RESULT of an op directly in a
-/// `linalg.generic` body and is not yielded, so it is read only inside that
-/// same body. That is a group this pass had the chance to select and did not.
+/// Reported, when made and read in the same body without being yielded:
 ///
-///   - `%c = arith.cmpf ogt, %x, %y : f32` read by `arith.select %c, %t, %f :
-///     i32` -- the select rule declines an integer select, so `%c` is kept.
-///   - `%c = arith.cmpf ord, %x, %y : f32` read by `arith.uitofp %c : i1 to
-///     f32` -- `ord` has no `spyreop.compare` counterpart.
-///   - `%c = arith.cmpf oeq, %x, %y : f32` read by `arith.sitofp` -- the
-///     compare rule wants `uitofp`.
+///   - `cmpf ogt` read by an i32 `arith.select`;
+///   - `cmpf ord` read by `arith.uitofp` (no counterpart);
+///   - `cmpf oeq` read by `arith.sitofp` (the compare rule wants `uitofp`).
 ///
-/// When the `i1` comes from an `arith.cmpf`, a note names its predicate and
-/// says whether the predicate or its reader is the reason; every reader gets a
-/// note.
+/// Not reported, because each is the tensor form crossing a body boundary,
+/// which FuseComputeAndDataMovement removes:
 ///
-/// WHAT IS NOT REPORTED, because it is the tensor form crossing a generic
-/// boundary -- removing that is FuseComputeAndDataMovement's job, and before
-/// fusion every compare sits in a generic of its own:
-///
-///   - an `i1` block argument, e.g. `^bb0(%cond: i1, ...)` fed by a
-///     `tensor<8xi1>` `ins` operand;
-///   - an `i1` that is yielded, e.g. a lone compare generic ending in
-///     `linalg.yield %c : i1`.
-///
-/// WHY REPORT AT ALL, when every other unmatched op flows through to the
-/// backend. An op with no intrinsic (an f64 `math.sqrt`) is a CAPABILITY gap
-/// that a future rule or device may close. An `i1` in a body is
-/// UNREPRESENTABLE: no spyreop op produces or consumes it, so no rule could
-/// ever select it. Here the predicate that caused it is still in hand; the
-/// backend's error names neither the predicate nor this pass.
-///
-/// WHY AFTER THE FIXPOINT. Until selection finishes, an `i1` between a compare
-/// and its consumer is exactly the shape the group rules match, so its presence
-/// is evidence of a problem only once no rule has claimed it.
+///   - an `i1` block argument, e.g. `^bb0(%cond: i1, ...)`;
+///   - an `i1` that is yielded, e.g. `linalg.yield %c : i1`.
 LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
   LogicalResult result = success();
   mod.walk([&](linalg::GenericOp generic) {
@@ -683,9 +647,7 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
               "intrinsic produces or consumes that type, so no selection rule "
               "can ever remove it";
 
-      // The actionable half. A compare is how an i1 gets into a body in
-      // practice, and which predicate it used is the whole of what an author
-      // can change.
+      // Name the predicate: it is what an author can change.
       if (auto cmp = v.getDefiningOp<arith::CmpFOp>()) {
         StringRef pred = arith::stringifyCmpFPredicate(cmp.getPredicate());
         if (spyrePredicateFor(cmp.getPredicate()))

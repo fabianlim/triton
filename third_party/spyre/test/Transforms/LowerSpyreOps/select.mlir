@@ -57,17 +57,14 @@ func.func @compare_two_values_keeps_both_ops(%a: tensor<8xf32>, %b: tensor<8xf32
 
 // -----
 
-// PURPOSE: the shape a kernel reading a stored mask writes, and the one case that
-// lowers to a select with no compare at all.
+// PURPOSE: `m != 0` lowers to a select with no compare, because
+// `spyreop.select` already tests its condition against zero.
 //
-// `mask != 0` asks whether the value is non-zero, which is what `spyreop.select`
-// does to its condition. So the comparison is redundant: the rule deletes it and
-// gives the select the mask directly. The CHECK-NEXT chain from the block header
-// to `linalg.yield` is the whole point of the test -- it pins the emitted body to
-// exactly one op, so no compare can sit in it, and the operand list shows the mask
-// arriving as the condition unchanged.
+// The CHECK-NEXT chain from `^bb0` to `linalg.yield` catches:
+//   - a compare left in the body, e.g. `spyreop.compare <notequal> %m, %zero`;
+//   - the wrong condition, e.g. `spyreop.select %p, ...`.
 //
-// `one` is arith's ORDERED not-equal. The unordered spelling is covered below.
+// `one` is the ordered spelling; Triton's `une` is the next case.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @mask_not_equal_zero_needs_no_compare(
 // CHECK:           ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
@@ -121,19 +118,12 @@ func.func @triton_not_equal_reaches_the_same_form(%m: tensor<8xf32>, %p: tensor<
 
 // -----
 
-// PURPOSE: catch an inverted condition, which is the one way this rule can be
-// wrong while still looking right.
+// PURPOSE: `m == 0` folds with the two values exchanged, because the select
+// picks the FIRST value where `m` is not zero, the opposite of `m == 0`.
 //
-// `m == 0` is true exactly where `spyreop.select` would choose the SECOND value,
-// so handing the select the mask directly picks the opposite arm. The rule
-// compensates by swapping the two values as it builds the op, and the check below
-// asserts that order: the kernel writes `select (m == 0) ? P : Q` and the emitted
-// op must be `spyreop.select %mask, Q, P`.
-//
-// Why this test carries its weight: a version of the rule that forgot the swap
-// would emit one clean op, pass a check that no compare is emitted, and silently
-// return the wrong value for every lane. The operand ORDER is the only thing that
-// distinguishes correct from inverted.
+// `select(m == 0, P, Q)` must become `spyreop.select %m, Q, P`. This catches a
+// rule that forgets the exchange, which emits one clean op and returns the
+// wrong value on every lane.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @mask_equal_zero_swaps_the_values(
 // CHECK:           ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
@@ -218,14 +208,14 @@ func.func @triton_not_equal_of_two_values(%a: tensor<8xf32>, %b: tensor<8xf32>,
 
 // -----
 
-// PURPOSE: pin the boundary of the one-op form, so it is not widened to a
-// comparison that looks similar but computes something else.
+// PURPOSE: an ordering against zero keeps its compare, because it disagrees
+// with "not zero" on values a mask can hold:
+//   - `m > 0` is false for `m = -1`, where "not zero" is true;
+//   - `m >= 0` is also true for `m = 0`.
 //
-// `m > 0` also mentions zero, but it is FALSE for a negative value where "not
-// zero" is TRUE -- so dropping it would change the result wherever a mask holds a
-// negative number. A mask arriving from memory could hold anything, so the rule
-// keeps the comparison and emits the two-op form. `oge`, `olt` and `ole` are
-// excluded for the same reason and are not repeated here.
+// The checks bind the compare to `%m` and the select to the compare, catching a
+// rule that emits both ops but wires the select to `%m`. `oge`, `olt` and `ole`
+// are the `*_zero_retains_compare` cases.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @greater_than_zero_keeps_its_compare(
 // CHECK:           ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
@@ -250,12 +240,11 @@ func.func @greater_than_zero_keeps_its_compare(%m: tensor<8xf32>, %p: tensor<8xf
 
 // -----
 
-// PURPOSE: pin that the one-op form needs the comparison to be against ZERO, not
-// merely against a constant.
+// PURPOSE: only a comparison against ZERO folds, not one against any constant.
 //
-// `m != 2.0` is a real question the device does not answer for free, so the
-// comparison stays. Without this case the rule could be keyed on "compares
-// against a constant" and still pass everything above.
+// `m != 2.0` keeps its compare. This catches a rule keyed on "compares against
+// a constant". The checks bind the compare to `%m` and the select to the
+// compare, as in the previous case.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @nonzero_constant_keeps_its_compare(
 // CHECK:           ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
@@ -280,27 +269,22 @@ func.func @nonzero_constant_keeps_its_compare(%m: tensor<8xf32>, %p: tensor<8xf3
 
 // -----
 
-// PURPOSE: show that one comparison serving TWO consumers is fully lowered, and
-// record what that costs.
+// PURPOSE: one comparison read by both a cast and a select is fully lowered.
 //
-// The comparison here feeds both a cast and a select, and the two have separate
-// rules. Each rule rewrites its own pair, and since neither can know the other
-// fired, each BUILDS ITS OWN `spyreop.compare` -- so the body comes out with two
-// identical compares rather than one shared. That is what the count below
-// pins. This test runs instruction selection without common-subexpression
-// elimination, so it checks both consumer rules independently. A subsequent
-// elimination pass can merge the compares and give the remaining result two uses.
+// Each consumer's rule builds its own `spyreop.compare`, so the body has two:
+//   - `%f`, from the cast rule, used as the select's first value;
+//   - `%c`, from the select rule, used as its condition.
 //
-// What matters either way is that no `arith` op survives: both pairs are consumed,
-// so no `i1` is left. This case previously lived in compare-invalid.mlir as an
-// expected FAILURE -- with no select rule the select kept the `i1` alive and the
-// kernel was refused -- and it is here now because that is no longer true.
+// The CHECK-NEXT chain pins that body exactly, so a surviving `arith.cmpf` or
+// `arith.select` fails it. This test runs no common-subexpression elimination;
+// one run afterwards could merge the two compares.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @one_compare_two_consumers(
-// CHECK-COUNT-2:   spyreop.compare <equal> {{.*}} : f16
-// CHECK:           spyreop.select {{.*}} : f16
-// CHECK-NOT:       arith.cmpf
-// CHECK-NOT:       arith.select
+// CHECK:           ^bb0(%[[A:.*]]: f16, %[[B:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT:        %[[F:.*]] = spyreop.compare <equal> %[[A]], %[[B]] : f16
+// CHECK-NEXT:        %[[C:.*]] = spyreop.compare <equal> %[[A]], %[[B]] : f16
+// CHECK-NEXT:        %[[S:.*]] = spyreop.select %[[C]], %[[F]], %[[B]] : f16
+// CHECK-NEXT:        linalg.yield %[[S]] : f16
 func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {indexing_maps = [#map, #map, #map],
@@ -317,21 +301,20 @@ func.func @one_compare_two_consumers(%x: tensor<4xf16>, %y: tensor<4xf16>) -> te
 
 // -----
 
-// PURPOSE: show what the rule does when it cannot apply, and that it declines
-// QUIETLY here rather than reporting.
+// PURPOSE: a condition passed in as an `i1` block argument is left alone, and
+// QUIETLY: no rewrite and no diagnostic.
 //
-// The condition is an `i1` the kernel was handed as an operand, not one a
-// comparison in this body produced, so there is no float for `spyreop.select` to
-// use and nothing this rule can build. The select is left exactly as it was.
+//   - No rewrite: there is no float for `spyreop.select` to take, and inventing
+//     one would mean guessing how true is encoded.
+//   - No diagnostic: an `i1` block argument is the tensor form crossing a body
+//     boundary, which FuseComputeAndDataMovement removes, not this pass.
 //
-// And no diagnostic, deliberately: an `i1` arriving as a block argument is the
-// TENSOR form crossing into a body, which an earlier pass is responsible for
-// removing, so reporting it here would blame this pass for IR it did not shape.
-// The pass reports only an `i1` made and read inside one body -- the next case.
+// The next case is the one that IS reported.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL:   func.func @condition_from_outside_is_left_alone(
-// CHECK:           arith.select
-// CHECK-NOT:       spyreop.select
+// CHECK:           ^bb0(%[[C:.*]]: i1, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
+// CHECK-NEXT:        %[[S:.*]] = arith.select %[[C]], %[[P]], %[[Q]] : f32
+// CHECK-NEXT:        linalg.yield %[[S]] : f32
 func.func @condition_from_outside_is_left_alone(%c: tensor<8xi1>, %p: tensor<8xf32>,
                                               %q: tensor<8xf32>) -> tensor<8xf32> {
   %init = tensor.empty() : tensor<8xf32>
@@ -348,15 +331,13 @@ func.func @condition_from_outside_is_left_alone(%c: tensor<8xi1>, %p: tensor<8xf
 
 // -----
 
-// PURPOSE: pin that the values being selected must be a type the device has a
-// select for, and that an integer ternary is refused rather than mislowered.
+// PURPOSE: an integer ternary is refused rather than mislowered.
 //
-// `spyreop.select` exists only for the float widths, so an i32 ternary has no
-// device form and this rule declines. The comparison feeding it is then left with
-// no selectable consumer. Unlike the previous case, where the `i1` is a block
-// argument and is exempt, this `i1` is produced by an `arith.cmpf` inside the body
-// and read inside the same body, so it IS reported: the previous case is a quiet
-// decline, this one is a diagnostic.
+// `spyreop.select` exists only for floats, so the rule declines an i32 select.
+// This differs from the previous case:
+//   - previous: the `i1` is a block argument -> quiet decline;
+//   - here: the `i1` is made by an `arith.cmpf` in this body and read in it
+//     -> reported by rejectSurvivingBooleans.
 #map = affine_map<(d0) -> (d0)>
 func.func @integer_values_are_refused(%a: tensor<8xf32>, %b: tensor<8xf32>,
                                       %p: tensor<8xi32>, %q: tensor<8xi32>) -> tensor<8xi32> {
@@ -470,8 +451,9 @@ func.func @ueq_left_zero_f32_input(%m: tensor<4xf32>, %p: tensor<4xf32>, %q: ten
 // equivalent for negative inputs or the equality boundary.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL: func.func @oge_zero_retains_compare(
-// CHECK: %[[C:.*]] = spyreop.compare <greaterequal>
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]],
+// CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT: %[[C:.*]] = spyreop.compare <greaterequal> %[[M]], %{{.*}} : f16
+// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]], %[[P]], %[[Q]] : f16
 // CHECK-NEXT: linalg.yield %[[S]] : f16
 func.func @oge_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
   %zero = arith.constant 0.0 : f16
@@ -492,8 +474,9 @@ func.func @oge_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 // equivalent for negative inputs or the equality boundary.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL: func.func @olt_zero_retains_compare(
-// CHECK: %[[C:.*]] = spyreop.compare <lesserthan>
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]],
+// CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT: %[[C:.*]] = spyreop.compare <lesserthan> %[[M]], %{{.*}} : f16
+// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]], %[[P]], %[[Q]] : f16
 // CHECK-NEXT: linalg.yield %[[S]] : f16
 func.func @olt_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
   %zero = arith.constant 0.0 : f16
@@ -514,8 +497,9 @@ func.func @olt_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 // equivalent for negative inputs or the equality boundary.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL: func.func @ole_zero_retains_compare(
-// CHECK: %[[C:.*]] = spyreop.compare <lesserequal>
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]],
+// CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT: %[[C:.*]] = spyreop.compare <lesserequal> %[[M]], %{{.*}} : f16
+// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]], %[[P]], %[[Q]] : f16
 // CHECK-NEXT: linalg.yield %[[S]] : f16
 func.func @ole_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
   %zero = arith.constant 0.0 : f16
@@ -536,8 +520,9 @@ func.func @ole_zero_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 // Retain the input element comparison rather than folding all lanes together.
 #map = affine_map<(d0) -> (d0)>
 // CHECK-LABEL: func.func @nonuniform_zero_input_retains_compare(
-// CHECK: %[[C:.*]] = spyreop.compare <notequal>
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]],
+// CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %[[X:.*]]: f16, %{{.*}}: f16):
+// CHECK-NEXT: %[[C:.*]] = spyreop.compare <notequal> %[[X]], %[[M]] : f16
+// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[C]], %[[P]], %[[Q]] : f16
 // CHECK-NEXT: linalg.yield %[[S]] : f16
 func.func @nonuniform_zero_input_retains_compare(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
   %mixed = arith.constant dense<[0.0, 1.0, -0.0, -1.0]> : tensor<4xf16>
