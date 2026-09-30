@@ -164,6 +164,16 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         Rules, a GROUP to one:
         - arith.divf(1.0, x)            → spyreop.reciprocal(x)
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate
+        - arith.cmpf + arith.select     → spyreop.select, fed by a spyreop.compare
+                                          unless the cmpf is a zero test the
+                                          select performs itself
+
+        NO NaN REACHES A COMPUTE BODY. Every rule assumes it. Under it, each
+        unordered cmpf predicate computes what its ordered counterpart does
+        (`une` as `one`, `ueq` as `oeq`, ...), so both spellings select the same
+        spyreop.compare — which is what lets Triton's `!=`, emitted as `une`,
+        lower at all. A NaN in a kernel's inputs gives an unspecified result on
+        the NaN lanes.
 
         ONE PASS FOR ALL SELECTION, and the two kinds are not two tiers. They
         share one greedy pattern set, and a group rule wins where both could
@@ -251,10 +261,6 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
           operand through the body is sound only for a value uniform across it,
           so a mixed constant matches nothing — without that, element 0 being 1.0
           would be taken for the whole tensor
-        - an UNORDERED cmpf predicate. spyreop.compare is ordered for every
-          predicate, `notequal` included, so `une` and its five siblings differ
-          from it on exactly the NaN input and mapping them across would change
-          the computed value. Declined for correctness, not for coverage.
         - `ord` and `uno`, which ask about NaN-ness rather than an ordering, and
           the constant predicates, which ask nothing. No counterpart exists.
         - arith.sitofp where uitofp was wanted: an `i1` read as signed is 0 or

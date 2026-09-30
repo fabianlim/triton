@@ -15,7 +15,7 @@
 // knows the PREDICATE. By the time the backend sees it, the failure names an op
 // several lowerings below the one the author wrote.
 //
-// Four ways in, and the diagnostic distinguishes two kinds: a predicate with no
+// Two kinds of way in, and the diagnostic distinguishes them: a predicate with no
 // counterpart at all, and a predicate that HAS one where the READER was the
 // problem. The note says which, because that is what an author can act on.
 //
@@ -35,34 +35,10 @@
 // No counterpart for the predicate
 //===----------------------------------------------------------------------===//
 
-// `une` is the one to worry about, being the plausible spelling of `a != b`.
-// `spyreop.compare` is ordered for every predicate, `notequal` included -- it
-// answers zero when either operand is NaN -- so `une`, which is TRUE there, is a
-// different computation and is not selected.
-func.func @unordered_notequal(%m: tensor<4xf16>) -> tensor<4xf16> {
-  %zero = arith.constant dense<0.0> : tensor<4xf16>
-  %init = tensor.empty() : tensor<4xf16>
-  %0 = linalg.generic {
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
-                       affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}
-      ins(%m, %zero : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
-  ^bb0(%a: f16, %z: f16, %out: f16):
-    // expected-error @below {{an i1 value survives inside a compute body}}
-    // expected-note @below {{the predicate 'une' has no spyreop.compare counterpart}}
-    %c = arith.cmpf une, %a, %z : f16
-    // expected-note @below {{read here, by 'arith.uitofp'}}
-    %f = arith.uitofp %c : i1 to f16
-    linalg.yield %f : f16
-  } -> tensor<4xf16>
-  return %0 : tensor<4xf16>
-}
-
-// -----
-
-// `ord` asks whether either operand is NaN, which a comparison intrinsic does not
-// answer at all -- a different reason for the same refusal, and the note says so
-// in the same sentence.
+// `ord` asks whether neither operand is NaN, which a comparison intrinsic does
+// not answer directly. The unordered orderings (`une`, `ugt`, ...) are NOT here: under
+// the pass's no-NaN assumption each computes what its ordered counterpart does,
+// and compare.mlir's `all_unordered_predicates` pins that they are selected.
 func.func @ord_has_no_counterpart(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
   %init = tensor.empty() : tensor<4xf16>
   %0 = linalg.generic {
@@ -132,3 +108,68 @@ func.func @width_change(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf16> {
   return %0 : tensor<4xf16>
 }
 
+
+// -----
+
+// Unorderedness cannot be converted to a device numeric comparison.
+func.func @uno_has_no_counterpart(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    // expected-error @below {{an i1 value survives inside a compute body}}
+    // expected-note @below {{the predicate 'uno' has no spyreop.compare counterpart}}
+    %c = arith.cmpf uno, %a, %b : f16
+    // expected-note @below {{read here, by 'arith.uitofp'}}
+    %f = arith.uitofp %c : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
+}
+
+
+// -----
+
+// Constant predicates retained in a body have no device comparison counterpart.
+func.func @false_has_no_counterpart(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    // expected-error @below {{an i1 value survives inside a compute body}}
+    // expected-note @below {{the predicate 'false' has no spyreop.compare counterpart}}
+    %c = arith.cmpf false, %a, %b : f16
+    // expected-note @below {{read here, by 'arith.uitofp'}}
+    %f = arith.uitofp %c : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
+}
+
+
+// -----
+
+// Constant predicates retained in a body have no device comparison counterpart.
+func.func @true_has_no_counterpart(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    // expected-error @below {{an i1 value survives inside a compute body}}
+    // expected-note @below {{the predicate 'true' has no spyreop.compare counterpart}}
+    %c = arith.cmpf true, %a, %b : f16
+    // expected-note @below {{read here, by 'arith.uitofp'}}
+    %f = arith.uitofp %c : i1 to f16
+    linalg.yield %f : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
+}

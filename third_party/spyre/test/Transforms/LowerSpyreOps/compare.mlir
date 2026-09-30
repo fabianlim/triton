@@ -108,6 +108,57 @@ func.func @all_ordered_inequalities(%x: tensor<4xf16>, %y: tensor<4xf16>) -> ten
 
 // -----
 
+// All six UNORDERED predicates, each selected as its ordered counterpart. The two
+// spellings differ only when an operand is NaN, and the pass assumes no NaN (see
+// NO NaN REACHES A COMPUTE BODY in LowerSpyreOps.cpp). `une` is the case that
+// matters in practice: it is what Triton emits for `!=`, so without this mapping
+// `(a != b).to(f16)` had no device form and was refused.
+//
+// Operand order is checked as well as the predicate: `ugt %a, %b` must become
+// `greaterthan %a, %b`, and a mapping that swapped the operands would compute
+// `lesserthan` while printing the right name.
+// CHECK-LABEL:   func.func @all_unordered_predicates(
+// CHECK-NOT:       arith.cmpf
+// CHECK:           ^bb0(%[[A:.*]]: f16, %[[B:.*]]: f16, %{{.*}}: f16):
+// CHECK:             spyreop.compare <equal> %[[A]], %[[B]] : f16
+// CHECK:             spyreop.compare <notequal> %[[A]], %[[B]] : f16
+// CHECK:             spyreop.compare <greaterthan> %[[A]], %[[B]] : f16
+// CHECK:             spyreop.compare <greaterequal> %[[A]], %[[B]] : f16
+// CHECK:             spyreop.compare <lesserthan> %[[A]], %[[B]] : f16
+// CHECK:             spyreop.compare <lesserequal> %[[A]], %[[B]] : f16
+// CHECK-NOT:       arith.cmpf
+func.func @all_unordered_predicates(%x: tensor<4xf16>, %y: tensor<4xf16>) -> tensor<4xf16> {
+  %init = tensor.empty() : tensor<4xf16>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                       affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%x, %y : tensor<4xf16>, tensor<4xf16>) outs(%init : tensor<4xf16>) {
+  ^bb0(%a: f16, %b: f16, %out: f16):
+    %c0 = arith.cmpf ueq, %a, %b : f16
+    %f0 = arith.uitofp %c0 : i1 to f16
+    %c1 = arith.cmpf une, %a, %b : f16
+    %f1 = arith.uitofp %c1 : i1 to f16
+    %c2 = arith.cmpf ugt, %a, %b : f16
+    %f2 = arith.uitofp %c2 : i1 to f16
+    %c3 = arith.cmpf uge, %a, %b : f16
+    %f3 = arith.uitofp %c3 : i1 to f16
+    %c4 = arith.cmpf ult, %a, %b : f16
+    %f4 = arith.uitofp %c4 : i1 to f16
+    %c5 = arith.cmpf ule, %a, %b : f16
+    %f5 = arith.uitofp %c5 : i1 to f16
+    %s0 = arith.addf %f0, %f1 : f16
+    %s1 = arith.addf %f2, %f3 : f16
+    %s2 = arith.addf %f4, %f5 : f16
+    %s3 = arith.addf %s0, %s1 : f16
+    %s = arith.addf %s3, %s2 : f16
+    linalg.yield %s : f16
+  } -> tensor<4xf16>
+  return %0 : tensor<4xf16>
+}
+
+// -----
+
 // THE SCOPE, and it is the scope of the DIAGNOSTIC too. The same pair outside any
 // generic body is not matched -- the body is where compute is -- and it is not
 // refused either, because the `i1` check walks generic bodies and nothing else. An
