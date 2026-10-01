@@ -15,10 +15,9 @@
 // it.
 //
 // No single pass can make this claim, which is why it is here. LowerSpyreOps'
-// group rule chooses the unary intrinsic and its 1:1 rule would have chosen the
-// binary one, so what is under test is not which rule wins -- that is the pass's
-// own test -- but that the stage delivers a body in the form the group rule can
-// read at all.
+// divf rule chooses between the unary and the binary intrinsic, so what is under
+// test is not that choice -- that is the pass's own test -- but that the stage
+// delivers a body in the form the rule can read at all.
 //
 // WHY THE CONSTANT HAS TO GO. A float immediate reaching a Spyre compute unit is
 // not read back as it was written, so a divide by a rounded one is not the divide

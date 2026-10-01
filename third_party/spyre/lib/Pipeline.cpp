@@ -196,8 +196,8 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
 
   // Instruction selection: the arith and math ops in each compute body become the
   // spyreop intrinsics that do the same thing. One pass for all of it -- the
-  // one-op-to-one rules and the group rules share a pattern set, and specificity
-  // rather than a declared order decides between two that could both match.
+  // one-op-to-one rules and the group rules share a pattern set, each rooted on
+  // a different op.
   //
   // Needs every compute to be a linalg.generic, which the passes above make it: a
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed

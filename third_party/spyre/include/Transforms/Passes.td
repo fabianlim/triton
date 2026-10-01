@@ -156,13 +156,13 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         - math.sqrt  (f16 or f32)                 → spyreop.sqrt
         - math.exp   (f16 or f32)                 → spyreop.exp
         - math.rsqrt (f16 or f32)                 → spyreop.rsqrt
-        - arith.divf (f16 or f32)                 → spyreop.realdiv
+        - arith.divf (f16 or f32), numerator 1.0  → spyreop.reciprocal
+        - arith.divf (f16 or f32), otherwise      → spyreop.realdiv
         - arith.addi (i32, inside linalg.generic) → spyreop.addi32toi32
         - arith.addi (i64, inside linalg.generic) → spyreop.addi64toi64
         - arith.muli (i32, inside linalg.generic) → spyreop.muli32toi32
 
         Rules, a GROUP to one:
-        - arith.divf(1.0, x)            → spyreop.reciprocal(x)
         - arith.cmpf + arith.uitofp     → spyreop.compare, carrying the predicate
         - arith.cmpf + arith.select     → spyreop.select, fed by a spyreop.compare
                                           unless the cmpf is a zero test the
@@ -176,10 +176,8 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         the NaN lanes.
 
         ONE PASS FOR ALL SELECTION, and the two kinds are not two tiers. They
-        share one greedy pattern set, and a group rule wins where both could
-        apply because it is more specific: a divf with a constant-one numerator
-        is claimed by the reciprocal rule and the realdiv rule never sees it. No
-        order is declared anywhere.
+        share one greedy pattern set, and no two rules are rooted on the same
+        op, so no order is declared anywhere.
 
         A GROUP IS WHAT IS SELECTABLE when no member of it could have been
         selected alone — the criterion, and not the op count. `arith.cmpf`

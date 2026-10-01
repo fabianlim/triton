@@ -12,17 +12,17 @@
 //
 // ONE PASS FOR ALL SELECTION, and the two kinds of rule are not two tiers:
 //
-//   one op to one   math.sqrt -> spyreop.sqrt, and so on. Type-driven.
-//   a GROUP to one  `1.0 / x` -> spyreop.reciprocal; a compare and a cast ->
-//                   spyreop.compare. The group is what is selectable: no
-//                   member of it could have been selected alone.
+//   one op to one   math.sqrt -> spyreop.sqrt, and so on. `arith.divf`
+//                   picks its target from the numerator: `1.0 / x` ->
+//                   spyreop.reciprocal, anything else -> spyreop.realdiv.
+//   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
+//                   is selectable: no member of it could have been selected
+//                   alone.
 //
-// They share one greedy pattern set, and a group rule wins where both could
-// apply because it is more specific: a `divf` with a constant-one numerator is
-// claimed by the reciprocal rule and the realdiv rule never sees it. No order
-// is declared anywhere. Splitting these across two passes is what an earlier
-// shape did, and it bought a standing question -- which pass claims this op --
-// for nothing.
+// They share one greedy pattern set, and no two rules are rooted on the same
+// op, so no rule has to win over another and no order is declared anywhere.
+// Splitting these across two passes is what an earlier shape did, and it
+// bought a standing question -- which pass claims this op -- for nothing.
 //
 // EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is
@@ -274,64 +274,15 @@ struct SelectUnaryFloat : public OpRewritePattern<Source> {
 };
 
 //===----------------------------------------------------------------------===//
-// A group to one: arith.divf with a numerator of one -> spyreop.reciprocal
+// One op to one: arith.divf -> spyreop.reciprocal or spyreop.realdiv
 //===----------------------------------------------------------------------===//
 
-/// `1.0 / x` is two ops -- the constant and the divide -- and the device does
-/// it in one. Replacing them with the unary intrinsic takes the float immediate
-/// out of the program entirely, which is what this rule is for: a float
-/// immediate reaching a Spyre compute unit is not read back as it was written,
-/// so a divide by a rounded one is not the divide that was written. Nothing
-/// downstream refuses it, so the rule is what protects the kernel rather than a
-/// diagnostic being what reports it. test/fixtures/reduce/meta.py records the
-/// observation, and `reduce/softmax_on_stick` is the kernel that depends on it.
+/// `1.0 / x` -> `spyreop.reciprocal x`; any other `a / b` ->
+/// `spyreop.realdiv a, b`.
 ///
-/// MORE SPECIFIC THAN SelectArithDivF below, and that is how it wins: both
-/// could match, this one claims the op, and the realdiv rule never sees it.
-///
-/// The numerator is read THROUGH the body, so both forms match: the scalar
-/// constant FuseComputeAndDataMovement hoists above the generic, and the splat
-/// `ins` operand `tl.full` produces before it has run. In the second case the
-/// block argument goes unused and upstream's erasure takes the operand, its
-/// block argument and its indexing map with it -- the whole of what this rule
-/// has to do about the operand list.
-struct SelectReciprocal : public OpRewritePattern<arith::DivFOp> {
-  using OpRewritePattern::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(arith::DivFOp op,
-                                PatternRewriter &rewriter) const override {
-    linalg::GenericOp generic = computeBodyOf(op);
-    if (!generic)
-      return failure(); // Silent: most ops in a module are not in a body.
-    if (!isSpyreOpScalarType(op.getType()))
-      return failure();
-
-    Value numerator = resolveThroughBody(generic, op.getLhs());
-    if (!matchPattern(numerator, m_OneFloat())) {
-      traceDecline(op, isa<BlockArgument>(numerator)
-                           ? "numerator resolves to a block argument, so it "
-                             "names no value this rule can read"
-                           : "numerator is not a constant 1.0");
-      return failure();
-    }
-
-    traceMatch(op, "-> spyreop.reciprocal; the numerator is left to dead-op "
-                   "elimination, and its `ins` operand, if it had one, to "
-                   "upstream's unused-operand erasure");
-    rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
-                                                     op.getRhs());
-    return success();
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// One op to one: arith.divf -> spyreop.realdiv
-//===----------------------------------------------------------------------===//
-
-/// Unconditional on the numerator. A constant one is not a different lowering,
-/// it is a group the device has one op for, and SelectReciprocal claims it
-/// first by being more specific. A divide reaching this rule already means no
-/// group rule wanted it.
+/// The numerator is read through the enclosing body when there is one, so a
+/// one passed in as a splat `ins` operand matches as well as a scalar
+/// constant. Its unused block argument is then erased upstream.
 struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -339,6 +290,17 @@ struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
                                 PatternRewriter &rewriter) const override {
     if (!isSpyreOpScalarType(op.getType()))
       return failure();
+
+    Value numerator = op.getLhs();
+    if (linalg::GenericOp generic = computeBodyOf(op))
+      numerator = resolveThroughBody(generic, numerator);
+    if (matchPattern(numerator, m_OneFloat())) {
+      traceMatch(op, "numerator is 1.0 -> spyreop.reciprocal");
+      rewriter.replaceOpWithNewOp<spyreop::Reciprocal>(op, op.getType(),
+                                                       op.getRhs());
+      return success();
+    }
+
     rewriter.replaceOpWithNewOp<spyreop::RealDiv>(op, op.getType(), op.getLhs(),
                                                   op.getRhs());
     return success();
@@ -685,10 +647,9 @@ struct LowerSpyreOpsPass
     MLIRContext *ctx = &getContext();
 
     RewritePatternSet patterns(ctx);
-    // One line per rule, group rules and 1:1 rules in one set: specificity
-    // rather than a declared order is what decides between two that could both
-    // match. See ONE PASS FOR ALL SELECTION in the header.
-    patterns.add<SelectReciprocal, SelectCompare, SelectWhere>(ctx);
+    // One line per rule, group rules and 1:1 rules in one set, each rooted on
+    // a different op. See ONE PASS FOR ALL SELECTION in the header.
+    patterns.add<SelectCompare, SelectWhere>(ctx);
     patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
                  SelectUnaryFloat<math::ExpOp, spyreop::Exp>,

@@ -1,6 +1,7 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
 
-// Rule 1: `1.0 / x` is two ops, and the device does it in one.
+// `arith.divf` with a constant 1.0 numerator -> `spyreop.reciprocal`; any other
+// numerator -> `spyreop.realdiv`. One rule, SelectArithDivF, chooses between them.
 //
 // The case this file exists for is the FIRST one: the `1.0` is a splat `ins`
 // operand and the numerator in the body is a BLOCK ARGUMENT. Reading the operand
@@ -9,10 +10,6 @@
 // this rule needs nothing to have folded the constant in first -- unlike the
 // compare rule, which does need its group brought into one body. This whole file
 // therefore runs --lower-spyre-ops alone.
-//
-// Every case where the group rule DECLINES shows `spyreop.realdiv`, not
-// `arith.divf`: selection is one pass, so what the group rule leaves the 1:1 rule
-// takes, in the same fixpoint.
 //
 // `func.func`, not `tt.func`, because that is what this pass sees: it runs in the
 // `spyrecode` stage, long after ConvertFunctions.
@@ -118,17 +115,12 @@ func.func @recip_shared_numerator(%t: tensor<4xf16>) -> tensor<4xf16> {
 
 // -----
 
-// THE SCOPE, as a test, and the clearest case of the two rule kinds meeting. The
-// same divide OUTSIDE any generic body is not matched by the GROUP rule -- the body
-// is where compute is, and a rule that fired anywhere would be claiming to know
-// that an op found elsewhere is compute. The 1:1 realdiv rule has no such scope and
-// takes it, in the same pass and the same fixpoint. So the constant stays alive and
-// the binary op ships, which is the right answer for a divide nobody could prove
-// was a reciprocal.
+// The same divide outside any generic body is a reciprocal too: the numerator is
+// read directly when there is no body to read it through.
 // CHECK-LABEL:   func.func @recip_outside_a_body(
-// CHECK-NOT:       spyreop.reciprocal
-// CHECK:           %[[ONE:.*]] = arith.constant 1.000000e+00 : f16
-// CHECK:           %[[R:.*]] = spyreop.realdiv %[[ONE]], %{{.*}} : f16
+// CHECK-NOT:       arith.constant
+// CHECK-NOT:       spyreop.realdiv
+// CHECK:           %[[R:.*]] = spyreop.reciprocal %{{.*}} : f16
 func.func @recip_outside_a_body(%x: f16) -> f16 {
   %one = arith.constant 1.0 : f16
   %0 = arith.divf %one, %x : f16
@@ -137,9 +129,8 @@ func.func @recip_outside_a_body(%x: f16) -> f16 {
 
 // -----
 
-// A numerator that is not one gets the BINARY intrinsic, constant and all. The
-// group rule matches on the VALUE, not on "there is a constant on the left", and
-// what it declines the 1:1 rule takes.
+// A numerator that is not one gets the BINARY intrinsic, constant and all: the
+// rule matches on the VALUE, not on "there is a constant on the left".
 // CHECK-LABEL:   func.func @divf_two_over_x(
 // CHECK-NOT:       spyreop.reciprocal
 // CHECK:           spyreop.realdiv
