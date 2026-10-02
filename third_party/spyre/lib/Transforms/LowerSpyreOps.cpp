@@ -155,25 +155,9 @@ unsigned getScalarIntBitWidth(Type type) {
 /// `arith.muli` that will be inside a body once scalarized -- and it holds
 /// today only because the tensor-of-pointers `tt.load` path is unimplemented.
 /// Stated rather than glossed. The group rules use the enclosing generic as a
-/// SCOPE instead, through computeBodyOf, which asks a different and exact
-/// question.
+/// SCOPE instead, requiring the generic to be their immediate parent.
 bool isInsideLinalgGeneric(Operation *op) {
   return op->getParentOfType<linalg::GenericOp>() != nullptr;
-}
-
-/// The `linalg.generic` whose body `op` sits directly in, or null.
-///
-/// The scope for a group rule. Not a claim about the op -- see THE GENERIC BODY
-/// IS THE SCOPE in the header.
-linalg::GenericOp computeBodyOf(Operation *op) {
-  auto generic = op->getParentOfType<linalg::GenericOp>();
-  if (!generic)
-    return nullptr;
-  // A generic reached through some other region in between is not this op's
-  // compute body. Nothing in this tree produces that shape, and a rule reading
-  // the wrong operand list would be silent, so it is checked rather than
-  // assumed.
-  return op->getBlock() == generic.getBlock() ? generic : nullptr;
 }
 
 /// What `v` names from OUTSIDE `generic`'s body: the matching `ins` operand
@@ -200,10 +184,8 @@ Value resolveThroughBody(linalg::GenericOp generic, Value v) {
   auto arg = dyn_cast<BlockArgument>(v);
   if (!arg || arg.getOwner() != generic.getBlock())
     return v;
-  unsigned n = arg.getArgNumber();
-  if (n >= static_cast<unsigned>(generic.getNumDpsInputs()))
-    return v;
-  return generic.getDpsInputs()[n];
+  OpOperand *operand = generic.getMatchingOpOperand(arg);
+  return generic.isDpsInput(operand) ? operand->get() : v;
 }
 
 /// The spyreop predicate computing the same thing as `p`, or nothing:
@@ -249,6 +231,33 @@ void traceMatch(Operation *root, const llvm::Twine &what) {
                           << root->getLoc() << ": " << what << "\n");
 }
 
+/// Matches a floating-point comparison feeding a single-result consumer
+/// directly inside a linalg.generic body. The consumer and compared values
+/// must have the same scalar f16 or f32 type. Returns null on a mismatch;
+/// predicate support remains the caller's responsibility.
+arith::CmpFOp matchComparedInput(Operation *consumer, Value input) {
+  auto generic = dyn_cast<linalg::GenericOp>(consumer->getParentOp());
+  if (!generic)
+    return nullptr;
+  Type resultType = consumer->getResult(0).getType();
+  if (!isSpyreOpScalarType(resultType)) {
+    traceDecline(consumer, "no spyreop intrinsic for this result type");
+    return nullptr;
+  }
+  auto cmp = resolveThroughBody(generic, input).getDefiningOp<arith::CmpFOp>();
+  if (!cmp) {
+    traceDecline(consumer, "operand is not an arith.cmpf");
+    return nullptr;
+  }
+  // Device comparison and selection require identical input and result types.
+  if (cmp.getLhs().getType() != resultType) {
+    traceDecline(consumer, "the compared type and the consumer's result type "
+                           "differ, which one spyreop intrinsic cannot express");
+    return nullptr;
+  }
+  return cmp;
+}
+
 //===----------------------------------------------------------------------===//
 // One op to one: the unary float math ops
 //===----------------------------------------------------------------------===//
@@ -292,7 +301,7 @@ struct SelectArithDivF : public OpRewritePattern<arith::DivFOp> {
       return failure();
 
     Value numerator = op.getLhs();
-    if (linalg::GenericOp generic = computeBodyOf(op))
+    if (linalg::GenericOp generic = dyn_cast<linalg::GenericOp>(op->getParentOp()))
       numerator = resolveThroughBody(generic, numerator);
     if (matchPattern(numerator, m_OneFloat())) {
       traceMatch(op, "numerator is 1.0 -> spyreop.reciprocal");
@@ -337,31 +346,9 @@ struct SelectCompare : public OpRewritePattern<arith::UIToFPOp> {
 
   LogicalResult matchAndRewrite(arith::UIToFPOp op,
                                 PatternRewriter &rewriter) const override {
-    linalg::GenericOp generic = computeBodyOf(op);
-    if (!generic)
+    auto cmp = matchComparedInput(op, op.getIn());
+    if (!cmp)
       return failure();
-    if (!isSpyreOpScalarType(op.getType())) {
-      traceDecline(op, "no spyreop intrinsic for this result type");
-      return failure();
-    }
-
-    // Resolved through the body, because a compare could in principle have been
-    // computed outside the generic and carried in -- in which case there is no
-    // compare here to merge with, and the resolved value is not a cmpf.
-    auto cmp =
-        resolveThroughBody(generic, op.getIn()).getDefiningOp<arith::CmpFOp>();
-    if (!cmp) {
-      traceDecline(op, "operand is not an arith.cmpf");
-      return failure();
-    }
-    // The compared width is the intrinsic's whole type, by
-    // SameOperandsAndResultType: comparing f32 and casting to f16 is a
-    // narrowing this one op cannot express.
-    if (cmp.getLhs().getType() != op.getType()) {
-      traceDecline(op, "the compared type and the cast's result type differ, "
-                       "which one spyreop.compare cannot express");
-      return failure();
-    }
 
     std::optional<spyreop::ComparePredicate> predicate =
         spyrePredicateFor(cmp.getPredicate());
@@ -451,32 +438,11 @@ struct SelectWhere : public OpRewritePattern<arith::SelectOp> {
 
   LogicalResult matchAndRewrite(arith::SelectOp op,
                                 PatternRewriter &rewriter) const override {
-    linalg::GenericOp generic = computeBodyOf(op);
-    if (!generic)
+    auto cmp = matchComparedInput(op, op.getCondition());
+    if (!cmp)
       return failure();
+    auto generic = cast<linalg::GenericOp>(op->getParentOp());
     Type selected = op.getType();
-    if (!isSpyreOpScalarType(selected)) {
-      traceDecline(op, "no spyreop intrinsic for this result type");
-      return failure();
-    }
-
-    // Resolved through the body for the reason SelectCompare states: the
-    // comparison may have been computed outside this generic and carried in, in
-    // which case there is nothing here to merge with.
-    auto cmp = resolveThroughBody(generic, op.getCondition())
-                   .getDefiningOp<arith::CmpFOp>();
-    if (!cmp) {
-      traceDecline(op, "condition is not an arith.cmpf");
-      return failure();
-    }
-    // The compared width is the intrinsic's whole type, by
-    // SameOperandsAndResultType -- selecting f16 on an f32 comparison is a
-    // narrowing one spyreop.select cannot express.
-    if (cmp.getLhs().getType() != selected) {
-      traceDecline(op, "the compared type and the selected type differ, which "
-                       "one spyreop.select cannot express");
-      return failure();
-    }
 
     std::optional<ZeroTestSelect> zeroTest = selectFromZeroTest(generic, cmp);
     StringRef predicateName = arith::stringifyCmpFPredicate(cmp.getPredicate());
