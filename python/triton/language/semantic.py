@@ -2133,10 +2133,12 @@ class TritonSemantic(Generic[TensorTy]):
             if a.type.scalar not in entry.dtypes:
                 raise ValueError(f"tl.spyre_op({name!r}): the intrinsic takes "
                                  f"{[d.name for d in entry.dtypes]}, not {a.type.scalar.name}")
-        result_types = entry.result_types([a.type for a in args])
+        # The result is operand 0's type, for every target.
+        result_types = [args[0].type]
 
         # Built empty, then traced into: a region belongs to an op, so the op has
-        # to exist first -- and that is why its result types are the registry's.
+        # to exist first -- and that is why its result type is fixed beforehand
+        # rather than read off the fallback.
         from triton._C.libtriton import spyre
         op = spyre.ir_builders.create_spyre_op(self.builder, name, [a.handle for a in args],
                                                [t.to_ir(self.builder) for t in result_types])
@@ -2150,7 +2152,8 @@ class TritonSemantic(Generic[TensorTy]):
             got = [r.type for r in results]
             if got != list(result_types):
                 raise ValueError(f"tl.spyre_op({name!r}): the registered fallback returns "
-                                 f"{got}, but the intrinsic declares {list(result_types)}")
+                                 f"{got}, but a request returns operand 0's type, "
+                                 f"{list(result_types)}")
             spyre.ir_builders.create_spyre_op_yield(self.builder, [r.handle for r in results])
         finally:
             self.builder.restore_insertion_point(ip)

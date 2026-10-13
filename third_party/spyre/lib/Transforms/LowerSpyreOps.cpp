@@ -555,7 +555,9 @@ struct CallSiteMatch {
 };
 
 /// Whether `generic`'s body is one call site, and what it reads. Fails on a
-/// body with no hinted op, which is not a call site.
+/// body getBodyCallSite names no call site for: one with no hinted op, which is
+/// not a call site, or with the ops of two, which is left for
+/// rejectSurvivingHints.
 ///
 /// FuseComputeAndDataMovement has already checked that a body holding hinted
 /// ops holds one call site, whole, and nothing else but constants, so what is
@@ -566,14 +568,12 @@ struct CallSiteMatch {
 /// operand order.
 FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic) {
   CallSiteMatch match;
+  match.hint = triton::tts::getBodyCallSite(*generic.getBlock());
+  if (!match.hint)
+    return failure();
   for (Operation &op : generic.getBlock()->without_terminator())
     if (!op.hasTrait<OpTrait::ConstantLike>())
       match.members.push_back(&op);
-  for (Operation *op : match.members)
-    if ((match.hint = triton::tts::getSpyreopHint(op)))
-      break;
-  if (!match.hint)
-    return failure();
 
   llvm::SmallSetVector<BlockArgument, 2> read;
   for (Operation *op : match.members)

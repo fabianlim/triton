@@ -37,7 +37,7 @@
 // And one clause that is a REQUEST rather than a property of the IR:
 //
 //   ONE BODY PER CALL SITE   fuse a producer into its consumer when both
-//            bodies carry the same `tts.spyreop_hint`, i.e. both hold ops
+//            bodies carry `tts.spyreop_hint`s of one `id`, i.e. both hold ops
 //            LowerTTSMarkers inlined out of one `tts.spyre_op`. Each tensor op
 //            of the call site's fallback arrives in a generic of its own, and
 //            LowerSpyreOps replaces a call site only as one whole body. See
@@ -343,50 +343,26 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
   return true;
 }
 
-/// The `tl.spyre_op` call site whose ops `op`'s body holds: the one
-/// `tts.spyreop_hint` its hinted ops share, or null when `op` is not a generic,
-/// holds no hinted op, or holds hinted ops of two call sites. With `<silu#0>`
-/// for the hint `{target = "spyreop.silu", id = 0}`:
-///
-///   {exp<silu#0>, addf<silu#0>}   -> silu#0
-///   {exp<silu#0>, cst}            -> silu#0
-///   {exp<silu#0>, mulf<gelu#1>}   -> null
-///
-/// The hint is on the BODY ops and not on the generics, because every pass that
-/// rebuilds a generic -- this pass's own fusion among them -- drops the generic's
-/// attributes and keeps the body's; see `kSpyreopHintAttrName`. A constant does
-/// not count: the canonicalizer hoists and merges constants without regard to
-/// hints, so a constant says nothing about which call site a body belongs to.
-DictionaryAttr callSiteOfBody(Operation *op) {
-  auto generic = dyn_cast_or_null<linalg::GenericOp>(op);
-  if (!generic)
-    return {};
-  DictionaryAttr found;
-  bool mixed = false;
-  generic.getBlock()->walk([&](Operation *bodyOp) {
-    if (bodyOp->hasTrait<OpTrait::ConstantLike>())
-      return;
-    DictionaryAttr hint = triton::tts::getSpyreopHint(bodyOp);
-    if (!hint)
-      return;
-    if (found && found != hint)
-      mixed = true;
-    found = hint;
-  });
-  return mixed ? DictionaryAttr() : found;
-}
-
 /// The THIRD clause: whether the producer and the consumer of `fusedOperand`
-/// both hold ops of one call site, by callSiteOfBody. Fusing a producer
-/// `<silu#0>` into a consumer `<silu#0>` -> yes; into `<silu#1>` -> no; into
-/// an unhinted consumer -> no.
+/// are both generics whose bodies hold ops of one call site, by
+/// getBodyCallSite. Fusing a producer `<silu#0>` into a consumer `<silu#0>` ->
+/// yes; into `<silu#1>` -> no; into an unhinted consumer -> no.
 ///
 /// Not gated on hasOneUse, like the other two: a producer of a call site read
 /// by two consumers of the same call site is fused into each, which duplicates
 /// part of the fallback inside the one body LowerSpyreOps then replaces whole.
 bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
-  DictionaryAttr producer = callSiteOfBody(fusedOperand->get().getDefiningOp());
-  if (!producer || producer != callSiteOfBody(fusedOperand->getOwner()))
+  auto callSite = [](Operation *op) -> DictionaryAttr {
+    auto generic = dyn_cast_or_null<linalg::GenericOp>(op);
+    return generic ? triton::tts::getBodyCallSite(*generic.getBlock())
+                   : DictionaryAttr();
+  };
+  DictionaryAttr producer = callSite(fusedOperand->get().getDefiningOp());
+  if (!producer)
+    return false;
+  DictionaryAttr consumer = callSite(fusedOperand->getOwner());
+  if (!consumer || triton::tts::getSpyreopHintId(producer) !=
+                       triton::tts::getSpyreopHintId(consumer))
     return false;
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
                           << producer << " into "
@@ -1032,16 +1008,30 @@ struct FuseComputeAndDataMovementPass
     };
     int genericsBefore = countGenerics();
 
+    // Whether any `tl.spyre_op` call site is in the module, asked once: the
+    // third clause and its post-check are about call sites only, and without
+    // one the clause would walk both bodies of every candidate to find no hint
+    // and the post-check the whole module. Fusion carries a hint over with the
+    // body op holding it and no pattern here writes one, so the answer before
+    // the fixpoint holds through it.
+    bool hasCallSites =
+        mod.walk([](Operation *op) {
+             return triton::tts::getSpyreopHint(op) ? WalkResult::interrupt()
+                                                    : WalkResult::advance();
+           })
+            .wasInterrupted();
+
     RewritePatternSet patterns(ctx);
     // Upstream does the map composition; the control function decides which
     // fusions are allowed to happen at all. THREE clauses, and they are
     // independent reasons rather than one policy split up -- the two halves
     // the pass is named for, and the call site; see the header.
     linalg::ControlFusionFn fuseWhatMustNotSurvive =
-        [](OpOperand *fusedOperand) {
+        [hasCallSites](OpOperand *fusedOperand) {
           return isPureDataMovement(fusedOperand->get().getDefiningOp()) ||
                  isUnrepresentableIntermediate(fusedOperand) ||
-                 producerAndConsumerShareCallSite(fusedOperand);
+                 (hasCallSites &&
+                  producerAndConsumerShareCallSite(fusedOperand));
         };
     linalg::populateElementwiseOpsFusionPatterns(patterns,
                                                  fuseWhatMustNotSurvive);
@@ -1056,7 +1046,7 @@ struct FuseComputeAndDataMovementPass
     // report anything. The call sites the third clause fused are checked the
     // same way.
     LogicalResult gate = rejectOnPhysicalizedPaths(mod, tally);
-    LogicalResult fused = checkCallSitesFused(mod);
+    LogicalResult fused = hasCallSites ? checkCallSitesFused(mod) : success();
 
     LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] done: " << tally.absorbed
                             << " operand(s) absorbed, " << tally.genericsRemoved

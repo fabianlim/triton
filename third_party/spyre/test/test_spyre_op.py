@@ -16,8 +16,8 @@ The last is reproduced with the registered pipeline rather than through the
 ``spyrecode`` stage itself, which shells out to dbo-opt -- CLAUDE.md's
 "Reproducing that module". And the refusals the frontend owns: a target with no
 fallback registered, a dtype the registration does not take, the wrong arity, a
-fallback returning other types than declared, and the registrations the
-decorator refuses.
+fallback returning other than operand 0's type, and the registrations the
+decorator refuses -- among them a target that is not a registered op.
 
 Numerical coverage of the real fallbacks, through ``ktir_cpu``, is the
 ``spyreop`` fixture's.
@@ -192,6 +192,22 @@ def test_an_op_class_registers_as_its_name(register):
 def test_a_dtype_that_is_not_a_tl_dtype_is_refused(register):
     with pytest.raises(TypeError, match="takes dtypes as tl dtypes, got 'fp16'"):
         register(dtypes=("fp16", ))
+
+
+@pytest.mark.parametrize("target", ["spyreop.sigmiod", "sigmoid"])
+def test_a_target_that_is_not_a_registered_op_is_refused(register, target):
+    with pytest.raises(ValueError, match=f"target '{target}' is not a registered op"):
+        register(target)
+
+
+def test_a_fallback_taking_no_operand_is_refused(register):
+
+    @triton.jit
+    def nullary():
+        return tl.full([128], 1.0, tl.float32)
+
+    with pytest.raises(ValueError, match="takes no operand"):
+        register()(nullary)
 
 
 def test_a_second_fallback_for_one_name_is_refused(register):

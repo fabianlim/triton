@@ -148,8 +148,8 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
     before its region is traced -- a region belongs to an op -- so the frontend
-    takes the result types from the registration's rule for `target` and
-    refuses a fallback whose returned types differ, at the kernel line.
+    gives it one result of operand 0's type, for every target, and refuses a
+    fallback whose returned types differ, at the kernel line.
 
     `IsolatedFromAbove`, so the body reads nothing but its block arguments: a
     value the kernel computed outside reaches the fallback only as an operand,
@@ -164,8 +164,9 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
     body, and LowerSpyreOps replaces that body with the target.
 
     WHICH TARGETS EXIST, and what each takes, is the frontend's registration
-    (`backend/intrinsics.py`), not this dialect's: it checks the operand count,
-    the dtypes and the result types when the call is traced. The IR carries the
+    (`backend/intrinsics.py`), not this dialect's: it checks that `target` is a
+    registered op when a fallback is registered, and the operand count, the
+    dtypes and the result type when the call is traced. The IR carries the
     target by name, so the checks below hold for hand-written IR too, and what
     is target-specific is checked once more by the target op's own verifier,
     when LowerSpyreOps builds it.

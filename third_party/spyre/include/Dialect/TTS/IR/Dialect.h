@@ -54,7 +54,7 @@ namespace mlir::triton::tts {
 /// dialect's attribute verifier has already held the value to its spelling --
 /// a dictionary of exactly a string `target` and an i64 `id` -- so a non-null
 /// result has both entries. Two ops come from one call site exactly when their
-/// hints are equal.
+/// hints have one `id`.
 DictionaryAttr getSpyreopHint(Operation *op);
 
 /// The op a hint returned by getSpyreopHint names.
@@ -62,6 +62,27 @@ StringRef getSpyreopHintTarget(DictionaryAttr hint);
 
 /// The call-site id of a hint returned by getSpyreopHint.
 int64_t getSpyreopHintId(DictionaryAttr hint);
+
+/// The `tl.spyre_op` call site whose ops `body` holds: the hint of its hinted
+/// ops, when they all have one `id`, or null when `body` holds no hinted op or
+/// hinted ops of two call sites. With `<silu#0>` for the hint
+/// `{target = "spyreop.silu", id = 0}`:
+///
+///   {exp<silu#0>, addf<silu#0>}   -> silu#0
+///   {exp<silu#0>, cst}            -> silu#0
+///   {exp<silu#0>, mulf<gelu#1>}   -> null
+///
+/// Ops in nested regions count. A constant does not, hinted or not: passes
+/// create, merge and fold constants without regard to hints, so one says
+/// nothing about which call site a body belongs to. Two call sites are told
+/// apart by `id` alone; whether the ops of one `id` agree on `target` is
+/// FuseComputeAndDataMovement's post-check, not this.
+///
+/// A block and not a linalg.generic, though a generic's body is what every
+/// caller asks about: what a body is depends on no dialect, and the hint is
+/// carried on the body's ops rather than on the op owning it, because a pass
+/// rebuilding that op keeps the body's attributes and drops its own.
+DictionaryAttr getBodyCallSite(Block &body);
 
 /// Copies every `tts.*` discardable attribute of `from` onto `to`, overwriting
 /// one `to` already has. For a rewrite that replaces `from` with a new `to`

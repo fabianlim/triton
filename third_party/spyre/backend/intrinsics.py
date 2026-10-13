@@ -13,10 +13,13 @@ means the same thing at every stage:
 
 This module is the one registry. Each entry is registered with
 ``@spyre_intrinsic(target, dtypes=...)`` on its fallback, and says everything the
-frontend checks when the call is traced: the operand count (the fallback's), the
-dtypes every operand may have, and the result rule. The IR carries only the
-target's name, so the compiler needs no copy of this table: ``LowerSpyreOps``
-builds the op by that name, and the op's own verifier checks the operands.
+frontend checks when the call is traced: the operand count (the fallback's) and
+the dtypes every operand may have. The result is operand 0's type, for every
+target. The IR carries only the target's name, so the compiler needs no copy of
+this table: ``LowerSpyreOps`` builds the op by that name, and the op's own
+verifier checks the operands. The one thing checked against the compiler here is
+that the name is a registered op, at registration, so a misspelled target is
+refused where it is written rather than at its first trace.
 
 The decorator is the backend's: it is not exported through ``triton.language``,
 so kernel authors cannot register targets.
@@ -32,6 +35,7 @@ The frontend reaches this registry through the ``spyre_intrinsic`` codegen hook
 module.
 """
 
+import functools
 from dataclasses import dataclass
 from typing import Callable, Tuple
 
@@ -50,8 +54,23 @@ def target_name(target):
     raise TypeError(f"tl.spyre_op: a target is an op name or an op class, got {target!r}")
 
 
-def _result_is_operand0(arg_types):
-    return [arg_types[0]]
+@functools.cache
+def _context():
+    """A context set up as a compile's is -- Triton's dialects and the Spyre
+    backend's in its registry -- made once and kept, since it is only read."""
+    from triton._C.libtriton import ir, spyre
+    context = ir.context()
+    ir.load_dialects(context)
+    spyre.load_dialects(context)
+    return context
+
+
+def is_registered_op(name):
+    """Whether ``name`` is an op the compiler registers: the answer
+    ``tts.spyre_op``'s region verifier gives for the same name, asked of a
+    context set up as a compile's is."""
+    from triton._C.libtriton import spyre
+    return spyre.ir_utils.is_registered_op(_context(), name)
 
 
 @dataclass(frozen=True)
@@ -59,29 +78,31 @@ class Intrinsic:
     """One registered target: the op, its fallback, and what it takes.
 
     ``fallback`` is a ``@triton.jit`` function of ``arity`` tensors, traced at the
-    operands' types. ``dtypes`` is what every operand may be. ``result_types``
-    maps the operand types to the declared result types: the op is created before
-    its body is traced, so the result types cannot be read off the body, and the
-    frontend refuses a fallback that returns anything else.
+    operands' types. ``dtypes`` is what every operand may be. The one result has
+    operand 0's type: the op is created before its body is traced, so its result
+    type cannot be read off the body, and the frontend refuses a fallback that
+    returns anything else.
     """
 
     target: str
     fallback: Callable
     arity: int
     dtypes: Tuple[tl.dtype, ...]
-    result_types: Callable
 
 
 #: Target name -> Intrinsic, filled by ``spyre_intrinsic``.
 REGISTRY = {}
 
 
-def spyre_intrinsic(target, *, dtypes, result_types=_result_is_operand0):
+def spyre_intrinsic(target, *, dtypes):
     """Register the decorated ``@triton.jit`` function as the fallback for the op
-    ``target``, taking operands of ``dtypes``. ``result_types`` maps the operand
-    types to the result types; by default the one result has operand 0's type.
-    Raises on a target that already has a fallback."""
+    ``target``, taking operands of ``dtypes`` and returning operand 0's type.
+    Raises on a target that is not a registered op, and on one that already has
+    a fallback."""
     name = target_name(target)
+    if not is_registered_op(name):
+        raise ValueError(f"tl.spyre_op: target {name!r} is not a registered op; a "
+                         f"target is named in full, e.g. 'spyreop.sigmoid'")
     dtypes = tuple(dtypes)
     for dtype in dtypes:
         if not isinstance(dtype, tl.dtype):
@@ -90,12 +111,14 @@ def spyre_intrinsic(target, *, dtypes, result_types=_result_is_operand0):
     def register(fallback):
         if name in REGISTRY:
             raise ValueError(f"tl.spyre_op: target {name!r} has two fallbacks")
+        if not fallback.arg_names:
+            raise ValueError(f"tl.spyre_op: the fallback for {name!r} takes no operand, "
+                             f"and the result is operand 0's type")
         REGISTRY[name] = Intrinsic(
             target=name,
             fallback=fallback,
             arity=len(fallback.arg_names),
             dtypes=dtypes,
-            result_types=result_types,
         )
         return fallback
 

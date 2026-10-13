@@ -63,6 +63,23 @@ int64_t getSpyreopHintId(DictionaryAttr hint) {
   return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
 }
 
+DictionaryAttr getBodyCallSite(Block &body) {
+  DictionaryAttr found;
+  WalkResult walked = body.walk([&](Operation *op) {
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return WalkResult::advance();
+    DictionaryAttr hint = getSpyreopHint(op);
+    if (!hint)
+      return WalkResult::advance();
+    if (!found)
+      found = hint;
+    else if (getSpyreopHintId(found) != getSpyreopHintId(hint))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return walked.wasInterrupted() ? DictionaryAttr() : found;
+}
+
 void copyTTSAttrs(Operation *from, Operation *to) {
   StringRef prefix = TTSDialect::getDialectNamespace();
   for (NamedAttribute attr : from->getDiscardableAttrs()) {
