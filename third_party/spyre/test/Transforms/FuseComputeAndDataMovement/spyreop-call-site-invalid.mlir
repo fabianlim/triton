@@ -15,15 +15,15 @@ func.func @split(%x: tensor<64xf32>) -> tensor<64xf32> {
   %a = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("sigmoid") call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: its ops are spread over 2 compute bodies}}
-    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: its ops are spread over 2 compute bodies}}
+    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
     linalg.yield %n : f32
   } -> tensor<64xf32>
   // expected-note @+1 {{a body holding ops of it}}
   %b = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   %s = arith.addf %a, %b : tensor<64xf32>
@@ -41,9 +41,9 @@ func.func @two_ids(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
-    // expected-error @+1 {{call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: its body also holds ops of call site 1, silu}}
-    %ex = math.exp %n {tts.spyreop_hint = {id = 1 : i64, name = "silu"}} : f32
+    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
+    // expected-error @+1 {{call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: its body also holds ops of call site 1, spyreop.silu}}
+    %ex = math.exp %n {tts.spyreop_hint = {id = 1 : i64, target = "spyreop.silu"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -59,7 +59,7 @@ func.func @foreign_op(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %ex = math.exp %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.silu"}} : f32
     // expected-error @+1 {{its body also holds 'arith.mulf', which is not part of it}}
     %m = arith.mulf %ex, %ex : f32
     linalg.yield %m : f32
@@ -72,7 +72,7 @@ func.func @foreign_op(%x: tensor<64xf32>) -> tensor<64xf32> {
 // OUTSIDE ANY BODY: a hinted op left at tensor level.
 func.func @outside_body(%x: tensor<64xf32>) -> tensor<64xf32> {
   // expected-error @+1 {{'math.exp' is outside any compute body}}
-  %e = math.exp %x {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : tensor<64xf32>
+  %e = math.exp %x {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
   return %e : tensor<64xf32>
 }
 
@@ -86,9 +86,9 @@ func.func @two_names(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
-    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
-    // expected-error @+1 {{tl.spyre_op("sigmoid") call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: an op of it names 'silu'}}
-    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, name = "silu"}} : f32
+    %n = arith.negf %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
+    // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") call site 0 did not fuse into one compute body, which its verified body guarantees -- a compiler bug: an op of it targets 'spyreop.silu'}}
+    %ex = math.exp %n {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.silu"}} : f32
     linalg.yield %ex : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>

@@ -16,16 +16,16 @@
 // CHECK-LABEL: func.func @one_request(
 // CHECK-SAME:    %[[X:.*]]: tensor<64xf16>
 // CHECK:         %[[ONE:.*]] = arith.constant dense<1.000000e+00> : tensor<64xf32>
-// CHECK:         %[[XF:.*]] = arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// CHECK:         %[[N:.*]] = arith.negf %[[XF]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// CHECK:         %[[E:.*]] = math.exp %[[N]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// CHECK:         %[[D:.*]] = arith.addf %[[ONE]], %[[E]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// CHECK:         %[[Q:.*]] = arith.divf %[[ONE]], %[[D]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// CHECK:         %[[Y:.*]] = arith.truncf %[[Q]] {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
+// CHECK:         %[[XF:.*]] = arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         %[[N:.*]] = arith.negf %[[XF]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         %[[E:.*]] = math.exp %[[N]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         %[[D:.*]] = arith.addf %[[ONE]], %[[E]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         %[[Q:.*]] = arith.divf %[[ONE]], %[[D]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         %[[Y:.*]] = arith.truncf %[[Q]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
 // CHECK:         return %[[Y]] : tensor<64xf16>
 // CHECK-NOT:     tts.
 func.func @one_request(%x: tensor<64xf16>) -> tensor<64xf16> {
-  %r = tts.spyre_op "sigmoid" (%x) : (tensor<64xf16>) -> tensor<64xf16> {
+  %r = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<64xf16>) -> tensor<64xf16> {
   ^bb0(%a: tensor<64xf16>):
     %one = arith.constant dense<1.0> : tensor<64xf32>
     %xf = arith.extf %a : tensor<64xf16> to tensor<64xf32>
@@ -45,17 +45,17 @@ func.func @one_request(%x: tensor<64xf16>) -> tensor<64xf16> {
 // ids, and an untagged op between them stays untagged. The second id
 // is the next one, not a hash of anything: unique per request is the contract.
 // CHECK-LABEL: func.func @two_requests(
-// CHECK:         %[[A:.*]] = math.exp %{{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "silu"}}
+// CHECK:         %[[A:.*]] = math.exp %{{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.silu"}}
 // CHECK:         %[[M:.*]] = arith.mulf %[[A]], %[[A]] : tensor<64xf32>
-// CHECK:         math.exp %[[M]] {tts.spyreop_hint = {id = 1 : i64, name = "silu"}}
+// CHECK:         math.exp %[[M]] {tts.spyreop_hint = {id = 1 : i64, target = "spyreop.silu"}}
 func.func @two_requests(%x: tensor<64xf32>) -> tensor<64xf32> {
-  %r0 = tts.spyre_op "silu" (%x) : (tensor<64xf32>) -> tensor<64xf32> {
+  %r0 = tts.spyre_op "spyreop.silu" (%x) : (tensor<64xf32>) -> tensor<64xf32> {
   ^bb0(%a: tensor<64xf32>):
     %e = math.exp %a : tensor<64xf32>
     tts.spyreop_yield %e : tensor<64xf32>
   }
   %m = arith.mulf %r0, %r0 : tensor<64xf32>
-  %r1 = tts.spyre_op "silu" (%m) : (tensor<64xf32>) -> tensor<64xf32> {
+  %r1 = tts.spyre_op "spyreop.silu" (%m) : (tensor<64xf32>) -> tensor<64xf32> {
   ^bb0(%a: tensor<64xf32>):
     %e = math.exp %a : tensor<64xf32>
     tts.spyreop_yield %e : tensor<64xf32>
@@ -68,11 +68,11 @@ func.func @two_requests(%x: tensor<64xf32>) -> tensor<64xf32> {
 // Group ids start above any already in the module, so a tag written earlier --
 // by hand here -- is not reused for a different request.
 // CHECK-LABEL: func.func @existing_tags(
-// CHECK:         math.exp %{{.*}} {tts.spyreop_hint = {id = 7 : i64, name = "sigmoid"}}
-// CHECK:         math.exp %{{.*}} {tts.spyreop_hint = {id = 8 : i64, name = "sigmoid"}}
+// CHECK:         math.exp %{{.*}} {tts.spyreop_hint = {id = 7 : i64, target = "spyreop.sigmoid"}}
+// CHECK:         math.exp %{{.*}} {tts.spyreop_hint = {id = 8 : i64, target = "spyreop.sigmoid"}}
 func.func @existing_tags(%x: tensor<64xf32>) -> tensor<64xf32> {
-  %p = math.exp %x {tts.spyreop_hint = {id = 7 : i64, name = "sigmoid"}} : tensor<64xf32>
-  %r = tts.spyre_op "sigmoid" (%p) : (tensor<64xf32>) -> tensor<64xf32> {
+  %p = math.exp %x {tts.spyreop_hint = {id = 7 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
+  %r = tts.spyre_op "spyreop.sigmoid" (%p) : (tensor<64xf32>) -> tensor<64xf32> {
   ^bb0(%a: tensor<64xf32>):
     %e = math.exp %a : tensor<64xf32>
     tts.spyreop_yield %e : tensor<64xf32>
@@ -86,9 +86,9 @@ func.func @existing_tags(%x: tensor<64xf32>) -> tensor<64xf32> {
 // requests are inlined before the markers are lowered; the other order would
 // write the pin onto the request and erase it with the request.
 // CHECK-LABEL: func.func @pinned_result(
-// CHECK:         math.exp %{{.*}} {tts.pin = {memory_space = "ct_local", offset = 0 : i32}, tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
+// CHECK:         math.exp %{{.*}} {tts.pin = {memory_space = "ct_local", offset = 0 : i32}, tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
 func.func @pinned_result(%x: tensor<64xf32>) -> tensor<64xf32> {
-  %r = tts.spyre_op "sigmoid" (%x) : (tensor<64xf32>) -> tensor<64xf32> {
+  %r = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<64xf32>) -> tensor<64xf32> {
   ^bb0(%a: tensor<64xf32>):
     %e = math.exp %a : tensor<64xf32>
     tts.spyreop_yield %e : tensor<64xf32>

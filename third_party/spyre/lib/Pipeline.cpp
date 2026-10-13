@@ -205,26 +205,10 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // is logical.
   pm.addPass(ktdp::createRewriteDescriptorLayoutGeneric());
 
-  // The cleanup belonging to the pass above, moved across the boundary with it.
-  // Physicalization emits an arith.divsi/remsi per access-tile index and a cast
-  // chain per retyped value; the `ktir` stage's tail canonicalize used to fold the
-  // static ones and now runs before them. Nothing else here would -- the
-  // canonicalize and CSE below are inside the bind-base-addresses branch, which a
-  // device launch does not take -- so omitting this hands dbo-opt the unfolded form
-  // on exactly the path that matters. Observed as a nondeterministic dbo-opt crash,
-  // not a diagnostic.
-  //
-  // Canonicalize only, for the reason the `ktir` stage's header gives: on an
-  // author-written HBM round trip a store's ktdp.construct_access_tile and the
-  // matching load's are both Pure over the same block, so CSE merges them and
-  // dbo-opt's compute-group extraction aborts. See issue #161.
-  pm.addPass(mlir::createCanonicalizerPass());
-
   // Instruction selection: the arith and math ops in each compute body become the
-  // spyreop intrinsics that do the same thing. One pass for all of it -- the
-  // one-op-to-one rules, the group rules and the request rule share a pattern
-  // set, each rooted on a different op, and the others decline an op a request
-  // claims, so no order between them is declared.
+  // spyreop intrinsics that do the same thing. One pass for all of it: the
+  // requests first, as a walk, then the one-op-to-one and group rules, which
+  // share a pattern set, each rooted on a different op.
   //
   // Needs every compute to be a linalg.generic, which the passes above make it: a
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
@@ -245,6 +229,27 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // which is the component that knows what it can take. What is reported is an
   // explicit request left unselected, and an `i1` no rule can remove.
   pm.addPass(createLowerSpyreOpsPass());
+
+  // The cleanup belonging to the layout pass, moved across the boundary with it.
+  // Physicalization emits an arith.divsi/remsi per access-tile index and a cast
+  // chain per retyped value; the `ktir` stage's tail canonicalize used to fold the
+  // static ones and now runs before them. Nothing else here would -- the
+  // canonicalize and CSE below are inside the bind-base-addresses branch, which a
+  // device launch does not take -- so omitting this hands dbo-opt the unfolded form
+  // on exactly the path that matters. Observed as a nondeterministic dbo-opt crash,
+  // not a diagnostic.
+  //
+  // Canonicalize only, for the reason the `ktir` stage's header gives: on an
+  // author-written HBM round trip a store's ktdp.construct_access_tile and the
+  // matching load's are both Pure over the same block, so CSE merges them and
+  // dbo-opt's compute-group extraction aborts. See issue #161.
+  //
+  // After LowerSpyreOps, not directly after the layout pass. Its arith patterns
+  // replace an op by a new one built without the original's discardable
+  // attributes, so on a `tl.spyre_op` call site they drop the
+  // `tts.spyreop_hint` selection reads. Nothing LowerSpyreOps matches is what
+  // this folds: the index arithmetic is outside every compute body.
+  pm.addPass(mlir::createCanonicalizerPass());
 
   if (options.bindBaseAddresses) {
     // The one genuine choice in this stage: symbolic and bound are real

@@ -8,7 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
-#include "Dialect/TTS/IR/Intrinsics.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "ktir/Dialect/KTDP/KTDP.h"
 
@@ -55,8 +55,21 @@ DictionaryAttr getSpyreopHint(Operation *op) {
       op->getDiscardableAttr(TTSDialect::kSpyreopHintAttrName));
 }
 
-StringRef getSpyreopHintName(DictionaryAttr hint) {
-  return hint.getAs<StringAttr>(TTSDialect::kSpyreopHintNameKey).getValue();
+StringRef getSpyreopHintTarget(DictionaryAttr hint) {
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreopHintTargetKey).getValue();
+}
+
+int64_t getSpyreopHintId(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
+}
+
+void copyTTSAttrs(Operation *from, Operation *to) {
+  StringRef prefix = TTSDialect::getDialectNamespace();
+  for (NamedAttribute attr : from->getDiscardableAttrs()) {
+    StringRef name = attr.getName().getValue();
+    if (name.starts_with(prefix) && name.drop_front(prefix.size()).starts_with("."))
+      to->setDiscardableAttr(attr.getName(), attr.getValue());
+  }
 }
 
 std::optional<CoordOp> symbolizeCoordOp(int64_t code) {
@@ -377,29 +390,29 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
 
   // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
   // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of
-  // the whole hint, and LowerSpyreOps selects the intrinsic its `name` names. So
+  // the whole hint, and LowerSpyreOps builds the op its `target` names. So
   // what one op can show is checked here, which is what lets getSpyreopHint hand
   // those readers a dictionary they need not re-check: exactly the two fields,
-  // each of its type, a `name` in the intrinsic table, and an op that is not a
-  // constant, which LowerTTSMarkers never hints. Nothing about other ops -- an
+  // each of its type, a `target` that is a registered op, and an op that is not
+  // a constant, which LowerTTSMarkers never hints. Nothing about other ops -- an
   // `id` being unique, a call site being whole -- is checkable from one op;
   // FuseComputeAndDataMovement checks those once its fusion is done.
   if (name == kSpyreopHintAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
-    auto intrinsic =
-        hint ? hint.getAs<StringAttr>(kSpyreopHintNameKey) : StringAttr();
+    auto target =
+        hint ? hint.getAs<StringAttr>(kSpyreopHintTargetKey) : StringAttr();
     auto id = hint ? hint.getAs<IntegerAttr>(kSpyreopHintIdKey) : IntegerAttr();
-    if (!hint || hint.size() != 2 || !intrinsic || !id ||
+    if (!hint || hint.size() != 2 || !target || !id ||
         !id.getType().isInteger(64))
       return op->emitError("'")
              << kSpyreopHintAttrName
              << "' must be a dictionary of exactly a string '"
-             << kSpyreopHintNameKey << "' and an i64 '" << kSpyreopHintIdKey
+             << kSpyreopHintTargetKey << "' and an i64 '" << kSpyreopHintIdKey
              << "', got " << attribute.getValue();
-    if (!lookupSpyreopIntrinsic(intrinsic.getValue()))
+    if (!RegisteredOperationName::lookup(target.getValue(), getContext()))
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' names no spyreop intrinsic: "
-             << intrinsic;
+             << kSpyreopHintAttrName << "' targets " << target
+             << ", which is not a registered op";
     if (op->hasTrait<OpTrait::ConstantLike>())
       return op->emitError("'")
              << kSpyreopHintAttrName << "' is not set on a constant";

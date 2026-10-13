@@ -133,21 +133,22 @@ def TTS_PinOp : TTS_Op<"pin", []> {
 def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
     IsolatedFromAbove, SingleBlockImplicitTerminator<"SpyreOpYieldOp">,
     RecursiveMemoryEffects]> {
-  let summary = "Request one spyreop intrinsic, carrying its fallback body";
+  let summary = "Request one device op, carrying its fallback body";
 
   let description = [{
-    `tts.spyre_op` is the **authoring** spelling of `tl.spyre_op(name, *args)`:
-    a request that the computation be done by the spyreop intrinsic `name`. The
-    region holds that computation's FALLBACK -- the backend's registered
-    `@triton.jit` body for `name`, traced at the operands' types -- so the op
-    means the same thing whether or not the intrinsic is ever selected.
+    `tts.spyre_op` is the **authoring** spelling of
+    `tl.spyre_op(target, *args)`: a request that the computation be done by the
+    op `target`, by its full name, e.g. `"spyreop.sigmoid"`. The region holds
+    that computation's FALLBACK -- the backend's registered `@triton.jit` body
+    for `target`, traced at the operands' types -- so the op means the same
+    thing whether or not the target is ever selected.
 
     The block arguments are the operands, one for one and of the same types, and
     the body ends in `tts.spyreop_yield`, whose operands are the results.
 
     RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
     before its region is traced -- a region belongs to an op -- so the frontend
-    takes the result types from the intrinsic table's rule for `name` and
+    takes the result types from the registration's rule for `target` and
     refuses a fallback whose returned types differ, at the kernel line.
 
     `IsolatedFromAbove`, so the body reads nothing but its block arguments: a
@@ -156,17 +157,22 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     THE CALL SITE IS CHECKED IN FOUR PLACES, by the form it has at the time. It
     is this op from trace to the end of the `ktir` stage; LowerTTSMarkers then
-    inlines the body in place and sets `tts.spyreop_hint = {name, id}` on every
+    inlines the body in place and sets `tts.spyreop_hint = {target, id}` on every
     op it inlined but the constants, `id` unique to this op in the module, so
     the `ktir` artifact is the fallback alone, in dialects any consumer loads.
     In `spyrecode`, FuseComputeAndDataMovement fuses the hinted ops into one
-    body, and LowerSpyreOps replaces that body with the intrinsic.
+    body, and LowerSpyreOps replaces that body with the target.
+
+    WHICH TARGETS EXIST, and what each takes, is the frontend's registration
+    (`backend/intrinsics.py`), not this dialect's: it checks the operand count,
+    the dtypes and the result types when the call is traced. The IR carries the
+    target by name, so the checks below hold for hand-written IR too, and what
+    is target-specific is checked once more by the target op's own verifier,
+    when LowerSpyreOps builds it.
 
       V1  this op's region verifier, while the op exists. What no later pass
-          can change: `name` is in the intrinsic table
-          (`Dialect/TTS/IR/Intrinsics.h`); the operand count and every
-          operand's element type are ones it takes; the result types are the
-          ones its rule gives; the block arguments have the operand types and
+          can change: `target` is a registered op; the block arguments have
+          the operand types and
           the yield the result types; no op in the body has a memory effect;
           and the body can fuse into one generic -- every op elementwise or a
           constant, and every value but a constant at the operands' shape. A
@@ -174,23 +180,24 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
           stage's inliner replaces it with the fallback's body.
       V2  the `tts.spyreop_hint` attribute verifier, on each op at every
           verification point. What one op shows: a dictionary of exactly a
-          string `name` and an i64 `id`, a `name` in the table, and an op that
-          is not a constant. Nothing about other ops.
+          string `target` and an i64 `id`, a `target` that is a registered op,
+          and an op that is not a constant. Nothing about other ops.
       V3  FuseComputeAndDataMovement, after its fixpoint, over the module:
           each `id` is in exactly one generic body and on no op outside one,
           that body holds no other op but constants, and the ops of one `id`
-          agree on `name`. V1 is what guarantees the fusion, so a failure here
+          agree on `target`. V1 is what guarantees the fusion, so a failure here
           is a compiler bug, reported as one.
-      V4  LowerSpyreOps: selection, then one check, that no op still carries a
+      V4  LowerSpyreOps: selection, which builds the target and runs its
+          verifier, then one check, that no op still carries a
           `tts.spyreop_hint`. A request left unselected is an error naming the
-          intrinsic, since passing the fallback through would drop it silently.
+          target, since passing the fallback through would drop it silently.
 
     Constants carry no hint: passes create, merge and fold them freely, so one
     says nothing about its call site.
 
     Example:
     ```mlir
-      %y = tts.spyre_op "sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+      %y = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
       ^bb0(%a: tensor<128xf32>):
         ...
         tts.spyreop_yield %r : tensor<128xf32>
@@ -198,12 +205,12 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
     ```
   }];
 
-  let arguments = (ins StrAttr:$name, Variadic<AnyRankedTensor>:$inputs);
+  let arguments = (ins StrAttr:$target, Variadic<AnyRankedTensor>:$inputs);
   let results = (outs Variadic<AnyRankedTensor>:$results);
   let regions = (region SizedRegion<1>:$body);
 
   let assemblyFormat = [{
-    $name `(` $inputs `)` attr-dict `:` functional-type($inputs, $results)
+    $target `(` $inputs `)` attr-dict `:` functional-type($inputs, $results)
     $body
   }];
   let hasRegionVerifier = 1;

@@ -346,7 +346,7 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
 /// The `tl.spyre_op` call site whose ops `op`'s body holds: the one
 /// `tts.spyreop_hint` its hinted ops share, or null when `op` is not a generic,
 /// holds no hinted op, or holds hinted ops of two call sites. With `<silu#0>`
-/// for the hint `{name = "silu", id = 0}`:
+/// for the hint `{target = "spyreop.silu", id = 0}`:
 ///
 ///   {exp<silu#0>, addf<silu#0>}   -> silu#0
 ///   {exp<silu#0>, cst}            -> silu#0
@@ -400,7 +400,7 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 ///   - each `id` is in exactly one generic body, and on no op outside a body;
 ///   - a body holding hinted ops holds no other op but constants: neither the
 ///     ops of a second `id`, nor an unhinted op;
-///   - every op of one `id` agrees on `name`.
+///   - every op of one `id` agrees on `target`.
 ///
 /// The `tts.spyre_op` verifier held each body to be elementwise at one shape,
 /// so ConvertElementwiseToLinalg gives every op of it a generic over one
@@ -408,20 +408,21 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 /// bug, and is reported as one rather than as the author's.
 LogicalResult checkCallSitesFused(ModuleOp mod) {
   using triton::tts::getSpyreopHint;
-  using triton::tts::getSpyreopHintName;
+  using triton::tts::getSpyreopHintId;
+  using triton::tts::getSpyreopHintTarget;
   using triton::tts::TTSDialect;
 
   struct CallSite {
-    StringAttr name;
+    StringAttr target;
     Operation *first = nullptr;
     llvm::SmallSetVector<Operation *, 2> bodies;
   };
   llvm::MapVector<int64_t, CallSite> callSites;
   LogicalResult result = success();
-  auto report = [&](Operation *op, int64_t id, StringRef name) {
+  auto report = [&](Operation *op, int64_t id, StringRef target) {
     result = failure();
     return op->emitError("fuse-compute-and-data-movement: tl.spyre_op(\"")
-           << name << "\") call site " << id
+           << target << "\") call site " << id
            << " did not fuse into one compute body, which its verified body "
               "guarantees -- a compiler bug: ";
   };
@@ -430,20 +431,20 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
     DictionaryAttr hint = getSpyreopHint(op);
     if (!hint)
       return;
-    int64_t id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
-    auto name = hint.getAs<StringAttr>(TTSDialect::kSpyreopHintNameKey);
+    int64_t id = getSpyreopHintId(hint);
+    auto target = hint.getAs<StringAttr>(TTSDialect::kSpyreopHintTargetKey);
     CallSite &site = callSites[id];
     if (!site.first) {
       site.first = op;
-      site.name = name;
-    } else if (site.name != name) {
-      report(op, id, site.name.getValue())
-          << "an op of it names '" << name.getValue() << "'";
+      site.target = target;
+    } else if (site.target != target) {
+      report(op, id, site.target.getValue())
+          << "an op of it targets '" << target.getValue() << "'";
       return;
     }
     auto generic = dyn_cast<linalg::GenericOp>(op->getParentOp());
     if (!generic) {
-      report(op, id, name.getValue()) << "'" << op->getName()
+      report(op, id, target.getValue()) << "'" << op->getName()
                                       << "' is outside any compute body";
       return;
     }
@@ -451,9 +452,9 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
   });
 
   for (auto &[id, site] : callSites) {
-    StringRef name = site.name.getValue();
+    StringRef target = site.target.getValue();
     if (site.bodies.size() > 1) {
-      InFlightDiagnostic diag = report(site.first, id, name)
+      InFlightDiagnostic diag = report(site.first, id, target)
                                 << "its ops are spread over "
                                 << site.bodies.size() << " compute bodies";
       for (Operation *body : site.bodies)
@@ -468,18 +469,17 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
         continue;
       DictionaryAttr hint = getSpyreopHint(&op);
       if (!hint) {
-        report(&op, id, name) << "its body also holds '" << op.getName()
+        report(&op, id, target) << "its body also holds '" << op.getName()
                               << "', which is not part of it";
         break;
       }
-      int64_t other =
-          hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
+      int64_t other = getSpyreopHintId(hint);
       if (other != id) {
         // Reported once per pair, from the lower id.
         if (other > id)
-          report(&op, id, name)
+          report(&op, id, target)
               << "its body also holds ops of call site " << other << ", "
-              << getSpyreopHintName(hint);
+              << getSpyreopHintTarget(hint);
         break;
       }
     }

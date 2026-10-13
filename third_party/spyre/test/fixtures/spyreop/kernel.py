@@ -171,11 +171,11 @@ def spyreop_intrinsic_1d(
         offset = i * BLOCK_SIZE
         x = x_desc.load([offset])
         if OP == "gelu":
-            result = tl.spyre_op("gelu", x)
+            result = tl.spyre_op("spyreop.gelu", x)
         elif OP == "silu":
-            result = tl.spyre_op("silu", x)
+            result = tl.spyre_op("spyreop.silu", x)
         else:
-            result = tl.spyre_op("sigmoid", x)
+            result = tl.spyre_op("spyreop.sigmoid", x)
         out_desc.store([offset], result)
 
 
@@ -218,9 +218,9 @@ def spyreop_intrinsic_2d(
             offset_n = n * BLOCK_N
             x = x_desc.load([offset_m, offset_n])
             if OP == "gelu":
-                result = tl.spyre_op("gelu", x)
+                result = tl.spyre_op("spyreop.gelu", x)
             elif OP == "silu":
-                result = tl.spyre_op("silu", x)
+                result = tl.spyre_op("spyreop.silu", x)
             else:
-                result = tl.spyre_op("sigmoid", x)
+                result = tl.spyre_op("spyreop.sigmoid", x)
             out_desc.store([offset_m, offset_n], result)

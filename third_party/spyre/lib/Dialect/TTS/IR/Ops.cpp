@@ -10,16 +10,15 @@
 // ktdp's enum. What deliberately does NOT stay is any rule about the operand's
 // provenance -- see the note in `PinOp::verify`.
 //
-// `spyre_op`'s rules are about its name and its body, which is why they are a
-// region verifier: the name is in the intrinsic table and the operands and
-// results are what the table declares, the block's signature is the operands',
+// `spyre_op`'s rules are about its target and its body, which is why they are a
+// region verifier: the target is a registered op, the block's signature is the
+// operands',
 // its terminator yields the results, nothing in it touches memory, and the body
 // is one elementwise computation, so it can fuse into one generic.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/TTS/IR/Dialect.h"
-#include "Dialect/TTS/IR/Intrinsics.h"
 
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -130,31 +129,11 @@ LogicalResult PinOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult SpyreOpOp::verifyRegions() {
-  const SpyreopIntrinsic *intrinsic = lookupSpyreopIntrinsic(getName());
-  if (!intrinsic) {
-    InFlightDiagnostic diag =
-        emitOpError("names no spyreop intrinsic: '") << getName() << "'; the "
-        << "intrinsic table has";
-    for (const SpyreopIntrinsic &entry : getSpyreopIntrinsics())
-      diag << " '" << entry.name << "'";
-    return diag;
-  }
-  if (getInputs().size() != intrinsic->numOperands)
-    return emitOpError("'") << getName() << "' takes "
-                            << intrinsic->numOperands << " operand(s), got "
-                            << getInputs().size();
-  for (auto [i, input] : llvm::enumerate(getInputs())) {
-    Type elementType = getElementTypeOrSelf(input.getType());
-    if (!intrinsic->takesElementType(elementType))
-      return emitOpError("'") << getName() << "' does not take operand " << i
-                              << " of element type " << elementType;
-  }
-  SmallVector<Type> resultTypes =
-      intrinsic->resultTypes(getInputs().getTypes());
-  if (TypeRange(resultTypes) != getResultTypes())
-    return emitOpError("'") << getName() << "' gives results "
-                            << TypeRange(resultTypes) << " for these operands, "
-                            << "but the op declares " << getResultTypes();
+  // Only that the target exists. Which operands and types it takes is the op's
+  // own verifier's, which runs when LowerSpyreOps builds it.
+  if (!RegisteredOperationName::lookup(getTarget(), getContext()))
+    return emitOpError("targets '")
+           << getTarget() << "', which is not a registered op";
 
   Block &body = getBody().front();
   if (body.getArgumentTypes() != getInputs().getTypes())

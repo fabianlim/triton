@@ -52,13 +52,22 @@ namespace mlir::triton::tts {
 
 /// The `tts.spyreop_hint` `op` carries, or null when it carries none. The
 /// dialect's attribute verifier has already held the value to its spelling --
-/// a dictionary of exactly a string `name` and an i64 `id` -- so a non-null
+/// a dictionary of exactly a string `target` and an i64 `id` -- so a non-null
 /// result has both entries. Two ops come from one call site exactly when their
 /// hints are equal.
 DictionaryAttr getSpyreopHint(Operation *op);
 
-/// The intrinsic a hint returned by getSpyreopHint names.
-StringRef getSpyreopHintName(DictionaryAttr hint);
+/// The op a hint returned by getSpyreopHint names.
+StringRef getSpyreopHintTarget(DictionaryAttr hint);
+
+/// The call-site id of a hint returned by getSpyreopHint.
+int64_t getSpyreopHintId(DictionaryAttr hint);
+
+/// Copies every `tts.*` discardable attribute of `from` onto `to`, overwriting
+/// one `to` already has. For a rewrite that replaces `from` with a new `to`
+/// computing the same value: the attributes are what the `ktir` stage's markers
+/// left on the op, and dropping one drops the request it records.
+void copyTTSAttrs(Operation *from, Operation *to);
 
 /// The coordinate op a `tts.tensor_layout`'s `phys_op[k]` names, by the
 /// attribute's own numbering.

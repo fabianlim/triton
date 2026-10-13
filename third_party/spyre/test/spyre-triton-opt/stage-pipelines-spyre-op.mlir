@@ -31,7 +31,7 @@ module {
                                  phys_op = array<i64: 1, 0, 2>,
                                  phys_arg = array<i64: 64, 0, 64>} : <64x128xf16>
     %x = tt.descriptor_load %in_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
-    %g = tts.spyre_op "gelu" (%x) : (tensor<64x128xf16>) -> tensor<64x128xf16> {
+    %g = tts.spyre_op "spyreop.gelu" (%x) : (tensor<64x128xf16>) -> tensor<64x128xf16> {
     ^bb0(%a: tensor<64x128xf16>):
       %half = arith.constant dense<5.000000e-01> : tensor<64x128xf32>
       %one = arith.constant dense<1.000000e+00> : tensor<64x128xf32>
@@ -56,9 +56,9 @@ module {
 //
 // KTIR-LABEL:   func.func @gelu(
 // KTIR:           %[[X:.*]] = ktdp.load
-// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
-// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
-// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "gelu"}}
+// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
 // KTIR:           ktdp.store %[[G]]
 // KTIR-NOT:       tts.spyre_op
 // KTIR-NOT:       tts.spyreop_yield
@@ -87,7 +87,7 @@ module {
     %in_desc = tt.make_tensor_descriptor %in_ptr, [%n], [%sn] : <f32>, <128xf32>
     %out_desc = tt.make_tensor_descriptor %out_ptr, [%n], [%sn] : <f32>, <128xf32>
     %x = tt.descriptor_load %in_desc[%c0_i32] : !tt.tensordesc<128xf32> -> tensor<128xf32>
-    %s = tts.spyre_op "sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+    %s = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
     ^bb0(%a: tensor<128xf32>):
       %one = arith.constant dense<1.000000e+00> : tensor<128xf32>
       %zero = arith.constant dense<0.000000e+00> : tensor<128xf32>
@@ -97,7 +97,7 @@ module {
       %r = arith.divf %one, %d : tensor<128xf32>
       tts.spyreop_yield %r : tensor<128xf32>
     }
-    %y = tts.spyre_op "silu" (%s) : (tensor<128xf32>) -> tensor<128xf32> {
+    %y = tts.spyre_op "spyreop.silu" (%s) : (tensor<128xf32>) -> tensor<128xf32> {
     ^bb0(%a: tensor<128xf32>):
       %one = arith.constant dense<1.000000e+00> : tensor<128xf32>
       %zero = arith.constant dense<0.000000e+00> : tensor<128xf32>
@@ -116,8 +116,8 @@ module {
 // their equal constants, which is why a constant carries no hint.
 //
 // KTIR-LABEL:   func.func @sigmoid_silu(
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}}
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 1 : i64, name = "silu"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 1 : i64, target = "spyreop.silu"}}
 
 // Two bodies, one intrinsic each, the second reading the first.
 //

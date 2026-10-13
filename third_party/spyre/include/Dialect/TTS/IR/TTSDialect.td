@@ -8,6 +8,12 @@ def TTS_Dialect : Dialect {
 
   let cppNamespace = "::mlir::triton::tts";
 
+  // A `tts.spyre_op` names the op its call site becomes, and the verifiers
+  // check that the name is a registered op. Every target today is spyreop's,
+  // so loading this dialect loads that one, wherever the request is built or
+  // parsed.
+  let dependentDialects = ["::mlir::spyreop::SpyreOpDialect"];
+
   let summary = "Triton-to-Spyre authoring annotations";
 
   let description = [{
@@ -119,10 +125,11 @@ def TTS_Dialect : Dialect {
     /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
     /// body:
     ///
-    ///   name : the intrinsic the call site names, the op's `name`, as a string
-    ///   id   : an `i64` unique per `tts.spyre_op` in the module, so two call
-    ///          sites of the same intrinsic stay distinguishable after both are
-    ///          inlined into one function
+    ///   target : the op the call site names, the op's `target`, as the
+    ///            string of a registered operation name
+    ///   id     : an `i64` unique per `tts.spyre_op` in the module, so two call
+    ///            sites of the same target stay distinguishable after both are
+    ///            inlined into one function
     ///
     /// On the ops and not on what they become: ConvertElementwiseToLinalg
     /// writes a tensor op's attributes onto the scalar op it puts in the body,
@@ -130,7 +137,7 @@ def TTS_Dialect : Dialect {
     /// pass that rebuilds a `linalg.generic` drops the generic's own
     /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
     /// carry one call site, and LowerSpyreOps replaces the body the call site
-    /// became with the intrinsic `name` names. What is checked about it, and
+    /// became with the op `target` names. What is checked about it, and
     /// where, is stated once, in `tts.spyre_op`'s description.
     ///
     /// Builtin-valued like the two above, so the `ktir` artifact carrying it
@@ -139,7 +146,7 @@ def TTS_Dialect : Dialect {
         "tts.spyreop_hint";
 
     /// The two entry names of that dictionary.
-    static constexpr ::llvm::StringLiteral kSpyreopHintNameKey = "name";
+    static constexpr ::llvm::StringLiteral kSpyreopHintTargetKey = "target";
     static constexpr ::llvm::StringLiteral kSpyreopHintIdKey = "id";
   }];
 

@@ -169,13 +169,14 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           select performs itself
 
         A request to one: a body holding exactly one `tl.spyre_op`'s fallback →
-        the intrinsic its hint names. The intrinsics are listed in the intrinsic
-        table, `Dialect/TTS/IR/Intrinsics.cpp`.
+        the op its hint's `target` names, built by name and held to its own
+        verifier. The targets are registered in `backend/intrinsics.py`; a `tts`
+        attribute on the op producing the result, a pin, moves to the target.
 
-        A HINTED OP IS CLAIMED. Every 1:1 and group rule declines an op carrying
-        `tts.spyreop_hint`, so a fallback's `math.exp` is never selected alone as
-        spyreop.exp. That is what keeps the rules unordered: the request rule is
-        rooted on the generic, the others never touch its members.
+        REQUESTS FIRST. Call sites are selected by a walk before any other rule
+        runs, and a `tts.spyreop_hint` left after it is refused there, so the 1:1
+        and group rules never see a hinted op: a fallback's `math.exp` is never
+        selected alone as spyreop.exp.
 
         NO NaN REACHES A COMPUTE BODY. Every rule assumes it. Under it, each
         unordered cmpf predicate computes what its ordered counterpart does
@@ -184,9 +185,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         lower at all. A NaN in a kernel's inputs gives an unspecified result on
         the NaN lanes.
 
-        ONE PASS FOR ALL SELECTION, and the two kinds are not two tiers. They
-        share one greedy pattern set, and no two rules are rooted on the same
-        op, so no order is declared anywhere.
+        ONE PASS FOR ALL SELECTION, and the 1:1 and group kinds are not two
+        tiers. They share one greedy pattern set, and no two rules are rooted on
+        the same op, so no order is declared between them.
 
         A GROUP IS WHAT IS SELECTABLE when no member of it could have been
         selected alone — the criterion, and not the op count. `arith.cmpf`

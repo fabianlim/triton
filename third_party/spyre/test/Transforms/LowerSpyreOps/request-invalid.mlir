@@ -17,8 +17,8 @@ func.func @binary(%x: tensor<64xf32>, %y: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
       ins(%x, %y : tensor<64xf32>, tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%a: f32, %b: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected. The request is explicit, so its fallback is not used instead}}
-    %s = arith.addf %a, %b {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+    // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") was not selected. The request is explicit, so its fallback is not used instead}}
+    %s = arith.addf %a, %b {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
     linalg.yield %s : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -26,12 +26,32 @@ func.func @binary(%x: tensor<64xf32>, %y: tensor<64xf32>) -> tensor<64xf32> {
 
 // -----
 
-// A HINTED OP OUTSIDE ANY BODY, which is also the 1:1 rules' decline made
-// visible: a scalar math.exp is something SelectUnaryFloat selects wherever it
-// is. Were it not declined, it would become an unhinted spyreop.exp and nothing
-// would be reported.
+// A HINTED OP OUTSIDE ANY BODY, which also shows the request phase stopping
+// the pass: a scalar math.exp is something SelectUnaryFloat selects wherever it
+// is. Were the rule phase run, it would become an unhinted spyreop.exp and
+// nothing would be reported.
 func.func @outside_body(%x: f32) -> f32 {
-  // expected-error @+1 {{tl.spyre_op("sigmoid") was not selected}}
-  %e = math.exp %x {tts.spyreop_hint = {id = 0 : i64, name = "sigmoid"}} : f32
+  // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") was not selected}}
+  %e = math.exp %x {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : f32
   return %e : f32
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// A TARGET THAT REFUSES THE OPERAND. The target is built by name, so its own
+// verifier is what knows spyreop.gelu takes no f32; its diagnostic is reported,
+// the body is left as it was, and the hint then reports the request.
+func.func @target_refuses_type(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    // expected-error @+2 {{'spyreop.gelu' op}}
+    // expected-error @+1 {{tl.spyre_op("spyreop.gelu") was not selected}}
+    %g = math.erf %in {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}} : f32
+    linalg.yield %g : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
 }

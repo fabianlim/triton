@@ -334,7 +334,7 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 ///   1. pick its `id`: one per op, so two call sites of the same intrinsic --
 ///      one helper inlined twice, say -- stay two after both land in one
 ///      function;
-///   2. set `{name = name, id = id}` on every op of the body but its
+///   2. set `{target = target, id = id}` on every op of the body but its
 ///      constants and its terminator, which is about to go. The op's verifier
 ///      has held every one of them to be elementwise, so none has a region;
 ///   3. replace each block argument by its operand and move the body's ops in
@@ -357,6 +357,11 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 /// after the `ktir` stage's canonicalize: an operand that only folds to a
 /// constant there (`tl.full` traces to a `tt.splat` of a scalar) is a constant
 /// by now.
+///
+/// So is a call site whose body holds nothing but constants, for the same
+/// outcome: no op would carry the hint, and the request would vanish without
+/// a diagnostic. The canonicalizes before this pass are what reduce a body to
+/// that -- `x * 1.0` folds to `x` -- and they run inside the region.
 static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
   using mlir::triton::tts::SpyreOpOp;
   using mlir::triton::tts::TTSDialect;
@@ -373,19 +378,30 @@ static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
   SmallVector<SpyreOpOp> callSites;
   module.walk([&](SpyreOpOp op) { callSites.push_back(op); });
 
-  for (SpyreOpOp callSite : callSites)
+  for (SpyreOpOp callSite : callSites) {
     for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
       if (matchPattern(operand, m_Constant()))
         return callSite.emitError()
-               << "tl.spyre_op(\"" << callSite.getName() << "\"): operand " << i
+               << "tl.spyre_op(\"" << callSite.getTarget() << "\"): operand "
+               << i
                << " is a constant, so the call site would fold to a constant "
-                  "and no intrinsic would be selected";
+                  "and no target would be selected";
+    Block &body = callSite.getBody().front();
+    if (llvm::all_of(body.without_terminator(), [](Operation &op) {
+          return op.hasTrait<OpTrait::ConstantLike>();
+        }))
+      return callSite.emitError()
+             << "tl.spyre_op(\"" << callSite.getTarget()
+             << "\"): the fallback folded to nothing but constants and its "
+                "operands, so no op is left to carry the request and no "
+                "target would be selected";
+  }
 
   Builder builder(module.getContext());
   for (SpyreOpOp callSite : callSites) {
     DictionaryAttr hint = builder.getDictionaryAttr({
-        builder.getNamedAttr(TTSDialect::kSpyreopHintNameKey,
-                             callSite.getNameAttr()),
+        builder.getNamedAttr(TTSDialect::kSpyreopHintTargetKey,
+                             callSite.getTargetAttr()),
         builder.getNamedAttr(TTSDialect::kSpyreopHintIdKey,
                              builder.getI64IntegerAttr(nextId++)),
     });

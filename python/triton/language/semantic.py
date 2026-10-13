@@ -2107,17 +2107,18 @@ class TritonSemantic(Generic[TensorTy]):
         spyre.ir_builders.create_pin(self.builder, v.handle, space, off)
         return tl.tensor(None, tl.void)
 
-    def spyre_op(self, name, args, call_fallback):
-        """Emit tts.spyre_op -- a request for the spyreop intrinsic ``name``,
-        holding the backend's registered fallback for it, traced at the operands'
-        types. ``call_fallback(fn, args)`` traces one ``@triton.jit`` call at the
+    def spyre_op(self, target, args, call_fallback):
+        """Emit tts.spyre_op -- a request for the device op ``target``, holding
+        the backend's registered fallback for it, traced at the operands' types.
+        ``call_fallback(fn, args)`` traces one ``@triton.jit`` call at the
         current insertion point, which is the code generator's to do."""
         # The registry is the backend's, reached through the codegen hook the
-        # backend supplies; an unknown name raises there, naming the known ones.
+        # backend supplies; an unknown target raises there, naming the known ones.
         lookup = self.builder.codegen_fns.get("spyre_intrinsic")
         if lookup is None:
             raise ValueError("tl.spyre_op: this backend registers no intrinsics")
-        entry = lookup(name)
+        entry = lookup(target)
+        name = entry.target
 
         if len(args) != entry.arity:
             raise ValueError(f"tl.spyre_op({name!r}): takes {entry.arity} tensor "
@@ -2126,11 +2127,12 @@ class TritonSemantic(Generic[TensorTy]):
             if not isinstance(a, tl.tensor) or not a.type.is_block():
                 raise ValueError(f"tl.spyre_op({name!r}): operand {i} must be a "
                                  f"tensor, got {a!r}")
-            # The C++ intrinsic table's dtypes, which the tts.spyre_op verifier
-            # also checks; checked here so the refusal is at the kernel line.
-            if a.type.scalar.name not in entry.dtypes:
+            # The registration's dtypes. The target op's verifier checks its own
+            # operand types again when LowerSpyreOps builds it; checked here so
+            # the refusal is at the kernel line.
+            if a.type.scalar not in entry.dtypes:
                 raise ValueError(f"tl.spyre_op({name!r}): the intrinsic takes "
-                                 f"{list(entry.dtypes)}, not {a.type.scalar.name}")
+                                 f"{[d.name for d in entry.dtypes]}, not {a.type.scalar.name}")
         result_types = entry.result_types([a.type for a in args])
 
         # Built empty, then traced into: a region belongs to an op, so the op has
