@@ -3928,8 +3928,9 @@ def spyre_op(target, *args, _semantic=None, _generator=None):
               and ``"spyreop.sigmoid"`` (fp16, fp32); any other target, or any
               other dtype, is refused here. Kernel authors cannot register
               targets.
-        args: The operands, tensors, as many as the target takes -- one for
-              each of the three above. The result has the operand's type.
+        args: The operands, tensors of one shape, as many as the target takes
+              -- one for each of the three above -- in the order the target
+              takes them. The result has operand 0's type.
 
     Only valid on the ``spyre`` backend — raises on any other target.
     """

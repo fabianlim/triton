@@ -52,9 +52,10 @@ namespace mlir::triton::tts {
 
 /// The `tts.spyreop_hint` `op` carries, or null when it carries none. The
 /// dialect's attribute verifier has already held the value to its spelling --
-/// a dictionary of exactly a string `target` and an i64 `id` -- so a non-null
-/// result has both entries. Two ops come from one call site exactly when their
-/// hints have one `id`.
+/// a dictionary of a string `target`, an i64 `id`, a positive i64 `arity` and
+/// optionally an `operands` array -- so a non-null result has the three
+/// required entries. Two ops come from one call site exactly when their hints
+/// have one `id`; the dictionaries themselves differ, `operands` being per op.
 DictionaryAttr getSpyreopHint(Operation *op);
 
 /// The op a hint returned by getSpyreopHint names.
@@ -63,9 +64,20 @@ StringRef getSpyreopHintTarget(DictionaryAttr hint);
 /// The call-site id of a hint returned by getSpyreopHint.
 int64_t getSpyreopHintId(DictionaryAttr hint);
 
-/// The `tl.spyre_op` call site whose ops `body` holds: the hint of its hinted
-/// ops, when they all have one `id`, or null when `body` holds no hinted op or
-/// hinted ops of two call sites. With `<silu#0>` for the hint
+/// The call site's operand count, from a hint returned by getSpyreopHint.
+int64_t getSpyreopHintArity(DictionaryAttr hint);
+
+/// Which call operand each operand of the hinted op is -- entry j for operand
+/// j, -1 for one that is not a call operand -- or null when the op reads no
+/// call operand directly. From a hint returned by getSpyreopHint, so the array
+/// has one entry per operand of the op it was read off.
+DenseI64ArrayAttr getSpyreopHintOperands(DictionaryAttr hint);
+
+/// The `tl.spyre_op` call site whose ops `body` holds: the hint of its first
+/// hinted op, when they all have one `id`, or null when `body` holds no hinted
+/// op or hinted ops of two call sites. What the result says about the call site
+/// is its `id`, `target` and `arity`; its `operands`, if any, are that one
+/// op's. With `<silu#0>` for the hint
 /// `{target = "spyreop.silu", id = 0}`:
 ///
 ///   {exp<silu#0>, addf<silu#0>}   -> silu#0

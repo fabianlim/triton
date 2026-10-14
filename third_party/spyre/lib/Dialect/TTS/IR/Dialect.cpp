@@ -63,6 +63,14 @@ int64_t getSpyreopHintId(DictionaryAttr hint) {
   return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
 }
 
+int64_t getSpyreopHintArity(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintArityKey).getInt();
+}
+
+DenseI64ArrayAttr getSpyreopHintOperands(DictionaryAttr hint) {
+  return hint.getAs<DenseI64ArrayAttr>(TTSDialect::kSpyreopHintOperandsKey);
+}
+
 DictionaryAttr getBodyCallSite(Block &body) {
   DictionaryAttr found;
   WalkResult walked = body.walk([&](Operation *op) {
@@ -406,26 +414,36 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
     return success();
 
   // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
-  // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by equality of
-  // the whole hint, and LowerSpyreOps builds the op its `target` names. So
-  // what one op can show is checked here, which is what lets getSpyreopHint hand
-  // those readers a dictionary they need not re-check: exactly the two fields,
-  // each of its type, a `target` that is a registered op, and an op that is not
-  // a constant, which LowerTTSMarkers never hints. Nothing about other ops -- an
-  // `id` being unique, a call site being whole -- is checkable from one op;
-  // FuseComputeAndDataMovement checks those once its fusion is done.
+  // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by the hint's
+  // `id`, and LowerSpyreOps builds the op its `target` names from the call
+  // operands its `operands` bind. So what one op can show is checked here, which
+  // is what lets getSpyreopHint hand those readers a dictionary they need not
+  // re-check: the three required fields, each of its type, an optional
+  // `operands` of the op's own operand count with every entry a call operand
+  // index or -1, no other key, a `target` that is a registered op, and an op that
+  // is not a constant, which LowerTTSMarkers never hints. Nothing about other ops
+  // -- an `id` being unique, a call site being whole, its ops agreeing on
+  // `target` and `arity`, every call operand being bound -- is checkable from one
+  // op; FuseComputeAndDataMovement and LowerSpyreOps check those.
   if (name == kSpyreopHintAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
     auto target =
         hint ? hint.getAs<StringAttr>(kSpyreopHintTargetKey) : StringAttr();
     auto id = hint ? hint.getAs<IntegerAttr>(kSpyreopHintIdKey) : IntegerAttr();
-    if (!hint || hint.size() != 2 || !target || !id ||
-        !id.getType().isInteger(64))
+    auto arity =
+        hint ? hint.getAs<IntegerAttr>(kSpyreopHintArityKey) : IntegerAttr();
+    Attribute operandsEntry = hint ? hint.get(kSpyreopHintOperandsKey) : nullptr;
+    auto operands = dyn_cast_or_null<DenseI64ArrayAttr>(operandsEntry);
+    size_t expected = operandsEntry ? 4 : 3;
+    if (!hint || hint.size() != expected || !target || !id ||
+        !id.getType().isInteger(64) || !arity ||
+        !arity.getType().isInteger(64) || (operandsEntry && !operands))
       return op->emitError("'")
-             << kSpyreopHintAttrName
-             << "' must be a dictionary of exactly a string '"
-             << kSpyreopHintTargetKey << "' and an i64 '" << kSpyreopHintIdKey
-             << "', got " << attribute.getValue();
+             << kSpyreopHintAttrName << "' must be a dictionary of a string '"
+             << kSpyreopHintTargetKey << "', an i64 '" << kSpyreopHintIdKey
+             << "', an i64 '" << kSpyreopHintArityKey
+             << "' and optionally an array<i64> '" << kSpyreopHintOperandsKey
+             << "', and nothing else, got " << attribute.getValue();
     if (!RegisteredOperationName::lookup(target.getValue(), getContext()))
       return op->emitError("'")
              << kSpyreopHintAttrName << "' targets " << target
@@ -433,6 +451,25 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
     if (op->hasTrait<OpTrait::ConstantLike>())
       return op->emitError("'")
              << kSpyreopHintAttrName << "' is not set on a constant";
+    int64_t n = arity.getInt();
+    if (n < 1)
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' has " << kSpyreopHintArityKey
+             << " " << n << ", and a call site has at least one operand";
+    if (!operands)
+      return success();
+    if (operands.size() != static_cast<int64_t>(op->getNumOperands()))
+      return op->emitError("'")
+             << kSpyreopHintAttrName << "' has " << operands.size() << " '"
+             << kSpyreopHintOperandsKey << "' entries, one per operand of an op "
+             << "with " << op->getNumOperands();
+    for (auto [j, k] : llvm::enumerate(operands.asArrayRef()))
+      if (k < -1 || k >= n)
+        return op->emitError("'")
+               << kSpyreopHintAttrName << "' binds operand " << j
+               << " to call operand " << k << ", and a call site of "
+               << kSpyreopHintArityKey << " " << n << " has operands 0 to "
+               << n - 1 << ", or -1 for none";
     return success();
   }
 

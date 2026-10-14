@@ -334,9 +334,15 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 ///   1. pick its `id`: one per op, so two call sites of the same intrinsic --
 ///      one helper inlined twice, say -- stay two after both land in one
 ///      function;
-///   2. set `{target = target, id = id}` on every op of the body but its
-///      constants and its terminator, which is about to go. The op's verifier
-///      has held every one of them to be elementwise, so none has a region;
+///   2. set `{target = target, id = id, arity = n}` on every op of the body
+///      but its constants and its terminator, which is about to go, `n` the
+///      call site's operand count -- and on an op with an operand that is a
+///      block argument, `operands` too: per operand of that op, the index of the
+///      block argument it is, which is the index of the call operand it is
+///      about to become, or -1. This is the one point the binding is known
+///      exactly; after ConvertElementwiseToLinalg and fusion, a body's block
+///      arguments are in whatever order its `ins` ended up in. The op's
+///      verifier has held every op to be elementwise, so none has a region;
 ///   3. replace each block argument by its operand and move the body's ops in
 ///      front of the call site;
 ///   4. replace each result by its yielded value and erase the call site, whose
@@ -399,18 +405,44 @@ static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
 
   Builder builder(module.getContext());
   for (SpyreOpOp callSite : callSites) {
-    DictionaryAttr hint = builder.getDictionaryAttr({
+    SmallVector<NamedAttribute, 4> common = {
         builder.getNamedAttr(TTSDialect::kSpyreopHintTargetKey,
                              callSite.getTargetAttr()),
         builder.getNamedAttr(TTSDialect::kSpyreopHintIdKey,
                              builder.getI64IntegerAttr(nextId++)),
-    });
+        builder.getNamedAttr(
+            TTSDialect::kSpyreopHintArityKey,
+            builder.getI64IntegerAttr(callSite.getInputs().size())),
+    };
+    DictionaryAttr hint = builder.getDictionaryAttr(common);
 
     Block &body = callSite.getBody().front();
     Operation *yield = body.getTerminator();
-    for (Operation &op : body.without_terminator())
-      if (!op.hasTrait<OpTrait::ConstantLike>())
+    for (Operation &op : body.without_terminator()) {
+      if (op.hasTrait<OpTrait::ConstantLike>())
+        continue;
+      SmallVector<int64_t> operands;
+      bool readsCallOperand = false;
+      for (Value v : op.getOperands()) {
+        auto arg = dyn_cast<BlockArgument>(v);
+        if (arg && arg.getOwner() == &body) {
+          operands.push_back(arg.getArgNumber());
+          readsCallOperand = true;
+        } else {
+          operands.push_back(-1);
+        }
+      }
+      if (!readsCallOperand) {
         op.setAttr(TTSDialect::kSpyreopHintAttrName, hint);
+        continue;
+      }
+      SmallVector<NamedAttribute, 4> entries(common);
+      entries.push_back(
+          builder.getNamedAttr(TTSDialect::kSpyreopHintOperandsKey,
+                               builder.getDenseI64ArrayAttr(operands)));
+      op.setAttr(TTSDialect::kSpyreopHintAttrName,
+                 builder.getDictionaryAttr(entries));
+    }
 
     for (auto [arg, operand] :
          llvm::zip_equal(body.getArguments(), callSite.getInputs()))

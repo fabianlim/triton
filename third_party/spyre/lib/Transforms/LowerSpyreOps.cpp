@@ -18,10 +18,11 @@
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
-//   a REQUEST       a body whose ops all carry one `tts.spyreop_hint` -> the
-//                   op the hint's `target` names, replacing the whole body.
-//                   The author asked for that op with `tl.spyre_op`, and the
-//                   body is its fallback; see selectCallSite.
+//   a REQUEST       a body whose ops all carry `tts.spyreop_hint`s of one
+//                   `id` -> the op the hint's `target` names, applied to the
+//                   call operands in call order, replacing the whole body. The
+//                   author asked for that op with `tl.spyre_op`, and the body
+//                   is its fallback; see matchCallSite and selectCallSite.
 //
 // Two phases, in this order. Requests first, by a walk over the generics: a
 // body holding a call site becomes its intrinsic, and a hint left anywhere
@@ -550,48 +551,118 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 /// What the call-site rule needs from a body it replaces.
 struct CallSiteMatch {
   DictionaryAttr hint;
-  BlockArgument input;
+  /// Call operand k -> the `ins` block argument holding it, in call order.
+  SmallVector<BlockArgument> inputs;
   SmallVector<Operation *> members;
 };
 
-/// Whether `generic`'s body is one call site, and what it reads. Fails on a
-/// body getBodyCallSite names no call site for: one with no hinted op, which is
-/// not a call site, or with the ops of two, which is left for
-/// rejectSurvivingHints.
+/// Whether block arguments `a` and `b` of `generic` read one element of one
+/// value: the same `ins` operand through the same indexing map. Two ops of a
+/// call site reading one call operand from two generics give the fused body two
+/// such block arguments unless the fusion merges them, which it does for the
+/// `ins` it sees are equal; a body that kept both still has one input there.
+bool readSameInput(linalg::GenericOp generic, BlockArgument a,
+                   BlockArgument b) {
+  OpOperand *operandA = generic.getMatchingOpOperand(a);
+  OpOperand *operandB = generic.getMatchingOpOperand(b);
+  return operandA->get() == operandB->get() &&
+         generic.getMatchingIndexingMap(operandA) ==
+             generic.getMatchingIndexingMap(operandB);
+}
+
+/// What `generic`'s body, the call site `hint` names, reads for each of its
+/// call operands, or failure, reported, when the body does not say.
 ///
-/// FuseComputeAndDataMovement has already checked that a body holding hinted
-/// ops holds one call site, whole, and nothing else but constants, so what is
-/// left to find is the input: the one `ins` block argument the members read,
-/// a block argument whose `ins` operand is a constant aside, since that is a
-/// constant the fusion did not fold into the body. Unary only: with two inputs,
-/// the block-argument order after fusion says nothing about the call site's
-/// operand order.
-FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic) {
+/// FuseComputeAndDataMovement has already checked that the body holds one call
+/// site, whole, and nothing else but constants, so what is left to find is the
+/// inputs. Not by the block arguments' order, which after
+/// ConvertElementwiseToLinalg and fusion is whatever order the `ins` ended up
+/// in -- `b / a` converts to `ins(%b, %a)`, block argument 0 being call operand
+/// 1 -- but from the binding LowerTTSMarkers wrote when it was exact: each
+/// member's `operands`, entry j naming the call operand that member's operand j
+/// is. Gathered over every member, and refused, naming the target and the call
+/// operand, when it
+///
+///   - binds call operand k to an operand that is not an `ins` block argument
+///     of this generic, which nothing between the two passes makes it;
+///   - binds call operand k to two block arguments reading different values,
+///     two reading one value through one map being one input (readSameInput);
+///   - binds no block argument to some call operand k below `arity`, which is
+///     a fallback that does not read that operand, or whose reading folded
+///     away: the target would have nothing to take it from.
+///
+/// A bound block argument whose `ins` operand is a constant is used like any
+/// other: the binding says it is call operand k, so it is a call operand that
+/// folded to a constant after LowerTTSMarkers refused the ones constant there,
+/// and the target applied to it still computes what was asked. An unbound one
+/// -- a constant the fusion did not fold into the body -- is not read for the
+/// target at all, and goes with the members' other unused inputs.
+FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
+                                       DictionaryAttr hint) {
+  StringRef target = triton::tts::getSpyreopHintTarget(hint);
+  int64_t arity = triton::tts::getSpyreopHintArity(hint);
+  Block *body = generic.getBlock();
+  auto yield = cast<linalg::YieldOp>(body->getTerminator());
+  auto refuse = [&](Location loc) {
+    return mlir::emitError(loc)
+           << "lower-spyre-ops: tl.spyre_op(\"" << target << "\"): ";
+  };
+
   CallSiteMatch match;
-  match.hint = triton::tts::getBodyCallSite(*generic.getBlock());
-  if (!match.hint)
-    return failure();
-  for (Operation &op : generic.getBlock()->without_terminator())
+  match.hint = hint;
+  match.inputs.assign(arity, BlockArgument());
+  for (Operation &op : body->without_terminator())
     if (!op.hasTrait<OpTrait::ConstantLike>())
       match.members.push_back(&op);
 
-  llvm::SmallSetVector<BlockArgument, 2> read;
-  for (Operation *op : match.members)
-    for (Value v : op->getOperands()) {
-      auto arg = dyn_cast<BlockArgument>(v);
-      if (!arg || arg.getOwner() != generic.getBlock())
+  for (Operation *op : match.members) {
+    DictionaryAttr opHint = triton::tts::getSpyreopHint(op);
+    DenseI64ArrayAttr operands =
+        opHint ? triton::tts::getSpyreopHintOperands(opHint) : nullptr;
+    if (!operands)
+      continue;
+    for (auto [j, k] : llvm::enumerate(operands.asArrayRef())) {
+      if (k < 0)
         continue;
-      Operation *def = resolveThroughBody(generic, arg).getDefiningOp();
-      if (def && def->hasTrait<OpTrait::ConstantLike>())
-        continue;
-      read.insert(arg);
+      auto arg = dyn_cast<BlockArgument>(op->getOperand(j));
+      if (!arg || arg.getOwner() != body ||
+          !generic.isDpsInput(generic.getMatchingOpOperand(arg))) {
+        refuse(op->getLoc())
+            << "call operand " << k << " is operand " << j << " of '"
+            << op->getName()
+            << "', which is not an input of its compute body -- a compiler "
+               "bug, since nothing between the call site's inlining and its "
+               "selection makes it one";
+        return failure();
+      }
+      BlockArgument &bound = match.inputs[k];
+      if (!bound)
+        bound = arg;
+      else if (bound != arg && !readSameInput(generic, bound, arg)) {
+        refuse(op->getLoc())
+            << "call operand " << k
+            << " is read from two different inputs of its compute body, block "
+               "arguments "
+            << bound.getArgNumber() << " and " << arg.getArgNumber();
+        return failure();
+      }
     }
-  auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
-  if (read.size() != 1 ||
-      !generic.isDpsInput(generic.getMatchingOpOperand(read.front())) ||
-      yield->getNumOperands() != 1)
+  }
+
+  for (auto [k, bound] : llvm::enumerate(match.inputs))
+    if (!bound) {
+      refuse(generic.getLoc())
+          << "call operand " << k
+          << " is read by no op left of the fallback, so there is no input to "
+             "pass the target for it";
+      return failure();
+    }
+  if (yield->getNumOperands() != 1) {
+    refuse(generic.getLoc())
+        << "the call site's body yields " << yield->getNumOperands()
+        << " values, and a request has one result";
     return failure();
-  match.input = read.front();
+  }
   return match;
 }
 
@@ -600,9 +671,9 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic) {
 /// Matched on the generic and not on a member, because the call site is the
 /// BODY: which op the fallback happens to end in says nothing. What the members
 /// computed -- the fallback, casts included -- is discarded whole, and the body
-/// becomes the target applied to its input, at the type the body yields. The
-/// input's unused siblings, a captured constant among them, are left to the
-/// unused-operand cleanup in the rule phase.
+/// becomes the target applied to its inputs, in call order, at the type the
+/// body yields. The inputs' unused siblings, a captured constant among them,
+/// are left to the unused-operand cleanup in the rule phase.
 ///
 /// The target is built by name, so nothing here knows what it takes: its own
 /// verifier is asked, and a target that refuses this operand or type is erased
@@ -620,7 +691,7 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   Value result = yield->getOperand(0);
   rewriter.setInsertionPoint(yield);
   OperationState state(result.getLoc(), target);
-  state.addOperands(match.input);
+  state.addOperands(ArrayRef<BlockArgument>(match.inputs));
   state.addTypes(result.getType());
   Operation *selected = rewriter.create(state);
   if (failed(mlir::verify(selected))) {
@@ -641,11 +712,16 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
 
 /// The request phase: every body that is one call site becomes its target.
 /// A walk and not a fixpoint, since a body holds at most one call site and
-/// replacing it makes no other.
+/// replacing it makes no other. A body matchCallSite refuses is reported there,
+/// with the reason, and left hinted, so rejectSurvivingHints reports the
+/// request as unselected as well.
 void selectCallSites(ModuleOp module) {
   SmallVector<std::pair<linalg::GenericOp, CallSiteMatch>> matches;
   module.walk([&](linalg::GenericOp generic) {
-    FailureOr<CallSiteMatch> match = matchCallSite(generic);
+    DictionaryAttr hint = triton::tts::getBodyCallSite(*generic.getBlock());
+    if (!hint)
+      return;
+    FailureOr<CallSiteMatch> match = matchCallSite(generic, hint);
     if (succeeded(match))
       matches.emplace_back(generic, std::move(*match));
   });
@@ -659,10 +735,10 @@ void selectCallSites(ModuleOp module) {
 /// would ignore that request without saying so. After the request phase, so it
 /// is the one check that no `tts.spyreop_hint` reaches the rule phase.
 LogicalResult rejectSurvivingHints(ModuleOp module) {
-  llvm::SmallDenseSet<DictionaryAttr> reported;
+  llvm::SmallDenseSet<int64_t> reported;
   module.walk([&](Operation *op) {
     DictionaryAttr hint = triton::tts::getSpyreopHint(op);
-    if (!hint || !reported.insert(hint).second)
+    if (!hint || !reported.insert(triton::tts::getSpyreopHintId(hint)).second)
       return;
     mlir::emitError(op->getLoc())
         << "lower-spyre-ops: tl.spyre_op(\""

@@ -2127,6 +2127,14 @@ class TritonSemantic(Generic[TensorTy]):
             if not isinstance(a, tl.tensor) or not a.type.is_block():
                 raise ValueError(f"tl.spyre_op({name!r}): operand {i} must be a "
                                  f"tensor, got {a!r}")
+            # tts.spyre_op's verifier holds every operand to operand 0's shape,
+            # so the call site fuses into one body; checked here so the refusal
+            # is at the kernel line.
+            shape = [tl._unwrap_if_constexpr(d) for d in a.type.shape]
+            shape0 = [tl._unwrap_if_constexpr(d) for d in args[0].type.shape]
+            if shape != shape0:
+                raise ValueError(f"tl.spyre_op({name!r}): operand {i} has shape {shape}, "
+                                 f"and every operand must have operand 0's, {shape0}")
             # The registration's dtypes. The target op's verifier checks its own
             # operand types again when LowerSpyreOps builds it; checked here so
             # the refusal is at the kernel line.

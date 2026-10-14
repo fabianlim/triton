@@ -365,7 +365,7 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
                        triton::tts::getSpyreopHintId(consumer))
     return false;
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
-                          << producer << " into "
+                          << triton::tts::getSpyreopHintId(producer) << " into "
                           << fusedOperand->getOwner()->getLoc() << "\n");
   return true;
 }
@@ -376,7 +376,8 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 ///   - each `id` is in exactly one generic body, and on no op outside a body;
 ///   - a body holding hinted ops holds no other op but constants: neither the
 ///     ops of a second `id`, nor an unhinted op;
-///   - every op of one `id` agrees on `target`.
+///   - every op of one `id` agrees on `target` and on `arity`. Not on the whole
+///     hint, which differs per op by its `operands`.
 ///
 /// The `tts.spyre_op` verifier held each body to be elementwise at one shape,
 /// so ConvertElementwiseToLinalg gives every op of it a generic over one
@@ -384,12 +385,14 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 /// bug, and is reported as one rather than as the author's.
 LogicalResult checkCallSitesFused(ModuleOp mod) {
   using triton::tts::getSpyreopHint;
+  using triton::tts::getSpyreopHintArity;
   using triton::tts::getSpyreopHintId;
   using triton::tts::getSpyreopHintTarget;
   using triton::tts::TTSDialect;
 
   struct CallSite {
     StringAttr target;
+    int64_t arity = 0;
     Operation *first = nullptr;
     llvm::SmallSetVector<Operation *, 2> bodies;
   };
@@ -409,13 +412,20 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
       return;
     int64_t id = getSpyreopHintId(hint);
     auto target = hint.getAs<StringAttr>(TTSDialect::kSpyreopHintTargetKey);
+    int64_t arity = getSpyreopHintArity(hint);
     CallSite &site = callSites[id];
     if (!site.first) {
       site.first = op;
       site.target = target;
+      site.arity = arity;
     } else if (site.target != target) {
       report(op, id, site.target.getValue())
           << "an op of it targets '" << target.getValue() << "'";
+      return;
+    } else if (site.arity != arity) {
+      report(op, id, target.getValue())
+          << "an op of it has arity " << arity << " where another has "
+          << site.arity;
       return;
     }
     auto generic = dyn_cast<linalg::GenericOp>(op->getParentOp());

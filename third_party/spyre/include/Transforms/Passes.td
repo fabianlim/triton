@@ -172,6 +172,12 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         the op its hint's `target` names, built by name and held to its own
         verifier. The targets are registered in `backend/intrinsics.py`; a `tts`
         attribute on the op producing the result, a pin, moves to the target.
+        The target takes the call operands in CALL order, which the body's
+        block-argument order does not give -- `b / a` converts to
+        `ins(%b, %a)` -- so it is read off the hint's per-op `operands`, which
+        LowerTTSMarkers wrote when it was exact. A body whose bindings conflict,
+        leave a call operand unbound, or name something other than an `ins`
+        block argument is an error naming the target and the call operand.
 
         REQUESTS FIRST. Call sites are selected by a walk before any other rule
         runs, and a `tts.spyreop_hint` left after it is refused there, so the 1:1
@@ -402,10 +408,12 @@ def FuseComputeAndDataMovement
           a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
           `tt.expand_dims` leaves behind where no collapse cancelled it.
         - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
-          whose bodies carry the same `tts.spyreop_hint` tag → fused. The tag means both
-          hold ops LowerTTSMarkers inlined from one `tts.spyre_op`, and
-          [LowerSpyreOps] replaces a request only as ONE body. Constants carry
-          no hint, and a body carrying two hints has none.
+          whose bodies carry `tts.spyreop_hint` tags of one `id` → fused. The
+          tags mean both hold ops LowerTTSMarkers inlined from one
+          `tts.spyre_op`, and [LowerSpyreOps] replaces a request only as ONE
+          body. By `id` and not by the whole tag, which differs per op by its
+          `operands`. Constants carry no hint, and a body carrying two ids has
+          none.
           Here rather than in a pass after RewriteDescriptorLayoutGeneric: that
           pass physicalizes only the generics one hop off an annotated load or
           store, leaving the request's first generic with a linearizing result

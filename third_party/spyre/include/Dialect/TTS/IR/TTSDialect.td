@@ -125,11 +125,35 @@ def TTS_Dialect : Dialect {
     /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
     /// body:
     ///
-    ///   target : the op the call site names, the op's `target`, as the
-    ///            string of a registered operation name
-    ///   id     : an `i64` unique per `tts.spyre_op` in the module, so two call
-    ///            sites of the same target stay distinguishable after both are
-    ///            inlined into one function
+    ///   target   : the op the call site names, the op's `target`, as the
+    ///              string of a registered operation name
+    ///   id       : an `i64` unique per `tts.spyre_op` in the module, so two
+    ///              call sites of the same target stay distinguishable after
+    ///              both are inlined into one function. It alone says which call
+    ///              site an op is of: the ops of one call site carry different
+    ///              dictionaries, since `operands` is per op
+    ///   arity    : an `i64`, the call site's operand count, on every op of it
+    ///   operands : on an op reading a call operand directly, and only there, a
+    ///              `DenseI64ArrayAttr` with one entry per operand of the op it
+    ///              sits on: the index of the call operand that operand IS, or
+    ///              -1 when it is not one (a value computed in the body, or a
+    ///              constant). E.g. `array<i64: 1, -1>` on the `arith.divf` of
+    ///              `b / t`, `b` the call's operand 1
+    ///
+    /// `operands` is the call site's operand order, written when it is known
+    /// exactly -- LowerTTSMarkers replacing block argument k with call operand
+    /// k -- because nothing later can recover it: a generic's block arguments
+    /// follow its `ins`, which ConvertElementwiseToLinalg orders by the first
+    /// op's operands and fusion splices and deduplicates. It is per operand of
+    /// an op, and survives because what happens to the op in between keeps its
+    /// operand order: ConvertElementwiseToLinalg gives operand j of the scalar
+    /// op block argument j, whose `ins` operand is the tensor op's operand j;
+    /// fusion and the layout rewrite clone body ops whole; and a rewrite
+    /// replacing a hinted op keeps lhs and rhs and copies its `tts` attributes.
+    /// The one reordering any folding driver does is a commutative op's trait
+    /// fold, which moves constant operands after the others -- the order the
+    /// `ktir` stage's canonicalize has already put the body in before the hint
+    /// is written.
     ///
     /// On the ops and not on what they become: ConvertElementwiseToLinalg
     /// writes a tensor op's attributes onto the scalar op it puts in the body,
@@ -145,9 +169,11 @@ def TTS_Dialect : Dialect {
     static constexpr ::llvm::StringLiteral kSpyreopHintAttrName =
         "tts.spyreop_hint";
 
-    /// The two entry names of that dictionary.
+    /// The entry names of that dictionary.
     static constexpr ::llvm::StringLiteral kSpyreopHintTargetKey = "target";
     static constexpr ::llvm::StringLiteral kSpyreopHintIdKey = "id";
+    static constexpr ::llvm::StringLiteral kSpyreopHintArityKey = "arity";
+    static constexpr ::llvm::StringLiteral kSpyreopHintOperandsKey = "operands";
   }];
 
   let hasOperationAttrVerify = 1;

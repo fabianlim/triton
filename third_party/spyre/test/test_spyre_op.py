@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """``tl.spyre_op`` from the kernel line to the module dbo-opt receives.
 
-Every case registers its own fallback for one real target, ``spyreop.sigmoid``,
-over an empty copy of the registry, so nothing here changes when a target is
+Every case registers its own fallback for a real target -- ``spyreop.sigmoid``,
+or ``spyreop.realdiv`` for two operands -- over an empty copy of the registry, so nothing here changes when a target is
 added and no registration outlives its test. The claims, one per stage:
 
 * tracing builds a ``tts.spyre_op`` holding the bound fallback, which its region
@@ -10,12 +10,14 @@ added and no registration outlives its test. The claims, one per stage:
 * the ``ktir`` artifact holds that fallback alone, inlined and hinted
   ``tts.spyreop_hint`` -- no ``tts`` op, which a KTIR reader could not parse;
 * the ``spyrecode`` pipeline fuses the hinted ops into one body and replaces it
-  with exactly one op, the target, and no hint is left for dbo-opt.
+  with exactly one op, the target, taking the operands in the call's order
+  whatever order the fallback read them in, and no hint is left for dbo-opt.
 
 The last is reproduced with the registered pipeline rather than through the
 ``spyrecode`` stage itself, which shells out to dbo-opt -- CLAUDE.md's
 "Reproducing that module". And the refusals the frontend owns: a target with no
-fallback registered, a dtype the registration does not take, the wrong arity, a
+fallback registered, a dtype the registration does not take, the wrong arity,
+operands of two shapes, a
 fallback returning other than operand 0's type, and the registrations the
 decorator refuses -- among them a target that is not a registered op.
 
@@ -103,7 +105,8 @@ def test_call_site_reaches_one_intrinsic(register, fallback, dtype, tmp_path):
     mod = _ktir(ttir, tmp_path)
     ktir = str(mod)
     assert "tts.spyre_op" not in ktir and "tts.spyreop_yield" not in ktir
-    assert f'tts.spyreop_hint = {{id = 0 : i64, target = "{TARGET}"}}' in ktir
+    assert re.search(r'tts\.spyreop_hint = \{arity = 1 : i64, id = 0 : i64, '
+                     r'(operands = array<i64: [-0-9, ]+>, )?target = "' + TARGET + '"', ktir)
     assert "tt.call" not in ktir
 
     spyrecode = _spyrecode(mod)
@@ -115,6 +118,87 @@ def test_call_site_reaches_one_intrinsic(register, fallback, dtype, tmp_path):
     assert "tts.spyreop_hint" not in spyrecode
     assert "math." not in spyrecode
     assert "arith.extf" not in spyrecode and "arith.truncf" not in spyrecode
+
+
+@triton.jit
+def _request2(x_ptr, y_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
+    x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
+    y_desc = tl.make_tensor_descriptor(y_ptr, shape=[N], strides=[1], block_shape=[N])
+    out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
+    out_desc.store([0], tl.spyre_op(OP, x_desc.load([0]), y_desc.load([0])))
+
+
+@triton.jit
+def div_in_order(a, b):
+    return a / b
+
+
+@triton.jit
+def div_reversed(a, b):
+    # Reads `b` first, so the fused body's `ins` are `(b, a)`.
+    return (1.0 / b) * a
+
+
+@triton.jit
+def div_reads_a_twice(a, b):
+    # `a` read by two ops of two generics, so two ops bind call operand 0.
+    return (a * 2.0) / b - a
+
+
+def _selected_operands(spyrecode, target):
+    """The descriptor each operand of the one ``target`` op reads, in its operand
+    order: block argument -> the generic's ``ins`` operand -> ``ktdp.load`` ->
+    access tile -> memory view."""
+    # Locations aside, which a block argument prints inline.
+    while True:
+        stripped = re.sub(r" loc\((?:[^()]|\([^()]*\))*\)", "", spyrecode)
+        if stripped == spyrecode:
+            break
+        spyrecode = stripped
+    tile_view = dict(re.findall(r"%(\w+) = ktdp\.construct_access_tile %(\w+)\[", spyrecode))
+    load_tile = dict(re.findall(r"%(\w+) = ktdp\.load %(\w+)", spyrecode))
+    generic = re.search(
+        r"ins\(([^:]*) :[^)]*\) outs\([^)]*\) \{\s*\^bb0\(([^)]*)\):\s*%\S+ = " + re.escape(target) +
+        r" ([^:]*) :", spyrecode)
+    assert generic, spyrecode
+    ins = [v.strip().lstrip("%") for v in generic.group(1).split(",")]
+    args = [a.split(":")[0].strip().lstrip("%") for a in generic.group(2).split(",")]
+    used = [v.strip().lstrip("%") for v in generic.group(3).split(",")]
+    return [tile_view[load_tile[ins[args.index(u)]]] for u in used]
+
+
+@pytest.mark.parametrize("fallback", [div_in_order, div_reversed, div_reads_a_twice],
+                         ids=["in_order", "reversed", "reads_a_twice"])
+def test_two_operand_call_site_takes_call_order(register, fallback, tmp_path):
+    # A real two-operand target. Whatever order the fallback reads its operands
+    # in, and so whatever order the fused body's `ins` end up in, the target
+    # takes them in the CALL's order: x, then y.
+    target = "spyreop.realdiv"
+    register(target, dtypes=(tl.float32, ))(fallback)
+    signature = {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32", "N": "constexpr", "OP": "constexpr"}
+    ttir = compile_to_ttir(_request2, signature, {"N": 128, "OP": target})
+    spyrecode = _spyrecode(_ktir(ttir, tmp_path))
+    assert spyrecode.count(target) == 1, spyrecode
+    assert "tts.spyreop_hint" not in spyrecode
+    assert _selected_operands(spyrecode, target) == ["x_desc", "y_desc"], spyrecode
+
+
+def test_operands_of_two_shapes_are_refused(register):
+
+    @register(dtypes=(tl.float32, ))
+    @triton.jit
+    def two(a, b):
+        return a + b
+
+    @triton.jit
+    def two_shapes(x_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
+        x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
+        out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
+        x = x_desc.load([0])
+        out_desc.store([0], tl.spyre_op(OP, x, tl.reshape(x, [N // 2, 2])))
+
+    _raises(two_shapes, TARGET, "fp32", f"tl.spyre_op('{TARGET}'): operand 1 has shape [64, 2], and every operand "
+            "must have operand 0's, [128]")
 
 
 def _raises(kernel, op, dtype, match):

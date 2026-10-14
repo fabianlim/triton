@@ -157,11 +157,15 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     THE CALL SITE IS CHECKED IN FOUR PLACES, by the form it has at the time. It
     is this op from trace to the end of the `ktir` stage; LowerTTSMarkers then
-    inlines the body in place and sets `tts.spyreop_hint = {target, id}` on every
-    op it inlined but the constants, `id` unique to this op in the module, so
-    the `ktir` artifact is the fallback alone, in dialects any consumer loads.
-    In `spyrecode`, FuseComputeAndDataMovement fuses the hinted ops into one
-    body, and LowerSpyreOps replaces that body with the target.
+    inlines the body in place and sets `tts.spyreop_hint = {target, id, arity}`
+    on every op it inlined but the constants, `id` unique to this op in the
+    module and `arity` its operand count, so the `ktir` artifact is the fallback
+    alone, in dialects any consumer loads. An op reading a block argument also
+    gets `operands`, per operand of that op the index of the call operand it is
+    or -1: the call's operand order, which nothing after the inlining can
+    recover. In `spyrecode`, FuseComputeAndDataMovement fuses the hinted ops of
+    one `id` into one body, and LowerSpyreOps replaces that body with the
+    target, applied to the inputs `operands` binds, in call order.
 
     WHICH TARGETS EXIST, and what each takes, is the frontend's registration
     (`backend/intrinsics.py`), not this dialect's: it checks that `target` is a
@@ -180,16 +184,21 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
           `tt.call` is admitted by both of the last two until the `ttir`
           stage's inliner replaces it with the fallback's body.
       V2  the `tts.spyreop_hint` attribute verifier, on each op at every
-          verification point. What one op shows: a dictionary of exactly a
-          string `target` and an i64 `id`, a `target` that is a registered op,
+          verification point. What one op shows: a dictionary of a string
+          `target`, an i64 `id`, a positive i64 `arity`, optionally an
+          `operands` array of one entry per operand of the op, each in
+          [-1, arity), and no other key; a `target` that is a registered op;
           and an op that is not a constant. Nothing about other ops.
       V3  FuseComputeAndDataMovement, after its fixpoint, over the module:
           each `id` is in exactly one generic body and on no op outside one,
           that body holds no other op but constants, and the ops of one `id`
-          agree on `target`. V1 is what guarantees the fusion, so a failure here
-          is a compiler bug, reported as one.
-      V4  LowerSpyreOps: selection, which builds the target and runs its
-          verifier, then one check, that no op still carries a
+          agree on `target` and `arity`. V1 is what guarantees the fusion, so a
+          failure here is a compiler bug, reported as one.
+      V4  LowerSpyreOps: selection, which reads each call operand's input off
+          the members' `operands` -- refusing, by target and call operand, a
+          call operand bound to two different inputs, to none, or to anything
+          but an `ins` block argument -- builds the target and runs its
+          verifier; then one check, that no op still carries a
           `tts.spyreop_hint`. A request left unselected is an error naming the
           target, since passing the fallback through would drop it silently.
 

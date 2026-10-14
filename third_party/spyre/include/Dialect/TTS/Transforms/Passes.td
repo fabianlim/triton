@@ -43,8 +43,13 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         - tts.spyre_op (op) → its body, inlined in place: block arguments
           replaced by the operands, results by the yielded values. Every op
           inlined but the constants carries the `tts.spyreop_hint` ATTRIBUTE,
-          `{target = <op name>, id = <i64>}`, with an id unique to that
-          tts.spyre_op in the module. Runs before the markers, so a pin naming
+          `{target = <op name>, id = <i64>, arity = <i64>}`, with an id unique
+          to that tts.spyre_op in the module and its operand count; an op
+          reading a block argument also carries `operands = array<i64: ...>`,
+          per operand of that op the index of the call operand it is, or -1.
+          Written here because this is the one point the binding is exact:
+          after ConvertElementwiseToLinalg and fusion a body's block-argument
+          order follows its `ins`, not the call. Runs before the markers, so a pin naming
           a request's result lands on the inlined op producing it. Two
           tts.spyre_op are errors, because no op of the body would be left to
           carry the request and no target would be selected: one with a

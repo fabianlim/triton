@@ -1,8 +1,9 @@
 """The device ops a kernel may request with ``tl.spyre_op``, and the fallback each
 one is traced as.
 
-``tl.spyre_op(target, x)`` is a request that ``x`` be computed by the device op
-``target``, named in full -- ``"spyreop.sigmoid"``. The kernel author writes only
+``tl.spyre_op(target, *args)`` is a request that ``args`` be computed by the
+device op ``target``, named in full -- ``"spyreop.sigmoid"`` -- which takes them
+in that order. The kernel author writes only
 the target; what is traced is the FALLBACK registered here -- the same
 computation in plain ``tl`` ops -- inside a ``tts.spyre_op`` region. So a request
 means the same thing at every stage:

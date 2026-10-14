@@ -100,9 +100,9 @@ func.func @already_normalized_and_integers(%f0: f32, %f1: f32, %i0: i32, %i1: i3
 // site.
 module {
 // CHECK-LABEL:   func.func @hinted_maxnumf(
-// CHECK:           arith.maximumf %{{.*}}, %{{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
+// CHECK:           arith.maximumf %{{.*}}, %{{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
 func.func @hinted_maxnumf(%a: tensor<64xf32>, %b: tensor<64xf32>) -> tensor<64xf32> {
-  %m = arith.maxnumf %a, %b {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
+  %m = arith.maxnumf %a, %b {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : tensor<64xf32>
   return %m : tensor<64xf32>
 }
 }

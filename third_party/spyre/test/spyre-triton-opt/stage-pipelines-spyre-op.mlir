@@ -56,9 +56,9 @@ module {
 //
 // KTIR-LABEL:   func.func @gelu(
 // KTIR:           %[[X:.*]] = ktdp.load
-// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
-// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
-// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.gelu"}}
+// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
 // KTIR:           ktdp.store %[[G]]
 // KTIR-NOT:       tts.spyre_op
 // KTIR-NOT:       tts.spyreop_yield
@@ -116,8 +116,8 @@ module {
 // their equal constants, which is why a constant carries no hint.
 //
 // KTIR-LABEL:   func.func @sigmoid_silu(
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 0 : i64, target = "spyreop.sigmoid"}}
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {id = 1 : i64, target = "spyreop.silu"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}}
+// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 1 : i64, target = "spyreop.silu"}}
 
 // Two bodies, one intrinsic each, the second reading the first.
 //
