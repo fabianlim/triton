@@ -170,8 +170,8 @@ void init_triton_spyre_ir_builders(py::module &&m) {
   // then traces the registered fallback into its region -- the shape
   // `create_reduce` has, since a region belongs to an op and so the op has to
   // exist first. That is also why the result types are an argument rather than
-  // read off the body: the registry declares them, and the region verifier
-  // holds the yield to them.
+  // read off the body: the frontend passes operand 0's type, and the region
+  // verifier holds the yield to it.
   //
   // `target` is not checked here. Which targets exist is the registry's, in the
   // backend's Python, and semantic.py refuses an unknown one before this runs;
