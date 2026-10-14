@@ -20,13 +20,13 @@
 // Two markers, two resolution functions and two attribute builders, which is
 // what the shape below was for.
 //
-// And one op that is NOT a marker: `tts.spyre_intrinsic` names no value and has a body,
-// so it does not fit the driver's resolve-and-move shape and has a function of
-// its own, inlineSpyreIntrinsicCallSites. Its lowering inlines the body in place and
-// leaves the call site as the `tts.spyre_intrinsic` on every op inlined -- an
-// attribute on the ops rather than on one subject, which is the same rule (the op
-// goes, a builtin attribute stays) applied to a call site that is about a
-// computation.
+// And one op that is NOT a marker: `tts.spyre_intrinsic` names no value and has
+// a body, so it does not fit the driver's resolve-and-move shape and has a
+// function of its own, inlineSpyreIntrinsicCallSites. Its lowering inlines the
+// body in place and leaves the call site as the `tts.spyre_intrinsic` on every
+// op inlined -- an attribute on the ops rather than on one subject, which is
+// the same rule (the op goes, a builtin attribute stays) applied to a call site
+// that is about a computation.
 //
 // A pinned BLOCK ARGUMENT is therefore refused HERE, and this is the only place it
 // can be. It is a value like any other and the op admits one, but it has no defining
@@ -327,7 +327,8 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 // tts.spyre_intrinsic
 //===----------------------------------------------------------------------===//
 
-/// Inline every `tts.spyre_intrinsic` in `module` in place, hinting each inlined op.
+/// Inline every `tts.spyre_intrinsic` in `module` in place, hinting each
+/// inlined op.
 ///
 /// Per call site, in this order:
 ///
@@ -337,8 +338,8 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 ///   2. set `{target = target, id = id, arity = n}` on every op of the body
 ///      but its constants and its terminator, which is about to go, `n` the
 ///      call site's operand count -- and on an op with an operand that is a
-///      block argument, `operands` too: per operand of that op, the index of the
-///      block argument it is, which is the index of the call operand it is
+///      block argument, `operands` too: per operand of that op, the index of
+///      the block argument it is, which is the index of the call operand it is
 ///      about to become, or -1. This is the one point the binding is known
 ///      exactly; after ConvertElementwiseToLinalg and fusion, a body's block
 ///      arguments are in whatever order its `ins` ended up in. The op's
@@ -388,8 +389,8 @@ static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
     for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
       if (matchPattern(operand, m_Constant()))
         return callSite.emitError()
-               << "tl.spyre_intrinsic(\"" << callSite.getTarget() << "\"): operand "
-               << i
+               << "tl.spyre_intrinsic(\"" << callSite.getTarget()
+               << "\"): operand " << i
                << " is a constant, so the call site would fold to a constant "
                   "and no target would be selected";
     Block &body = callSite.getBody().front();
@@ -473,8 +474,8 @@ struct LowerTTSMarkersPass
     // FIRST, ahead of the markers. A pin may name a call site's result, and
     // the op producing that value exists only once the body is inlined -- run
     // after, the pin would land on the call site and be erased with it. Not a
-    // marker, so not the driver's: see inlineSpyreIntrinsicCallSites, which refuses
-    // a call site with a constant operand.
+    // marker, so not the driver's: see inlineSpyreIntrinsicCallSites, which
+    // refuses a call site with a constant operand.
     if (failed(inlineSpyreIntrinsicCallSites(getOperation())))
       return signalPassFailure();
 

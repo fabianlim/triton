@@ -15,8 +15,8 @@
 //
 // And one intrinsic request, `tts.spyre_intrinsic`, in the same two spellings:
 // the op, which holds the fallback a kernel's request traces, and the
-// `tts.spyre_intrinsic` attribute, which the lowered IR carries on every op that
-// body was inlined into.
+// `tts.spyre_intrinsic` attribute, which the lowered IR carries on every op
+// that body was inlined into.
 //
 //===----------------------------------------------------------------------===//
 
@@ -71,15 +71,15 @@ int64_t getSpyreIntrinsicArity(DictionaryAttr hint);
 
 /// Which call operand each operand of the hinted op is -- entry j for operand
 /// j, -1 for one that is not a call operand -- or null when the op reads no
-/// call operand directly. From a hint returned by getSpyreIntrinsic, so the array
-/// has one entry per operand of the op it was read off.
+/// call operand directly. From a hint returned by getSpyreIntrinsic, so the
+/// array has one entry per operand of the op it was read off.
 DenseI64ArrayAttr getSpyreIntrinsicOperands(DictionaryAttr hint);
 
-/// The `tl.spyre_intrinsic` call site whose ops `body` holds: the hint of its first
-/// hinted op, when they all have one `id`, or null when `body` holds no hinted
-/// op or hinted ops of two call sites. What the result says about the call site
-/// is its `id`, `target` and `arity`; its `operands`, if any, are that one
-/// op's. With `<silu#0>` for the hint
+/// The `tl.spyre_intrinsic` call site whose ops `body` holds: the hint of its
+/// first hinted op, when they all have one `id`, or null when `body` holds no
+/// hinted op or hinted ops of two call sites. What the result says about the
+/// call site is its `id`, `target` and `arity`; its `operands`, if any, are
+/// that one op's. With `<silu#0>` for the hint
 /// `{target = "spyreop.silu", id = 0}`:
 ///
 ///   {exp<silu#0>, addf<silu#0>}   -> silu#0

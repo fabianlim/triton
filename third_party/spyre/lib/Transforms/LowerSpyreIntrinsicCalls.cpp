@@ -139,7 +139,8 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
   auto yield = cast<linalg::YieldOp>(body->getTerminator());
   auto refuse = [&](Location loc) {
     return mlir::emitError(loc)
-           << "lower-spyre-intrinsic-calls: tl.spyre_intrinsic(\"" << target << "\"): ";
+           << "lower-spyre-intrinsic-calls: tl.spyre_intrinsic(\"" << target
+           << "\"): ";
   };
 
   CallSiteMatch match;
@@ -319,7 +320,8 @@ LogicalResult rejectSurvivingHints(ModuleOp module) {
   llvm::SmallDenseSet<int64_t> reported;
   module.walk([&](Operation *op) {
     DictionaryAttr hint = triton::tts::getSpyreIntrinsic(op);
-    if (!hint || !reported.insert(triton::tts::getSpyreIntrinsicId(hint)).second)
+    if (!hint ||
+        !reported.insert(triton::tts::getSpyreIntrinsicId(hint)).second)
       return;
     mlir::emitError(op->getLoc())
         << "lower-spyre-intrinsic-calls: tl.spyre_intrinsic(\""

@@ -50,9 +50,10 @@ void mlir::triton::spyre::buildTTIRToKTIRPipeline(
 
   // LAST, and after that canonicalize rather than before it. Each tts marker op's
   // annotation -> an attribute on the op the marked value resolved to, and each
-  // tts.spyre_intrinsic -> its fallback body inlined, every op tagged `tts.spyre_intrinsic`. The
-  // body's tt ops were lowered in place by LowerComputeOps, above, so what is
-  // inlined is already this stage's output dialects.
+  // tts.spyre_intrinsic -> its fallback body inlined, every op tagged
+  // `tts.spyre_intrinsic`. The body's tt ops were lowered in place by
+  // LowerComputeOps, above, so what is inlined is already this stage's output
+  // dialects.
   //
   // Bounded below by two passes, one per marker. LowerDescriptorMemory, because a
   // tts.tensor_layout lands on the memory view that pass builds, reached through
@@ -238,14 +239,14 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // which is the component that knows what it can take.
   pm.addPass(createLowerSpyreOpsPass());
 
-  // The cleanup belonging to the layout pass, moved across the boundary with it.
-  // Physicalization emits an arith.divsi/remsi per access-tile index and a cast
-  // chain per retyped value; the `ktir` stage's tail canonicalize used to fold the
-  // static ones and now runs before them. Nothing else here would -- the
-  // canonicalize and CSE below are inside the bind-base-addresses branch, which a
-  // device launch does not take -- so omitting this hands dbo-opt the unfolded form
-  // on exactly the path that matters. Observed as a nondeterministic dbo-opt crash,
-  // not a diagnostic.
+  // The cleanup belonging to the layout pass, moved across the boundary with
+  // it. Physicalization emits an arith.divsi/remsi per access-tile index and a
+  // cast chain per retyped value; the `ktir` stage's tail canonicalize used to
+  // fold the static ones and now runs before them. Nothing else here would --
+  // the canonicalize and CSE below are inside the bind-base-addresses branch,
+  // which a device launch does not take -- so omitting this hands dbo-opt the
+  // unfolded form on exactly the path that matters. Observed as a
+  // nondeterministic dbo-opt crash, not a diagnostic.
   //
   // Canonicalize only, for the reason the `ktir` stage's header gives: on an
   // author-written HBM round trip a store's ktdp.construct_access_tile and the

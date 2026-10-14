@@ -50,8 +50,9 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 /// Replaces `Source` with `Target`, carrying both operands, the fastmath
-/// attribute and the `tts` attributes across. Applies wherever the op appears -- a linalg.generic body, a
-/// linalg.reduce combiner, or plain scalar arithmetic.
+/// attribute and the `tts` attributes across. Applies wherever the op appears
+/// -- a linalg.generic body, a linalg.reduce combiner, or plain scalar
+/// arithmetic.
 ///
 /// Usable for any pair of binary `arith` float ops: the only ODS shape it reads
 /// is two same-typed operands, one result and an optional fastmath attribute.

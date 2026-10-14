@@ -1,7 +1,8 @@
 //===- Ops.cpp - The tts dialect's ops ------------------------------------===//
 //
-// Four ops. `tensor_layout`'s verifier delegates rather than restates -- see the
-// note on `tts::verifyTensorLayoutArrays` for why the rules have a single owner.
+// Four ops. `tensor_layout`'s verifier delegates rather than restates -- see
+// the note on `tts::verifyTensorLayoutArrays` for why the rules have a single
+// owner.
 //
 // `pin`'s rules are its own, and what is left of them after ODS is small: the
 // offset is an attribute, so its spelling is a type constraint the generated
@@ -10,11 +11,11 @@
 // ktdp's enum. What deliberately does NOT stay is any rule about the operand's
 // provenance -- see the note in `PinOp::verify`.
 //
-// `spyre_intrinsic`'s rules are about its target and its body, which is why they are a
-// region verifier: the target is a registered op, the block's signature is the
-// operands',
-// its terminator yields the results, nothing in it touches memory, and the body
-// is one elementwise computation, so it can fuse into one generic.
+// `spyre_intrinsic`'s rules are about its target and its body, which is why
+// they are a region verifier: the target is a registered op, the block's
+// signature is the operands', its terminator yields the results, nothing in it
+// touches memory, and the body is one elementwise computation, so it can fuse
+// into one generic.
 //
 //===----------------------------------------------------------------------===//
 

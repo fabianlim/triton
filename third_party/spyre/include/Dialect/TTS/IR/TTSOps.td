@@ -137,14 +137,15 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
 
   let description = [{
     `tts.spyre_intrinsic` is the **authoring** spelling of
-    `tl.spyre_intrinsic(target, *args)`: a request that the computation be done by the
-    op `target`, by its full name, e.g. `"spyreop.sigmoid"`. The region holds
-    that computation's FALLBACK -- the backend's registered `@triton.jit` body
-    for `target`, traced at the operands' types -- so the op means the same
+    `tl.spyre_intrinsic(target, *args)`: a request that the computation be done
+    by the op `target`, by its full name, e.g. `"spyreop.sigmoid"`. The region
+    holds that computation's FALLBACK -- the backend's registered `@triton.jit`
+    body for `target`, traced at the operands' types -- so the op means the same
     thing whether or not the target is ever selected.
 
-    The block arguments are the operands, one for one and of the same types, and
-    the body ends in `tts.spyre_intrinsic_yield`, whose operands are the results.
+    The block arguments are the operands, one for one and of the same types,
+    and the body ends in `tts.spyre_intrinsic_yield`, whose operands are the
+    results.
 
     RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
     before its region is traced -- a region belongs to an op -- so the frontend
@@ -157,15 +158,17 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
 
     THE CALL SITE IS CHECKED IN FOUR PLACES, by the form it has at the time. It
     is this op from trace to the end of the `ktir` stage; LowerTTSMarkers then
-    inlines the body in place and sets `tts.spyre_intrinsic = {target, id, arity}`
-    on every op it inlined but the constants, `id` unique to this op in the
-    module and `arity` its operand count, so the `ktir` artifact is the fallback
-    alone, in dialects any consumer loads. An op reading a block argument also
-    gets `operands`, per operand of that op the index of the call operand it is
-    or -1: the call's operand order, which nothing after the inlining can
-    recover. In `spyrecode`, FuseComputeAndDataMovement fuses the hinted ops of
-    one `id` into one body, and LowerSpyreIntrinsicCalls replaces that body
-    with the target, applied to the inputs `operands` binds, in call order.
+    inlines the body in place and sets
+    `tts.spyre_intrinsic = {target, id, arity}` on every op it inlined but the
+    constants, `id` unique to this op in the module and `arity` its operand
+    count, so the `ktir` artifact is the fallback alone, in dialects any
+    consumer loads. An op reading a block
+    argument also gets `operands`, per operand of that op the index of the call
+    operand it is or -1: the call's operand order, which nothing after the
+    inlining can recover. In `spyrecode`, FuseComputeAndDataMovement fuses the
+    hinted ops of one `id` into one body, and LowerSpyreIntrinsicCalls replaces
+    that body with the target, applied to the inputs `operands` binds, in call
+    order.
 
     WHICH TARGETS EXIST, and what each takes, is the frontend's registration
     (`backend/intrinsics.py`), not this dialect's: it checks that `target` is a
@@ -208,7 +211,8 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
 
     Example:
     ```mlir
-      %y = tts.spyre_intrinsic "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+      %y = tts.spyre_intrinsic "spyreop.sigmoid" (%x)
+          : (tensor<128xf32>) -> tensor<128xf32> {
       ^bb0(%a: tensor<128xf32>):
         ...
         tts.spyre_intrinsic_yield %r : tensor<128xf32>

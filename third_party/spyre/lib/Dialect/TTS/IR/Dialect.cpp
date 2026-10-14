@@ -23,11 +23,11 @@ namespace mlir::triton::tts {
 
 namespace {
 
-/// Admits inlining INTO a `tts.spyre_intrinsic` body. Tracing reaches the registered
-/// fallback through a `tt.call` inside that body, and the `ttir` stage's
-/// inliner asks the dialect of the region's parent op whether a callee's body
-/// may land there; with no answer it keeps the call. Whether each inlined op
-/// may move is still asked of that op's own dialect.
+/// Admits inlining INTO a `tts.spyre_intrinsic` body. Tracing reaches the
+/// registered fallback through a `tt.call` inside that body, and the `ttir`
+/// stage's inliner asks the dialect of the region's parent op whether a
+/// callee's body may land there; with no answer it keeps the call. Whether each
+/// inlined op may move is still asked of that op's own dialect.
 struct TTSInlinerInterface : public DialectInlinerInterface {
   using DialectInlinerInterface::DialectInlinerInterface;
 
@@ -56,7 +56,8 @@ DictionaryAttr getSpyreIntrinsic(Operation *op) {
 }
 
 StringRef getSpyreIntrinsicTarget(DictionaryAttr hint) {
-  return hint.getAs<StringAttr>(TTSDialect::kSpyreIntrinsicTargetKey).getValue();
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreIntrinsicTargetKey)
+      .getValue();
 }
 
 int64_t getSpyreIntrinsicId(DictionaryAttr hint) {
@@ -92,7 +93,8 @@ void copyTTSAttrs(Operation *from, Operation *to) {
   StringRef prefix = TTSDialect::getDialectNamespace();
   for (NamedAttribute attr : from->getDiscardableAttrs()) {
     StringRef name = attr.getName().getValue();
-    if (name.starts_with(prefix) && name.drop_front(prefix.size()).starts_with("."))
+    if (name.starts_with(prefix) &&
+        name.drop_front(prefix.size()).starts_with("."))
       to->setDiscardableAttr(attr.getName(), attr.getValue());
   }
 }
@@ -413,35 +415,40 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   if (name == kPinAttrName)
     return success();
 
-  // The `tts.spyre_intrinsic` attribute is written by one pass, LowerTTSMarkers, and READ by two
-  // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by the hint's
-  // `id`, and LowerSpyreIntrinsicCalls builds the op its `target` names from
-  // the call operands its `operands` bind. So what one op can show is checked here, which
-  // is what lets getSpyreIntrinsic hand those readers a dictionary they need not
-  // re-check: the three required fields, each of its type, an optional
+  // The `tts.spyre_intrinsic` attribute is written by one pass,
+  // LowerTTSMarkers, and READ by two in `spyrecode` --
+  // FuseComputeAndDataMovement groups bodies by the hint's `id`, and
+  // LowerSpyreIntrinsicCalls builds the op its `target` names from the call
+  // operands its `operands` bind. So what one op can show is checked here,
+  // which is what lets getSpyreIntrinsic hand those readers a dictionary they
+  // need not re-check: the three required fields, each of its type, an optional
   // `operands` of the op's own operand count with every entry a call operand
-  // index or -1, no other key, a `target` that is a registered op, and an op that
-  // is not a constant, which LowerTTSMarkers never hints. Nothing about other ops
-  // -- an `id` being unique, a call site being whole, its ops agreeing on
-  // `target` and `arity`, every call operand being bound -- is checkable from one
-  // op; FuseComputeAndDataMovement and LowerSpyreIntrinsicCalls check those.
+  // index or -1, no other key, a `target` that is a registered op, and an op
+  // that is not a constant, which LowerTTSMarkers never hints. Nothing about
+  // other ops -- an `id` being unique, a call site being whole, its ops
+  // agreeing on `target` and `arity`, every call operand being bound -- is
+  // checkable from one op; FuseComputeAndDataMovement and
+  // LowerSpyreIntrinsicCalls check those.
   if (name == kSpyreIntrinsicAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
     auto target =
         hint ? hint.getAs<StringAttr>(kSpyreIntrinsicTargetKey) : StringAttr();
-    auto id = hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicIdKey) : IntegerAttr();
+    auto id =
+        hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicIdKey) : IntegerAttr();
     auto arity =
         hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicArityKey) : IntegerAttr();
-    Attribute operandsEntry = hint ? hint.get(kSpyreIntrinsicOperandsKey) : nullptr;
+    Attribute operandsEntry =
+        hint ? hint.get(kSpyreIntrinsicOperandsKey) : nullptr;
     auto operands = dyn_cast_or_null<DenseI64ArrayAttr>(operandsEntry);
     size_t expected = operandsEntry ? 4 : 3;
     if (!hint || hint.size() != expected || !target || !id ||
         !id.getType().isInteger(64) || !arity ||
         !arity.getType().isInteger(64) || (operandsEntry && !operands))
       return op->emitError("'")
-             << kSpyreIntrinsicAttrName << "' must be a dictionary of a string '"
-             << kSpyreIntrinsicTargetKey << "', an i64 '" << kSpyreIntrinsicIdKey
-             << "', an i64 '" << kSpyreIntrinsicArityKey
+             << kSpyreIntrinsicAttrName
+             << "' must be a dictionary of a string '"
+             << kSpyreIntrinsicTargetKey << "', an i64 '"
+             << kSpyreIntrinsicIdKey << "', an i64 '" << kSpyreIntrinsicArityKey
              << "' and optionally an array<i64> '" << kSpyreIntrinsicOperandsKey
              << "', and nothing else, got " << attribute.getValue();
     if (!RegisteredOperationName::lookup(target.getValue(), getContext()))
@@ -461,7 +468,8 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
     if (operands.size() != static_cast<int64_t>(op->getNumOperands()))
       return op->emitError("'")
              << kSpyreIntrinsicAttrName << "' has " << operands.size() << " '"
-             << kSpyreIntrinsicOperandsKey << "' entries, one per operand of an op "
+             << kSpyreIntrinsicOperandsKey
+             << "' entries, one per operand of an op "
              << "with " << op->getNumOperands();
     for (auto [j, k] : llvm::enumerate(operands.asArrayRef()))
       if (k < -1 || k >= n)

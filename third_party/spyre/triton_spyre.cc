@@ -166,11 +166,12 @@ void init_triton_spyre_ir_builders(py::module &&m) {
       py::arg("builder"), py::arg("value"), py::arg("memory_space"),
       py::arg("offset") = py::none());
 
-  // tl.spyre_intrinsic. The op is built EMPTY and returned, and the frontend then
-  // traces the registered fallback into its region -- the shape `create_reduce`
-  // has, since a region belongs to an op and so the op has to exist first. That
-  // is also why the result types are an argument rather than read off the body:
-  // the registry declares them, and the region verifier holds the yield to them.
+  // tl.spyre_intrinsic. The op is built EMPTY and returned, and the frontend
+  // then traces the registered fallback into its region -- the shape
+  // `create_reduce` has, since a region belongs to an op and so the op has to
+  // exist first. That is also why the result types are an argument rather than
+  // read off the body: the registry declares them, and the region verifier
+  // holds the yield to them.
   //
   // `target` is not checked here. Which targets exist is the registry's, in the
   // backend's Python, and semantic.py refuses an unknown one before this runs;
@@ -437,13 +438,13 @@ void init_triton_spyre_ir_utils(py::module &&m) {
         });
 
   // is_registered_op: whether `name` is an op `context` registers -- the
-  // question tts.spyre_intrinsic's region verifier asks of its `target`, asked here of
-  // `backend/intrinsics.py`'s registration so a misspelled target is refused
-  // where it is written. RegisteredOperationName::lookup finds only the ops of a
-  // LOADED dialect, and `spyre.load_dialects` only registers, so tts is loaded
-  // first, which loads spyreop, its dependent dialect and the one the targets
-  // are in. Any other dialect counts as it would at verification: only if
-  // something has loaded it.
+  // question tts.spyre_intrinsic's region verifier asks of its `target`, asked
+  // here of `backend/intrinsics.py`'s registration so a misspelled target is
+  // refused where it is written. RegisteredOperationName::lookup finds only the
+  // ops of a LOADED dialect, and `spyre.load_dialects` only registers, so tts
+  // is loaded first, which loads spyreop, its dependent dialect and the one the
+  // targets are in. Any other dialect counts as it would at verification: only
+  // if something has loaded it.
   m.def("is_registered_op",
         [](mlir::MLIRContext &context, const std::string &name) -> bool {
           context.loadDialect<mlir::triton::tts::TTSDialect>();

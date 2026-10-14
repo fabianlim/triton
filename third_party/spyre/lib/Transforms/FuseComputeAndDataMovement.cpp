@@ -37,11 +37,11 @@
 // And one clause that is a REQUEST rather than a property of the IR:
 //
 //   ONE BODY PER CALL SITE   fuse a producer into its consumer when both
-//            bodies carry `tts.spyre_intrinsic` attributes of one `id`, i.e. both hold ops
-//            LowerTTSMarkers inlined out of one `tts.spyre_intrinsic`. Each tensor op
-//            of the call site's fallback arrives in a generic of its own, and
-//            LowerSpyreIntrinsicCalls replaces a call site only as one whole
-//            body. See
+//            bodies carry `tts.spyre_intrinsic` attributes of one `id`, i.e.
+//            both hold ops LowerTTSMarkers inlined out of one
+//            `tts.spyre_intrinsic`. Each tensor op of the call site's fallback
+//            arrives in a generic of its own, and LowerSpyreIntrinsicCalls
+//            replaces a call site only as one whole body. See
 //            producerAndConsumerShareCallSite.
 //
 // Here and not in a pass of its own ahead of LowerSpyreIntrinsicCalls, because
@@ -367,7 +367,8 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
                        triton::tts::getSpyreIntrinsicId(consumer))
     return false;
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
-                          << triton::tts::getSpyreIntrinsicId(producer) << " into "
+                          << triton::tts::getSpyreIntrinsicId(producer)
+                          << " into "
                           << fusedOperand->getOwner()->getLoc() << "\n");
   return true;
 }
@@ -381,10 +382,10 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 ///   - every op of one `id` agrees on `target` and on `arity`. Not on the whole
 ///     hint, which differs per op by its `operands`.
 ///
-/// The `tts.spyre_intrinsic` op's verifier held each body to be elementwise at one shape,
-/// so ConvertElementwiseToLinalg gives every op of it a generic over one
-/// iteration space and the clause fuses them; anything else here is a compiler
-/// bug, and is reported as one rather than as the author's.
+/// The `tts.spyre_intrinsic` op's verifier held each body to be elementwise at
+/// one shape, so ConvertElementwiseToLinalg gives every op of it a generic over
+/// one iteration space and the clause fuses them; anything else here is a
+/// compiler bug, and is reported as one rather than as the author's.
 LogicalResult checkCallSitesFused(ModuleOp mod) {
   using triton::tts::getSpyreIntrinsic;
   using triton::tts::getSpyreIntrinsicArity;
@@ -402,7 +403,8 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
   LogicalResult result = success();
   auto report = [&](Operation *op, int64_t id, StringRef target) {
     result = failure();
-    return op->emitError("fuse-compute-and-data-movement: tl.spyre_intrinsic(\"")
+    return op->emitError(
+               "fuse-compute-and-data-movement: tl.spyre_intrinsic(\"")
            << target << "\") call site " << id
            << " did not fuse into one compute body, which its verified body "
               "guarantees -- a compiler bug: ";
@@ -1020,12 +1022,12 @@ struct FuseComputeAndDataMovementPass
     };
     int genericsBefore = countGenerics();
 
-    // Whether any `tl.spyre_intrinsic` call site is in the module, asked once: the
-    // third clause and its post-check are about call sites only, and without
-    // one the clause would walk both bodies of every candidate to find no hint
-    // and the post-check the whole module. Fusion carries a hint over with the
-    // body op holding it and no pattern here writes one, so the answer before
-    // the fixpoint holds through it.
+    // Whether any `tl.spyre_intrinsic` call site is in the module, asked once:
+    // the third clause and its post-check are about call sites only, and
+    // without one the clause would walk both bodies of every candidate to find
+    // no hint and the post-check the whole module. Fusion carries a hint over
+    // with the body op holding it and no pattern here writes one, so the answer
+    // before the fixpoint holds through it.
     bool hasCallSites =
         mod.walk([](Operation *op) {
              return triton::tts::getSpyreIntrinsic(op) ? WalkResult::interrupt()
