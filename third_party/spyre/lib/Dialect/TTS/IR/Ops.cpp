@@ -10,7 +10,7 @@
 // ktdp's enum. What deliberately does NOT stay is any rule about the operand's
 // provenance -- see the note in `PinOp::verify`.
 //
-// `spyre_op`'s rules are about its target and its body, which is why they are a
+// `spyre_intrinsic`'s rules are about its target and its body, which is why they are a
 // region verifier: the target is a registered op, the block's signature is the
 // operands',
 // its terminator yields the results, nothing in it touches memory, and the body
@@ -125,10 +125,10 @@ LogicalResult PinOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// tts.spyre_op
+// tts.spyre_intrinsic
 //===----------------------------------------------------------------------===//
 
-LogicalResult SpyreOpOp::verifyRegions() {
+LogicalResult SpyreIntrinsicOp::verifyRegions() {
   // Only that the target exists. Which operands and types it takes is the op's
   // own verifier's, which runs when LowerSpyreOps builds it.
   if (!RegisteredOperationName::lookup(getTarget(), getContext()))
@@ -141,7 +141,7 @@ LogicalResult SpyreOpOp::verifyRegions() {
                        "for one");
 
   // SingleBlockImplicitTerminator has already held the last op to be a yield.
-  auto yield = cast<SpyreOpYieldOp>(body.getTerminator());
+  auto yield = cast<SpyreIntrinsicYieldOp>(body.getTerminator());
   if (yield.getValues().getTypes() != getResultTypes())
     return emitOpError("body yields ")
            << yield.getValues().getTypes() << " but the op's results are "

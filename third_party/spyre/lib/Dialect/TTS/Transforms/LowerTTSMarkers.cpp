@@ -20,10 +20,10 @@
 // Two markers, two resolution functions and two attribute builders, which is
 // what the shape below was for.
 //
-// And one op that is NOT a marker: `tts.spyre_op` names no value and has a body,
+// And one op that is NOT a marker: `tts.spyre_intrinsic` names no value and has a body,
 // so it does not fit the driver's resolve-and-move shape and has a function of
-// its own, inlineSpyreOpCallSites. Its lowering inlines the body in place and
-// leaves the call site as the `tts.spyreop_hint` on every op inlined -- an
+// its own, inlineSpyreIntrinsicCallSites. Its lowering inlines the body in place and
+// leaves the call site as the `tts.spyre_intrinsic` on every op inlined -- an
 // attribute on the ops rather than on one subject, which is the same rule (the op
 // goes, a builtin attribute stays) applied to a call site that is about a
 // computation.
@@ -324,10 +324,10 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 }
 
 //===----------------------------------------------------------------------===//
-// tts.spyre_op
+// tts.spyre_intrinsic
 //===----------------------------------------------------------------------===//
 
-/// Inline every `tts.spyre_op` in `module` in place, hinting each inlined op.
+/// Inline every `tts.spyre_intrinsic` in `module` in place, hinting each inlined op.
 ///
 /// Per call site, in this order:
 ///
@@ -368,27 +368,27 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 /// outcome: no op would carry the hint, and the request would vanish without
 /// a diagnostic. The canonicalizes before this pass are what reduce a body to
 /// that -- `x * 1.0` folds to `x` -- and they run inside the region.
-static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
-  using mlir::triton::tts::SpyreOpOp;
+static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
+  using mlir::triton::tts::SpyreIntrinsicOp;
   using mlir::triton::tts::TTSDialect;
 
   int64_t nextId = 0;
   module.walk([&](Operation *op) {
-    if (DictionaryAttr hint = mlir::triton::tts::getSpyreopHint(op))
-      if (auto id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey))
+    if (DictionaryAttr hint = mlir::triton::tts::getSpyreIntrinsic(op))
+      if (auto id = hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicIdKey))
         nextId = std::max(nextId, id.getInt() + 1);
   });
 
   // Collect first: the rewrite erases. None is nested in another's body,
   // since the op's verifier admits only elementwise ops there.
-  SmallVector<SpyreOpOp> callSites;
-  module.walk([&](SpyreOpOp op) { callSites.push_back(op); });
+  SmallVector<SpyreIntrinsicOp> callSites;
+  module.walk([&](SpyreIntrinsicOp op) { callSites.push_back(op); });
 
-  for (SpyreOpOp callSite : callSites) {
+  for (SpyreIntrinsicOp callSite : callSites) {
     for (auto [i, operand] : llvm::enumerate(callSite.getInputs()))
       if (matchPattern(operand, m_Constant()))
         return callSite.emitError()
-               << "tl.spyre_op(\"" << callSite.getTarget() << "\"): operand "
+               << "tl.spyre_intrinsic(\"" << callSite.getTarget() << "\"): operand "
                << i
                << " is a constant, so the call site would fold to a constant "
                   "and no target would be selected";
@@ -397,21 +397,21 @@ static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
           return op.hasTrait<OpTrait::ConstantLike>();
         }))
       return callSite.emitError()
-             << "tl.spyre_op(\"" << callSite.getTarget()
+             << "tl.spyre_intrinsic(\"" << callSite.getTarget()
              << "\"): the fallback folded to nothing but constants and its "
                 "operands, so no op is left to carry the request and no "
                 "target would be selected";
   }
 
   Builder builder(module.getContext());
-  for (SpyreOpOp callSite : callSites) {
+  for (SpyreIntrinsicOp callSite : callSites) {
     SmallVector<NamedAttribute, 4> common = {
-        builder.getNamedAttr(TTSDialect::kSpyreopHintTargetKey,
+        builder.getNamedAttr(TTSDialect::kSpyreIntrinsicTargetKey,
                              callSite.getTargetAttr()),
-        builder.getNamedAttr(TTSDialect::kSpyreopHintIdKey,
+        builder.getNamedAttr(TTSDialect::kSpyreIntrinsicIdKey,
                              builder.getI64IntegerAttr(nextId++)),
         builder.getNamedAttr(
-            TTSDialect::kSpyreopHintArityKey,
+            TTSDialect::kSpyreIntrinsicArityKey,
             builder.getI64IntegerAttr(callSite.getInputs().size())),
     };
     DictionaryAttr hint = builder.getDictionaryAttr(common);
@@ -433,14 +433,14 @@ static LogicalResult inlineSpyreOpCallSites(ModuleOp module) {
         }
       }
       if (!readsCallOperand) {
-        op.setAttr(TTSDialect::kSpyreopHintAttrName, hint);
+        op.setAttr(TTSDialect::kSpyreIntrinsicAttrName, hint);
         continue;
       }
       SmallVector<NamedAttribute, 4> entries(common);
       entries.push_back(
-          builder.getNamedAttr(TTSDialect::kSpyreopHintOperandsKey,
+          builder.getNamedAttr(TTSDialect::kSpyreIntrinsicOperandsKey,
                                builder.getDenseI64ArrayAttr(operands)));
-      op.setAttr(TTSDialect::kSpyreopHintAttrName,
+      op.setAttr(TTSDialect::kSpyreIntrinsicAttrName,
                  builder.getDictionaryAttr(entries));
     }
 
@@ -473,9 +473,9 @@ struct LowerTTSMarkersPass
     // FIRST, ahead of the markers. A pin may name a call site's result, and
     // the op producing that value exists only once the body is inlined -- run
     // after, the pin would land on the call site and be erased with it. Not a
-    // marker, so not the driver's: see inlineSpyreOpCallSites, which refuses
+    // marker, so not the driver's: see inlineSpyreIntrinsicCallSites, which refuses
     // a call site with a constant operand.
-    if (failed(inlineSpyreOpCallSites(getOperation())))
+    if (failed(inlineSpyreIntrinsicCallSites(getOperation())))
       return signalPassFailure();
 
     // One statement per marker kind, and the three things a marker brings: its

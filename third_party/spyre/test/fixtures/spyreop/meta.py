@@ -90,7 +90,7 @@ level (that the rewrite fires, and fires only where it should) is what
 level; what this fixture adds on top is that a real Triton kernel, run
 through the full pipeline on real hardware, produces the right numbers.
 
-THE ``tl.spyre_op`` INTRINSICS are the exception to Level D only, and the
+THE ``tl.spyre_intrinsic`` INTRINSICS are the exception to Level D only, and the
 reason is the same two facts read the other way round. ``ktir_cpu`` runs the
 ``ktir`` artifact, which holds each intrinsic's registered FALLBACK
 (``backend/intrinsics.py``) inlined as plain arith/math, so a ktir_cpu variant
@@ -98,8 +98,8 @@ checks that fallback against the mathematical definition -- which is a claim
 worth making, since the fallback is what every KTIR reader computes for the
 call site. They never reach ``spyrecode``, the fusion or the selection; those
 are pinned in lit (``Transforms/LowerSpyreOps/request.mlir``,
-``spyre-triton-opt/stage-pipelines-spyre-op.mlir``) and in
-``test_spyre_op.py``. By level:
+``spyre-triton-opt/stage-pipelines-spyre-intrinsic.mlir``) and in
+``test_spyre_intrinsic.py``. By level:
 
 - Level A, shape: ``intrinsic_2d`` -- the 2D kernel, ``OP`` and ``DTYPE``
   pinned to sigmoid at fp32.
@@ -223,7 +223,7 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-# The tl.spyre_op intrinsics' definitions, which their fallbacks compute.
+# The tl.spyre_intrinsic intrinsics' definitions, which their fallbacks compute.
 _INTRINSIC_OPS = {
     "gelu": _gelu,
     "silu": lambda x: x * _sigmoid(x),
@@ -286,7 +286,7 @@ class SpyreIntOp(conftest.VariantFactory):
 
 @dataclass(frozen=True)
 class SpyreIntrinsic(conftest.VariantFactory):
-    """Factory for the ``tl.spyre_op`` variants: pointer dtypes from ``DTYPE``,
+    """Factory for the ``tl.spyre_intrinsic`` variants: pointer dtypes from ``DTYPE``,
     and the oracle from ``OP``, computed in fp32 and rounded to the buffer's
     dtype, which is what each fallback does."""
 
@@ -341,7 +341,7 @@ _SIG_ADDMUL = {
 }
 
 
-# The tl.spyre_op kernels. The pointer dtypes are SpyreIntrinsic's, per DTYPE.
+# The tl.spyre_intrinsic kernels. The pointer dtypes are SpyreIntrinsic's, per DTYPE.
 _SIG_INTRINSIC = {
     "x_ptr":      "*fp32",
     "output_ptr": "*fp32",
@@ -509,7 +509,7 @@ VARIANTS = {
     },
 
     # -----------------------------------------------------------------------
-    # The tl.spyre_op intrinsics on ktir_cpu, which runs each one's fallback.
+    # The tl.spyre_intrinsic intrinsics on ktir_cpu, which runs each one's fallback.
     # See the module docstring for the levels, and for the Level D variant
     # that is not here.
     # -----------------------------------------------------------------------
@@ -518,9 +518,9 @@ VARIANTS = {
     "intrinsic_2d": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "spyre-op"],
+                 "program-id-1d", "spyre-intrinsic"],
         "summary": (
-            "2D tl.spyre_op over M-tiles distributed across the grid, OP and "
+            "2D tl.spyre_intrinsic over M-tiles distributed across the grid, OP and "
             "DTYPE pinned to sigmoid at fp32."
         ),
         "kernel_fn":    kernel.spyreop_intrinsic_2d,
@@ -542,9 +542,9 @@ VARIANTS = {
     "intrinsic": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "spyre-op"],
+                 "program-id-1d", "spyre-intrinsic"],
         "summary": (
-            "1D tl.spyre_op across the grid, swept over each intrinsic at each "
+            "1D tl.spyre_intrinsic across the grid, swept over each intrinsic at each "
             "dtype it takes."
         ),
         "kernel_fn":    kernel.spyreop_intrinsic_1d,
@@ -570,9 +570,9 @@ VARIANTS = {
     "intrinsic_2d_stick": {
         "base": None,
         "tags": ["descriptor-load-static", "descriptor-store-static",
-                 "program-id-1d", "spyre-op", "spyre-tensor-layout"],
+                 "program-id-1d", "spyre-intrinsic", "spyre-tensor-layout"],
         "summary": (
-            "2D tl.spyre_op with x and out stick-on-N at fp16, swept over the "
+            "2D tl.spyre_intrinsic with x and out stick-on-N at fp16, swept over the "
             "three intrinsics."
         ),
         "kernel_fn":    kernel.spyreop_intrinsic_2d,

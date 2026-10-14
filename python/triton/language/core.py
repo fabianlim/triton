@@ -3907,13 +3907,13 @@ def spyre_pin(v, memory_space, offset=None, _semantic=None):
 
 @builtin
 @requires_backend("spyre")
-def spyre_op(target, *args, _semantic=None, _generator=None):
+def spyre_intrinsic(target, *args, _semantic=None, _generator=None):
     """(Spyre only) Compute ``args`` with the device op ``target``.
 
-    ``tl.spyre_op("spyreop.gelu", x)`` asks that ``gelu(x)`` be done by the
+    ``tl.spyre_intrinsic("spyreop.gelu", x)`` asks that ``gelu(x)`` be done by the
     device's own instruction for it. What is traced is the backend's FALLBACK for
     that op --
-    the same computation in plain ``tl`` ops -- inside a ``tts.spyre_op``, so the
+    the same computation in plain ``tl`` ops -- inside a ``tts.spyre_intrinsic``, so the
     request means one thing at every stage: the ``ktir`` artifact holds the
     fallback, which any KTIR reader runs, and the ``spyrecode`` stage replaces it
     with the intrinsic.
@@ -3936,10 +3936,10 @@ def spyre_op(target, *args, _semantic=None, _generator=None):
     """
     target = _unwrap_if_constexpr(target)
     if not isinstance(target, str):
-        raise ValueError(f"tl.spyre_op: target must be a constexpr string, got {target!r}")
+        raise ValueError(f"tl.spyre_intrinsic: target must be a constexpr string, got {target!r}")
 
     def call_fallback(fn, fn_args):
         return _generator.call_JitFunction(fn, fn_args, kwargs={})
 
-    return _semantic.spyre_op(target, args, call_fallback)
+    return _semantic.spyre_intrinsic(target, args, call_fallback)
 # --- END --- added for spyre

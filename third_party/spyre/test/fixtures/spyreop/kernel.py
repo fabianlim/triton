@@ -1,5 +1,5 @@
 """spyreop kernels: three single-tile, loop-free Level D kernels, and two for the
-``tl.spyre_op`` intrinsics at Level A-C.
+``tl.spyre_intrinsic`` intrinsics at Level A-C.
 
 The three Level D kernels are split by arity/dtype -- all take ``LAYOUT`` and have no
 ``tl.program_id``-driven distribution loop, only the one shape dbo-opt can
@@ -20,7 +20,7 @@ from its program-id distribution, which dbo-opt's scheduler rejects):
 See ``meta.py``'s module docstring for why there is no looped/Level-A/B
 counterpart to any of these kernels.
 
-And two kernels for the ``tl.spyre_op`` intrinsics, which dispatch ``OP`` among
+And two kernels for the ``tl.spyre_intrinsic`` intrinsics, which dispatch ``OP`` among
 ``gelu``, ``silu`` and ``sigmoid``:
 
 - :func:`spyreop_intrinsic_1d` -- 1D, distributed across the grid.
@@ -154,7 +154,7 @@ def spyreop_intrinsic_1d(
     BLOCK_SIZE: tl.constexpr,
     OP: tl.constexpr,
 ):
-    """``tl.spyre_op(OP, x)`` over a 1D vector, distributed across the grid."""
+    """``tl.spyre_intrinsic(OP, x)`` over a 1D vector, distributed across the grid."""
     pid = tl.program_id(0)
     x_desc = tl.make_tensor_descriptor(
         x_ptr, shape=[n_elements], strides=[1], block_shape=[BLOCK_SIZE],
@@ -171,11 +171,11 @@ def spyreop_intrinsic_1d(
         offset = i * BLOCK_SIZE
         x = x_desc.load([offset])
         if OP == "gelu":
-            result = tl.spyre_op("spyreop.gelu", x)
+            result = tl.spyre_intrinsic("spyreop.gelu", x)
         elif OP == "silu":
-            result = tl.spyre_op("spyreop.silu", x)
+            result = tl.spyre_intrinsic("spyreop.silu", x)
         else:
-            result = tl.spyre_op("spyreop.sigmoid", x)
+            result = tl.spyre_intrinsic("spyreop.sigmoid", x)
         out_desc.store([offset], result)
 
 
@@ -191,7 +191,7 @@ def spyreop_intrinsic_2d(
     OUT_LAYOUT: tl.constexpr,
     OP: tl.constexpr,
 ):
-    """``tl.spyre_op(OP, x)`` over ``[M, N]``, M-tiles distributed across the
+    """``tl.spyre_intrinsic(OP, x)`` over ``[M, N]``, M-tiles distributed across the
     grid. ``X_LAYOUT`` / ``OUT_LAYOUT`` are optional stick-tiling layouts; None
     lowers logically."""
     pid = tl.program_id(0)
@@ -218,9 +218,9 @@ def spyreop_intrinsic_2d(
             offset_n = n * BLOCK_N
             x = x_desc.load([offset_m, offset_n])
             if OP == "gelu":
-                result = tl.spyre_op("spyreop.gelu", x)
+                result = tl.spyre_intrinsic("spyreop.gelu", x)
             elif OP == "silu":
-                result = tl.spyre_op("spyreop.silu", x)
+                result = tl.spyre_intrinsic("spyreop.silu", x)
             else:
-                result = tl.spyre_op("spyreop.sigmoid", x)
+                result = tl.spyre_intrinsic("spyreop.sigmoid", x)
             out_desc.store([offset_m, offset_n], result)

@@ -79,7 +79,7 @@ from .core import (
     gather,
     histogram,
     inline_asm_elementwise,
-    spyre_op,  # --- added for spyre
+    spyre_intrinsic,  # --- added for spyre
     spyre_pin,  # --- added for spyre
     spyre_tensor_layout,  # --- added for spyre
     wk_slice_coord,  # --- added for spyre
@@ -211,7 +211,7 @@ __all__ = [
     "histogram",
     "inline_asm_elementwise",
     "interleave",
-    "spyre_op",  # --- added for spyre
+    "spyre_intrinsic",  # --- added for spyre
     "spyre_pin",  # --- added for spyre
     "spyre_tensor_layout",  # --- added for spyre
     "wk_slice_coord",  # --- added for spyre

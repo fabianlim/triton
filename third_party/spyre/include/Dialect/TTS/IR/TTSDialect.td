@@ -8,7 +8,7 @@ def TTS_Dialect : Dialect {
 
   let cppNamespace = "::mlir::triton::tts";
 
-  // A `tts.spyre_op` names the op its call site becomes, and the verifiers
+  // A `tts.spyre_intrinsic` names the op its call site becomes, and the verifiers
   // check that the name is a registered op. Every target today is spyreop's,
   // so loading this dialect loads that one, wherever the request is built or
   // parsed.
@@ -51,10 +51,11 @@ def TTS_Dialect : Dialect {
     What does not differ is that the value of either is built out of builtin
     attributes only.
 
-    The third op, `tts.spyre_op`, is a request for one spyreop intrinsic and
+    The third op, `tts.spyre_intrinsic`, is a request for one spyreop intrinsic and
     holds a body rather than naming a value, so it is not a marker; it is bound
-    by the same rule all the same. `LowerTTSMarkers` inlines the body and leaves
-    the request as the `tts.spyreop_hint` attribute on every op it inlined.
+    by the same rule all the same, and its attribute shares its name as theirs
+    do. `LowerTTSMarkers` inlines the body and leaves the request as the
+    `tts.spyre_intrinsic` attribute on every op it inlined.
   }];
 
   let extraClassDeclaration = [{
@@ -121,13 +122,13 @@ def TTS_Dialect : Dialect {
     static constexpr ::llvm::StringLiteral kMemorySpaceName = "memory_space";
     static constexpr ::llvm::StringLiteral kOffsetName = "offset";
 
-    /// Which `tts.spyre_op` call site an op was inlined from, as a
+    /// Which `tts.spyre_intrinsic` call site an op was inlined from, as a
     /// `DictionaryAttr` on every op `LowerTTSMarkers` inlined out of that op's
     /// body:
     ///
     ///   target   : the op the call site names, the op's `target`, as the
     ///              string of a registered operation name
-    ///   id       : an `i64` unique per `tts.spyre_op` in the module, so two
+    ///   id       : an `i64` unique per `tts.spyre_intrinsic` in the module, so two
     ///              call sites of the same target stay distinguishable after
     ///              both are inlined into one function. It alone says which call
     ///              site an op is of: the ops of one call site carry different
@@ -162,18 +163,18 @@ def TTS_Dialect : Dialect {
     /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
     /// carry one call site, and LowerSpyreOps replaces the body the call site
     /// became with the op `target` names. What is checked about it, and
-    /// where, is stated once, in `tts.spyre_op`'s description.
+    /// where, is stated once, in `tts.spyre_intrinsic`'s description.
     ///
     /// Builtin-valued like the two above, so the `ktir` artifact carrying it
     /// parses in a consumer that does not load this dialect.
-    static constexpr ::llvm::StringLiteral kSpyreopHintAttrName =
-        "tts.spyreop_hint";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicAttrName =
+        "tts.spyre_intrinsic";
 
     /// The entry names of that dictionary.
-    static constexpr ::llvm::StringLiteral kSpyreopHintTargetKey = "target";
-    static constexpr ::llvm::StringLiteral kSpyreopHintIdKey = "id";
-    static constexpr ::llvm::StringLiteral kSpyreopHintArityKey = "arity";
-    static constexpr ::llvm::StringLiteral kSpyreopHintOperandsKey = "operands";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicTargetKey = "target";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicIdKey = "id";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicArityKey = "arity";
+    static constexpr ::llvm::StringLiteral kSpyreIntrinsicOperandsKey = "operands";
   }];
 
   let hasOperationAttrVerify = 1;

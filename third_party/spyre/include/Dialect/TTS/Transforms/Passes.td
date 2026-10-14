@@ -23,7 +23,7 @@ include "mlir/Pass/PassBase.td"
 def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
     let summary = "Move each tts marker op's annotation onto the op the marked "
                   "value resolves to, and erase the marker; inline each "
-                  "tts.spyre_op, tagging what it inlined.";
+                  "tts.spyre_intrinsic, tagging what it inlined.";
     let description = [{
         Input: lowered KTIR (after LowerDescriptorMemory, LowerScalarLoad and
         LowerComputeOps) still carrying `tts` marker ops. A marker is an op with
@@ -40,24 +40,24 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         - tts.pin (op) → the `tts.pin` ATTRIBUTE, a dictionary of the op's
           memory_space and its address when it stated one, on the op DEFINING
           the pinned value. The marker is erased.
-        - tts.spyre_op (op) → its body, inlined in place: block arguments
+        - tts.spyre_intrinsic (op) → its body, inlined in place: block arguments
           replaced by the operands, results by the yielded values. Every op
-          inlined but the constants carries the `tts.spyreop_hint` ATTRIBUTE,
+          inlined but the constants carries the `tts.spyre_intrinsic` ATTRIBUTE,
           `{target = <op name>, id = <i64>, arity = <i64>}`, with an id unique
-          to that tts.spyre_op in the module and its operand count; an op
+          to that tts.spyre_intrinsic in the module and its operand count; an op
           reading a block argument also carries `operands = array<i64: ...>`,
           per operand of that op the index of the call operand it is, or -1.
           Written here because this is the one point the binding is exact:
           after ConvertElementwiseToLinalg and fusion a body's block-argument
           order follows its `ins`, not the call. Runs before the markers, so a pin naming
           a request's result lands on the inlined op producing it. Two
-          tts.spyre_op are errors, because no op of the body would be left to
+          tts.spyre_intrinsic are errors, because no op of the body would be left to
           carry the request and no target would be selected: one with a
           constant operand, whose body would fold to a constant in
           `spyrecode`, and one whose body has already folded to nothing but
           constants.
 
-        tts.spyre_op is not a marker -- it names no value and holds a body --
+        tts.spyre_intrinsic is not a marker -- it names no value and holds a body --
         so it is not one of the driver's kinds below; it has a function of its
         own, and the rule it shares with them is only the outcome: the op is
         gone and a builtin-valued attribute stays.
@@ -83,7 +83,7 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         Both markers stay legal through the passes in between. LowerComputeOps
         converts against an explicit illegal-op list that names no `tts` op, so
         a marker reaching it passes through untouched; LowerScalarLoad is
-        indifferent to markers. A tts.spyre_op passes through the same way,
+        indifferent to markers. A tts.spyre_intrinsic passes through the same way,
         and its BODY is converted where it stands: the conversion visits nested
         ops and no pattern depends on its parent, so the body inlined here is
         already linalg/tensor/arith/math.

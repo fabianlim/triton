@@ -168,7 +168,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
                                           unless the cmpf is a zero test the
                                           select performs itself
 
-        A request to one: a body holding exactly one `tl.spyre_op`'s fallback →
+        A request to one: a body holding exactly one `tl.spyre_intrinsic`'s fallback →
         the op its hint's `target` names, built by name and held to its own
         verifier. The targets are registered in `backend/intrinsics.py`; a `tts`
         attribute on the op producing the result, a pin, moves to the target.
@@ -180,7 +180,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         block argument is an error naming the target and the call operand.
 
         REQUESTS FIRST. Call sites are selected by a walk before any other rule
-        runs, and a `tts.spyreop_hint` left after it is refused there, so the 1:1
+        runs, and a `tts.spyre_intrinsic` attribute left after it is refused there, so the 1:1
         and group rules never see a hinted op: a fallback's `math.exp` is never
         selected alone as spyreop.exp.
 
@@ -209,9 +209,9 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         leaves the rest as it found it. That is a change from when it was a
         dialect conversion, where an unsupported float width was reported here.
 
-        The first exception is a request left unselected. A `tl.spyre_op` names
+        The first exception is a request left unselected. A `tl.spyre_intrinsic` names
         its intrinsic, so passing the fallback through would drop the request
-        without saying so. Any op that still carries a `tts.spyreop_hint` after
+        without saying so. Any op that still carries a `tts.spyre_intrinsic` after
         the rewrite is an error naming the intrinsic. That a request is one
         whole body is checked before this pass, by
         [FuseComputeAndDataMovement].
@@ -264,7 +264,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         body for the same reason. A contract between adjacent passes rather than
         an accident — and the reciprocal reads its numerator THROUGH the body, so
         for that rule the dependency is about whether it FIRES, never about
-        whether it is correct. Its `tts.spyreop_hint` clause is the same contract
+        whether it is correct. Its `tts.spyre_intrinsic` attribute clause is the same contract
         for requests: each tensor op of a fallback arrives in its own generic,
         and that pass fuses the ones of one request into one body.
 
@@ -302,7 +302,7 @@ def LowerSpyreOps : Pass<"lower-spyre-ops", "mlir::ModuleOp"> {
         after [FuseComputeAndDataMovement] per the contract above.
 
         Output: the selected ops replaced by their intrinsics, and no op
-        carrying a `tts.spyreop_hint`. Everything else unchanged.
+        carrying a `tts.spyre_intrinsic` attribute. Everything else unchanged.
     }];
 
     let dependentDialects = [
@@ -408,9 +408,9 @@ def FuseComputeAndDataMovement
           a unit-dim expand `[4] → [4,1]` gives `(d0, d1) → (d0)`, the one
           `tt.expand_dims` leaves behind where no collapse cancelled it.
         - A linalg.generic PRODUCER feeding a linalg.generic consumer, both of
-          whose bodies carry `tts.spyreop_hint` tags of one `id` → fused. The
+          whose bodies carry `tts.spyre_intrinsic` tags of one `id` → fused. The
           tags mean both hold ops LowerTTSMarkers inlined from one
-          `tts.spyre_op`, and [LowerSpyreOps] replaces a request only as ONE
+          `tts.spyre_intrinsic`, and [LowerSpyreOps] replaces a request only as ONE
           body. By `id` and not by the whole tag, which differs per op by its
           `operands`. Constants carry no hint, and a body carrying two ids has
           none.
@@ -560,11 +560,11 @@ def FuseComputeAndDataMovement
         one annotated memory view, no unabsorbable coordinate restatement is left
         on a path that view physicalizes; the pass fails instead.
 
-        And each `tl.spyre_op` call site is ONE generic body: every op carrying
-        a `tts.spyreop_hint` of one `id` is in the same body, which holds no op
+        And each `tl.spyre_intrinsic` call site is ONE generic body: every op carrying
+        a `tts.spyre_intrinsic` of one `id` is in the same body, which holds no op
         but constants besides them, no hinted op is outside a body, and the
         ops of one `id` agree on `name`. Anything else is an error naming the
-        intrinsic and saying the call site did not fuse. The `tts.spyre_op`
+        intrinsic and saying the call site did not fuse. The `tts.spyre_intrinsic` op's
         verifier held the body to be elementwise at one shape, which is what
         makes this a compiler bug rather than the author's.
     }];

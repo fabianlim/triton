@@ -13,8 +13,10 @@
 // a kernel authors on a value, and the `tts.pin` attribute, which the lowered IR
 // carries on the op producing that value.
 //
-// And one intrinsic request, `tts.spyre_op`, whose attribute spelling is the
-// `tts.spyreop_hint` tag on every op its body was inlined into.
+// And one intrinsic request, `tts.spyre_intrinsic`, in the same two spellings:
+// the op, which holds the fallback a kernel's request traces, and the
+// `tts.spyre_intrinsic` attribute, which the lowered IR carries on every op that
+// body was inlined into.
 //
 //===----------------------------------------------------------------------===//
 
@@ -50,30 +52,30 @@
 
 namespace mlir::triton::tts {
 
-/// The `tts.spyreop_hint` `op` carries, or null when it carries none. The
+/// The `tts.spyre_intrinsic` `op` carries, or null when it carries none. The
 /// dialect's attribute verifier has already held the value to its spelling --
 /// a dictionary of a string `target`, an i64 `id`, a positive i64 `arity` and
 /// optionally an `operands` array -- so a non-null result has the three
 /// required entries. Two ops come from one call site exactly when their hints
 /// have one `id`; the dictionaries themselves differ, `operands` being per op.
-DictionaryAttr getSpyreopHint(Operation *op);
+DictionaryAttr getSpyreIntrinsic(Operation *op);
 
-/// The op a hint returned by getSpyreopHint names.
-StringRef getSpyreopHintTarget(DictionaryAttr hint);
+/// The op a hint returned by getSpyreIntrinsic names.
+StringRef getSpyreIntrinsicTarget(DictionaryAttr hint);
 
-/// The call-site id of a hint returned by getSpyreopHint.
-int64_t getSpyreopHintId(DictionaryAttr hint);
+/// The call-site id of a hint returned by getSpyreIntrinsic.
+int64_t getSpyreIntrinsicId(DictionaryAttr hint);
 
-/// The call site's operand count, from a hint returned by getSpyreopHint.
-int64_t getSpyreopHintArity(DictionaryAttr hint);
+/// The call site's operand count, from a hint returned by getSpyreIntrinsic.
+int64_t getSpyreIntrinsicArity(DictionaryAttr hint);
 
 /// Which call operand each operand of the hinted op is -- entry j for operand
 /// j, -1 for one that is not a call operand -- or null when the op reads no
-/// call operand directly. From a hint returned by getSpyreopHint, so the array
+/// call operand directly. From a hint returned by getSpyreIntrinsic, so the array
 /// has one entry per operand of the op it was read off.
-DenseI64ArrayAttr getSpyreopHintOperands(DictionaryAttr hint);
+DenseI64ArrayAttr getSpyreIntrinsicOperands(DictionaryAttr hint);
 
-/// The `tl.spyre_op` call site whose ops `body` holds: the hint of its first
+/// The `tl.spyre_intrinsic` call site whose ops `body` holds: the hint of its first
 /// hinted op, when they all have one `id`, or null when `body` holds no hinted
 /// op or hinted ops of two call sites. What the result says about the call site
 /// is its `id`, `target` and `arity`; its `operands`, if any, are that one

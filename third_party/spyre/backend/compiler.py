@@ -534,21 +534,21 @@ class SpyreBackend(BaseBackend):
         Unlike ``min_dot_size`` the frontend treats it as optional, so a
         backend that omits it keeps upstream's allowlists unchanged.
 
-        ``spyre_intrinsic(target)`` returns the ``intrinsics.Intrinsic`` that
-        ``tl.spyre_op(target, ...)`` traces, or raises naming the registered ones.
+        ``spyre_intrinsic_lookup(target)`` returns the ``intrinsics.Intrinsic`` that
+        ``tl.spyre_intrinsic(target, ...)`` traces, or raises naming the registered ones.
         The registry is this backend's; see ``intrinsics.py``. Imported on first
         use, because it defines ``@triton.jit`` functions and this module is
         imported while ``triton`` itself is.
         """
 
-        def spyre_intrinsic(target):
+        def spyre_intrinsic_lookup(target):
             from . import intrinsics
             return intrinsics.lookup(target)
 
         return {
             "min_dot_size": lambda lhsType, rhsType: (1, 1, 1),
             "extra_math_dtypes": lambda op_name: _EXTRA_MATH_DTYPES.get(op_name, ()),
-            "spyre_intrinsic": spyre_intrinsic,
+            "spyre_intrinsic_lookup": spyre_intrinsic_lookup,
         }
 
     def get_module_map(self) -> Dict[str, ModuleType]:

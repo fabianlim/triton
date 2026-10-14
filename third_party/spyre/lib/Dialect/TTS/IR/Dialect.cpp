@@ -23,7 +23,7 @@ namespace mlir::triton::tts {
 
 namespace {
 
-/// Admits inlining INTO a `tts.spyre_op` body. Tracing reaches the registered
+/// Admits inlining INTO a `tts.spyre_intrinsic` body. Tracing reaches the registered
 /// fallback through a `tt.call` inside that body, and the `ttir` stage's
 /// inliner asks the dialect of the region's parent op whether a callee's body
 /// may land there; with no answer it keeps the call. Whether each inlined op
@@ -33,7 +33,7 @@ struct TTSInlinerInterface : public DialectInlinerInterface {
 
   bool isLegalToInline(Region *dest, Region *src, bool wouldBeCloned,
                        IRMapping &valueMapping) const final {
-    return isa<SpyreOpOp>(dest->getParentOp());
+    return isa<SpyreIntrinsicOp>(dest->getParentOp());
   }
 };
 
@@ -50,25 +50,25 @@ void TTSDialect::initialize() {
   addInterfaces<TTSInlinerInterface>();
 }
 
-DictionaryAttr getSpyreopHint(Operation *op) {
+DictionaryAttr getSpyreIntrinsic(Operation *op) {
   return dyn_cast_or_null<DictionaryAttr>(
-      op->getDiscardableAttr(TTSDialect::kSpyreopHintAttrName));
+      op->getDiscardableAttr(TTSDialect::kSpyreIntrinsicAttrName));
 }
 
-StringRef getSpyreopHintTarget(DictionaryAttr hint) {
-  return hint.getAs<StringAttr>(TTSDialect::kSpyreopHintTargetKey).getValue();
+StringRef getSpyreIntrinsicTarget(DictionaryAttr hint) {
+  return hint.getAs<StringAttr>(TTSDialect::kSpyreIntrinsicTargetKey).getValue();
 }
 
-int64_t getSpyreopHintId(DictionaryAttr hint) {
-  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintIdKey).getInt();
+int64_t getSpyreIntrinsicId(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicIdKey).getInt();
 }
 
-int64_t getSpyreopHintArity(DictionaryAttr hint) {
-  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreopHintArityKey).getInt();
+int64_t getSpyreIntrinsicArity(DictionaryAttr hint) {
+  return hint.getAs<IntegerAttr>(TTSDialect::kSpyreIntrinsicArityKey).getInt();
 }
 
-DenseI64ArrayAttr getSpyreopHintOperands(DictionaryAttr hint) {
-  return hint.getAs<DenseI64ArrayAttr>(TTSDialect::kSpyreopHintOperandsKey);
+DenseI64ArrayAttr getSpyreIntrinsicOperands(DictionaryAttr hint) {
+  return hint.getAs<DenseI64ArrayAttr>(TTSDialect::kSpyreIntrinsicOperandsKey);
 }
 
 DictionaryAttr getBodyCallSite(Block &body) {
@@ -76,12 +76,12 @@ DictionaryAttr getBodyCallSite(Block &body) {
   WalkResult walked = body.walk([&](Operation *op) {
     if (op->hasTrait<OpTrait::ConstantLike>())
       return WalkResult::advance();
-    DictionaryAttr hint = getSpyreopHint(op);
+    DictionaryAttr hint = getSpyreIntrinsic(op);
     if (!hint)
       return WalkResult::advance();
     if (!found)
       found = hint;
-    else if (getSpyreopHintId(found) != getSpyreopHintId(hint))
+    else if (getSpyreIntrinsicId(found) != getSpyreIntrinsicId(hint))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
@@ -413,11 +413,11 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   if (name == kPinAttrName)
     return success();
 
-  // `tts.spyreop_hint` is written by one pass, LowerTTSMarkers, and READ by two
+  // The `tts.spyre_intrinsic` attribute is written by one pass, LowerTTSMarkers, and READ by two
   // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by the hint's
   // `id`, and LowerSpyreOps builds the op its `target` names from the call
   // operands its `operands` bind. So what one op can show is checked here, which
-  // is what lets getSpyreopHint hand those readers a dictionary they need not
+  // is what lets getSpyreIntrinsic hand those readers a dictionary they need not
   // re-check: the three required fields, each of its type, an optional
   // `operands` of the op's own operand count with every entry a call operand
   // index or -1, no other key, a `target` that is a registered op, and an op that
@@ -425,50 +425,50 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // -- an `id` being unique, a call site being whole, its ops agreeing on
   // `target` and `arity`, every call operand being bound -- is checkable from one
   // op; FuseComputeAndDataMovement and LowerSpyreOps check those.
-  if (name == kSpyreopHintAttrName) {
+  if (name == kSpyreIntrinsicAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
     auto target =
-        hint ? hint.getAs<StringAttr>(kSpyreopHintTargetKey) : StringAttr();
-    auto id = hint ? hint.getAs<IntegerAttr>(kSpyreopHintIdKey) : IntegerAttr();
+        hint ? hint.getAs<StringAttr>(kSpyreIntrinsicTargetKey) : StringAttr();
+    auto id = hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicIdKey) : IntegerAttr();
     auto arity =
-        hint ? hint.getAs<IntegerAttr>(kSpyreopHintArityKey) : IntegerAttr();
-    Attribute operandsEntry = hint ? hint.get(kSpyreopHintOperandsKey) : nullptr;
+        hint ? hint.getAs<IntegerAttr>(kSpyreIntrinsicArityKey) : IntegerAttr();
+    Attribute operandsEntry = hint ? hint.get(kSpyreIntrinsicOperandsKey) : nullptr;
     auto operands = dyn_cast_or_null<DenseI64ArrayAttr>(operandsEntry);
     size_t expected = operandsEntry ? 4 : 3;
     if (!hint || hint.size() != expected || !target || !id ||
         !id.getType().isInteger(64) || !arity ||
         !arity.getType().isInteger(64) || (operandsEntry && !operands))
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' must be a dictionary of a string '"
-             << kSpyreopHintTargetKey << "', an i64 '" << kSpyreopHintIdKey
-             << "', an i64 '" << kSpyreopHintArityKey
-             << "' and optionally an array<i64> '" << kSpyreopHintOperandsKey
+             << kSpyreIntrinsicAttrName << "' must be a dictionary of a string '"
+             << kSpyreIntrinsicTargetKey << "', an i64 '" << kSpyreIntrinsicIdKey
+             << "', an i64 '" << kSpyreIntrinsicArityKey
+             << "' and optionally an array<i64> '" << kSpyreIntrinsicOperandsKey
              << "', and nothing else, got " << attribute.getValue();
     if (!RegisteredOperationName::lookup(target.getValue(), getContext()))
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' targets " << target
+             << kSpyreIntrinsicAttrName << "' targets " << target
              << ", which is not a registered op";
     if (op->hasTrait<OpTrait::ConstantLike>())
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' is not set on a constant";
+             << kSpyreIntrinsicAttrName << "' is not set on a constant";
     int64_t n = arity.getInt();
     if (n < 1)
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' has " << kSpyreopHintArityKey
+             << kSpyreIntrinsicAttrName << "' has " << kSpyreIntrinsicArityKey
              << " " << n << ", and a call site has at least one operand";
     if (!operands)
       return success();
     if (operands.size() != static_cast<int64_t>(op->getNumOperands()))
       return op->emitError("'")
-             << kSpyreopHintAttrName << "' has " << operands.size() << " '"
-             << kSpyreopHintOperandsKey << "' entries, one per operand of an op "
+             << kSpyreIntrinsicAttrName << "' has " << operands.size() << " '"
+             << kSpyreIntrinsicOperandsKey << "' entries, one per operand of an op "
              << "with " << op->getNumOperands();
     for (auto [j, k] : llvm::enumerate(operands.asArrayRef()))
       if (k < -1 || k >= n)
         return op->emitError("'")
-               << kSpyreopHintAttrName << "' binds operand " << j
+               << kSpyreIntrinsicAttrName << "' binds operand " << j
                << " to call operand " << k << ", and a call site of "
-               << kSpyreopHintArityKey << " " << n << " has operands 0 to "
+               << kSpyreIntrinsicArityKey << " " << n << " has operands 0 to "
                << n - 1 << ", or -1 for none";
     return success();
   }

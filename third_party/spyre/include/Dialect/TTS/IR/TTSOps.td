@@ -130,21 +130,21 @@ def TTS_PinOp : TTS_Op<"pin", []> {
   let hasVerifier = 1;
 }
 
-def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
-    IsolatedFromAbove, SingleBlockImplicitTerminator<"SpyreOpYieldOp">,
+def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
+    IsolatedFromAbove, SingleBlockImplicitTerminator<"SpyreIntrinsicYieldOp">,
     RecursiveMemoryEffects]> {
   let summary = "Request one device op, carrying its fallback body";
 
   let description = [{
-    `tts.spyre_op` is the **authoring** spelling of
-    `tl.spyre_op(target, *args)`: a request that the computation be done by the
+    `tts.spyre_intrinsic` is the **authoring** spelling of
+    `tl.spyre_intrinsic(target, *args)`: a request that the computation be done by the
     op `target`, by its full name, e.g. `"spyreop.sigmoid"`. The region holds
     that computation's FALLBACK -- the backend's registered `@triton.jit` body
     for `target`, traced at the operands' types -- so the op means the same
     thing whether or not the target is ever selected.
 
     The block arguments are the operands, one for one and of the same types, and
-    the body ends in `tts.spyreop_yield`, whose operands are the results.
+    the body ends in `tts.spyre_intrinsic_yield`, whose operands are the results.
 
     RESULT TYPES ARE DECLARED, not inferred from the body. The op is created
     before its region is traced -- a region belongs to an op -- so the frontend
@@ -157,7 +157,7 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     THE CALL SITE IS CHECKED IN FOUR PLACES, by the form it has at the time. It
     is this op from trace to the end of the `ktir` stage; LowerTTSMarkers then
-    inlines the body in place and sets `tts.spyreop_hint = {target, id, arity}`
+    inlines the body in place and sets `tts.spyre_intrinsic = {target, id, arity}`
     on every op it inlined but the constants, `id` unique to this op in the
     module and `arity` its operand count, so the `ktir` artifact is the fallback
     alone, in dialects any consumer loads. An op reading a block argument also
@@ -183,7 +183,7 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
           constant, and every value but a constant at the operands' shape. A
           `tt.call` is admitted by both of the last two until the `ttir`
           stage's inliner replaces it with the fallback's body.
-      V2  the `tts.spyreop_hint` attribute verifier, on each op at every
+      V2  the `tts.spyre_intrinsic` attribute verifier, on each op at every
           verification point. What one op shows: a dictionary of a string
           `target`, an i64 `id`, a positive i64 `arity`, optionally an
           `operands` array of one entry per operand of the op, each in
@@ -199,7 +199,7 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
           call operand bound to two different inputs, to none, or to anything
           but an `ins` block argument -- builds the target and runs its
           verifier; then one check, that no op still carries a
-          `tts.spyreop_hint`. A request left unselected is an error naming the
+          `tts.spyre_intrinsic` attribute. A request left unselected is an error naming the
           target, since passing the fallback through would drop it silently.
 
     Constants carry no hint: passes create, merge and fold them freely, so one
@@ -207,10 +207,10 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
 
     Example:
     ```mlir
-      %y = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+      %y = tts.spyre_intrinsic "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
       ^bb0(%a: tensor<128xf32>):
         ...
-        tts.spyreop_yield %r : tensor<128xf32>
+        tts.spyre_intrinsic_yield %r : tensor<128xf32>
       }
     ```
   }];
@@ -226,9 +226,9 @@ def TTS_SpyreOpOp : TTS_Op<"spyre_op", [
   let hasRegionVerifier = 1;
 }
 
-def TTS_SpyreOpYieldOp : TTS_Op<"spyreop_yield", [
-    Pure, Terminator, HasParent<"SpyreOpOp">]> {
-  let summary = "Terminate a tts.spyre_op body, yielding its results";
+def TTS_SpyreIntrinsicYieldOp : TTS_Op<"spyre_intrinsic_yield", [
+    Pure, Terminator, HasParent<"SpyreIntrinsicOp">]> {
+  let summary = "Terminate a tts.spyre_intrinsic body, yielding its results";
 
   let arguments = (ins Variadic<AnyRankedTensor>:$values);
 

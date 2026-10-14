@@ -1,12 +1,12 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file -verify-diagnostics
 
 // A HINT SURVIVING SELECTION IS REFUSED. The author asked for the intrinsic by
-// name with `tl.spyre_op`, so passing its fallback through to the backend would
+// name with `tl.spyre_intrinsic`, so passing its fallback through to the backend would
 // ignore the request without saying so. Whatever kept the call-site rule from
 // firing, the error is the same, once per call site, naming the intrinsic.
 //
 // What makes a call site selectable is checked before this pass: its body by
-// the `tts.spyre_op` verifier, its fusion into one body by
+// the `tts.spyre_intrinsic` verifier, its fusion into one body by
 // FuseComputeAndDataMovement. So every case is hand-written. Where the reason
 // a call site cannot be selected is known -- its `operands` bindings -- it is
 // reported first, naming the call operand.
@@ -18,12 +18,12 @@
 // it from. The reason is reported, and the request then as unselected.
 func.func @unbound_operand(%x: tensor<64xf32>) -> tensor<64xf32> {
   %e = tensor.empty() : tensor<64xf32>
-  // expected-error @+1 {{lower-spyre-ops: tl.spyre_op("spyreop.realdiv"): call operand 1 is read by no op left of the fallback, so there is no input to pass the target for it}}
+  // expected-error @+1 {{lower-spyre-ops: tl.spyre_intrinsic("spyreop.realdiv"): call operand 1 is read by no op left of the fallback, so there is no input to pass the target for it}}
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%a: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("spyreop.realdiv") was not selected. The request is explicit, so its fallback is not used instead}}
-    %s = math.exp %a {tts.spyreop_hint = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.realdiv"}} : f32
+    // expected-error @+1 {{tl.spyre_intrinsic("spyreop.realdiv") was not selected. The request is explicit, so its fallback is not used instead}}
+    %s = math.exp %a {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.realdiv"}} : f32
     linalg.yield %s : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -40,10 +40,10 @@ func.func @conflicting_binding(%x: tensor<64xf32>, %y: tensor<64xf32>) -> tensor
   %r = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
       ins(%x, %y : tensor<64xf32>, tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%a: f32, %b: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("spyreop.realdiv") was not selected}}
-    %n = math.exp %a {tts.spyreop_hint = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.realdiv"}} : f32
-    // expected-error @+1 {{lower-spyre-ops: tl.spyre_op("spyreop.realdiv"): call operand 0 is read from two different inputs of its compute body, block arguments 0 and 1}}
-    %s = arith.addf %n, %b {tts.spyreop_hint = {arity = 2 : i64, id = 0 : i64, operands = array<i64: -1, 0>, target = "spyreop.realdiv"}} : f32
+    // expected-error @+1 {{tl.spyre_intrinsic("spyreop.realdiv") was not selected}}
+    %n = math.exp %a {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.realdiv"}} : f32
+    // expected-error @+1 {{lower-spyre-ops: tl.spyre_intrinsic("spyreop.realdiv"): call operand 0 is read from two different inputs of its compute body, block arguments 0 and 1}}
+    %s = arith.addf %n, %b {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: -1, 0>, target = "spyreop.realdiv"}} : f32
     linalg.yield %s : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -60,10 +60,10 @@ func.func @binding_not_an_input(%x: tensor<64xf32>) -> tensor<64xf32> {
   %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%a: f32, %out: f32):
-    // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") was not selected}}
-    %n = arith.negf %a {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.sigmoid"}} : f32
-    // expected-error @+1 {{lower-spyre-ops: tl.spyre_op("spyreop.sigmoid"): call operand 0 is operand 0 of 'math.exp', which is not an input of its compute body -- a compiler bug}}
-    %s = math.exp %n {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.sigmoid"}} : f32
+    // expected-error @+1 {{tl.spyre_intrinsic("spyreop.sigmoid") was not selected}}
+    %n = arith.negf %a {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.sigmoid"}} : f32
+    // expected-error @+1 {{lower-spyre-ops: tl.spyre_intrinsic("spyreop.sigmoid"): call operand 0 is operand 0 of 'math.exp', which is not an input of its compute body -- a compiler bug}}
+    %s = math.exp %n {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.sigmoid"}} : f32
     linalg.yield %s : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
@@ -76,8 +76,8 @@ func.func @binding_not_an_input(%x: tensor<64xf32>) -> tensor<64xf32> {
 // is. Were the rule phase run, it would become an unhinted spyreop.exp and
 // nothing would be reported.
 func.func @outside_body(%x: f32) -> f32 {
-  // expected-error @+1 {{tl.spyre_op("spyreop.sigmoid") was not selected}}
-  %e = math.exp %x {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : f32
+  // expected-error @+1 {{tl.spyre_intrinsic("spyreop.sigmoid") was not selected}}
+  %e = math.exp %x {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : f32
   return %e : f32
 }
 
@@ -94,8 +94,8 @@ func.func @target_refuses_type(%x: tensor<64xf32>) -> tensor<64xf32> {
       ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
   ^bb0(%in: f32, %out: f32):
     // expected-error @+2 {{'spyreop.gelu' op}}
-    // expected-error @+1 {{tl.spyre_op("spyreop.gelu") was not selected}}
-    %g = math.erf %in {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.gelu"}} : f32
+    // expected-error @+1 {{tl.spyre_intrinsic("spyreop.gelu") was not selected}}
+    %g = math.erf %in {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.gelu"}} : f32
     linalg.yield %g : f32
   } -> tensor<64xf32>
   return %r : tensor<64xf32>

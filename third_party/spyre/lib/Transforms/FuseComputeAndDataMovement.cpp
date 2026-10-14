@@ -37,8 +37,8 @@
 // And one clause that is a REQUEST rather than a property of the IR:
 //
 //   ONE BODY PER CALL SITE   fuse a producer into its consumer when both
-//            bodies carry `tts.spyreop_hint`s of one `id`, i.e. both hold ops
-//            LowerTTSMarkers inlined out of one `tts.spyre_op`. Each tensor op
+//            bodies carry `tts.spyre_intrinsic` attributes of one `id`, i.e. both hold ops
+//            LowerTTSMarkers inlined out of one `tts.spyre_intrinsic`. Each tensor op
 //            of the call site's fallback arrives in a generic of its own, and
 //            LowerSpyreOps replaces a call site only as one whole body. See
 //            producerAndConsumerShareCallSite.
@@ -361,11 +361,11 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
   if (!producer)
     return false;
   DictionaryAttr consumer = callSite(fusedOperand->getOwner());
-  if (!consumer || triton::tts::getSpyreopHintId(producer) !=
-                       triton::tts::getSpyreopHintId(consumer))
+  if (!consumer || triton::tts::getSpyreIntrinsicId(producer) !=
+                       triton::tts::getSpyreIntrinsicId(consumer))
     return false;
   LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] fusing within call site "
-                          << triton::tts::getSpyreopHintId(producer) << " into "
+                          << triton::tts::getSpyreIntrinsicId(producer) << " into "
                           << fusedOperand->getOwner()->getLoc() << "\n");
   return true;
 }
@@ -379,15 +379,15 @@ bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
 ///   - every op of one `id` agrees on `target` and on `arity`. Not on the whole
 ///     hint, which differs per op by its `operands`.
 ///
-/// The `tts.spyre_op` verifier held each body to be elementwise at one shape,
+/// The `tts.spyre_intrinsic` op's verifier held each body to be elementwise at one shape,
 /// so ConvertElementwiseToLinalg gives every op of it a generic over one
 /// iteration space and the clause fuses them; anything else here is a compiler
 /// bug, and is reported as one rather than as the author's.
 LogicalResult checkCallSitesFused(ModuleOp mod) {
-  using triton::tts::getSpyreopHint;
-  using triton::tts::getSpyreopHintArity;
-  using triton::tts::getSpyreopHintId;
-  using triton::tts::getSpyreopHintTarget;
+  using triton::tts::getSpyreIntrinsic;
+  using triton::tts::getSpyreIntrinsicArity;
+  using triton::tts::getSpyreIntrinsicId;
+  using triton::tts::getSpyreIntrinsicTarget;
   using triton::tts::TTSDialect;
 
   struct CallSite {
@@ -400,19 +400,19 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
   LogicalResult result = success();
   auto report = [&](Operation *op, int64_t id, StringRef target) {
     result = failure();
-    return op->emitError("fuse-compute-and-data-movement: tl.spyre_op(\"")
+    return op->emitError("fuse-compute-and-data-movement: tl.spyre_intrinsic(\"")
            << target << "\") call site " << id
            << " did not fuse into one compute body, which its verified body "
               "guarantees -- a compiler bug: ";
   };
 
   mod.walk([&](Operation *op) {
-    DictionaryAttr hint = getSpyreopHint(op);
+    DictionaryAttr hint = getSpyreIntrinsic(op);
     if (!hint)
       return;
-    int64_t id = getSpyreopHintId(hint);
-    auto target = hint.getAs<StringAttr>(TTSDialect::kSpyreopHintTargetKey);
-    int64_t arity = getSpyreopHintArity(hint);
+    int64_t id = getSpyreIntrinsicId(hint);
+    auto target = hint.getAs<StringAttr>(TTSDialect::kSpyreIntrinsicTargetKey);
+    int64_t arity = getSpyreIntrinsicArity(hint);
     CallSite &site = callSites[id];
     if (!site.first) {
       site.first = op;
@@ -453,19 +453,19 @@ LogicalResult checkCallSitesFused(ModuleOp mod) {
     for (Operation &op : generic.getBlock()->without_terminator()) {
       if (op.hasTrait<OpTrait::ConstantLike>())
         continue;
-      DictionaryAttr hint = getSpyreopHint(&op);
+      DictionaryAttr hint = getSpyreIntrinsic(&op);
       if (!hint) {
         report(&op, id, target) << "its body also holds '" << op.getName()
                               << "', which is not part of it";
         break;
       }
-      int64_t other = getSpyreopHintId(hint);
+      int64_t other = getSpyreIntrinsicId(hint);
       if (other != id) {
         // Reported once per pair, from the lower id.
         if (other > id)
           report(&op, id, target)
               << "its body also holds ops of call site " << other << ", "
-              << getSpyreopHintTarget(hint);
+              << getSpyreIntrinsicTarget(hint);
         break;
       }
     }
@@ -1018,7 +1018,7 @@ struct FuseComputeAndDataMovementPass
     };
     int genericsBefore = countGenerics();
 
-    // Whether any `tl.spyre_op` call site is in the module, asked once: the
+    // Whether any `tl.spyre_intrinsic` call site is in the module, asked once: the
     // third clause and its post-check are about call sites only, and without
     // one the clause would walk both bodies of every candidate to find no hint
     // and the post-check the whole module. Fusion carries a hint over with the
@@ -1026,7 +1026,7 @@ struct FuseComputeAndDataMovementPass
     // the fixpoint holds through it.
     bool hasCallSites =
         mod.walk([](Operation *op) {
-             return triton::tts::getSpyreopHint(op) ? WalkResult::interrupt()
+             return triton::tts::getSpyreIntrinsic(op) ? WalkResult::interrupt()
                                                     : WalkResult::advance();
            })
             .wasInterrupted();

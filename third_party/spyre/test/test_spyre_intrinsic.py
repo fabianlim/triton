@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""``tl.spyre_op`` from the kernel line to the module dbo-opt receives.
+"""``tl.spyre_intrinsic`` from the kernel line to the module dbo-opt receives.
 
 Every case registers its own fallback for a real target -- ``spyreop.sigmoid``,
 or ``spyreop.realdiv`` for two operands -- over an empty copy of the registry, so nothing here changes when a target is
 added and no registration outlives its test. The claims, one per stage:
 
-* tracing builds a ``tts.spyre_op`` holding the bound fallback, which its region
+* tracing builds a ``tts.spyre_intrinsic`` holding the bound fallback, which its region
   verifier admits;
 * the ``ktir`` artifact holds that fallback alone, inlined and hinted
-  ``tts.spyreop_hint`` -- no ``tts`` op, which a KTIR reader could not parse;
+  ``tts.spyre_intrinsic`` -- no ``tts`` op, which a KTIR reader could not parse;
 * the ``spyrecode`` pipeline fuses the hinted ops into one body and replaces it
   with exactly one op, the target, taking the operands in the call's order
   whatever order the fallback read them in, and no hint is left for dbo-opt.
@@ -40,7 +40,7 @@ from utils import compile_to_ttir, make_ktir_mod
 def _request(x_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
     x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
     out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
-    out_desc.store([0], tl.spyre_op(OP, x_desc.load([0])))
+    out_desc.store([0], tl.spyre_intrinsic(OP, x_desc.load([0])))
 
 
 def _trace(kernel, op, dtype):
@@ -70,12 +70,12 @@ TARGET = "spyreop.sigmoid"
 
 @pytest.fixture
 def register(monkeypatch):
-    """``spyre_intrinsic`` for ``TARGET`` at fp16 and fp32, over an empty copy of
+    """``register_intrinsic`` for ``TARGET`` at fp16 and fp32, over an empty copy of
     the registry, so a test's registrations are gone when it ends."""
     monkeypatch.setattr(intrinsics, "REGISTRY", {})
 
     def register(target=TARGET, dtypes=(tl.float16, tl.float32)):
-        return intrinsics.spyre_intrinsic(target, dtypes=dtypes)
+        return intrinsics.register_intrinsic(target, dtypes=dtypes)
 
     return register
 
@@ -99,13 +99,15 @@ def test_call_site_reaches_one_intrinsic(register, fallback, dtype, tmp_path):
     ttir = _trace(_request, TARGET, dtype)
     # The call site, verified, holding the fallback as a call the `ttir` stage
     # inlines.
-    assert f'tts.spyre_op "{TARGET}"' in ttir
-    assert "tts.spyreop_yield" in ttir
+    assert f'tts.spyre_intrinsic "{TARGET}"' in ttir
+    assert "tts.spyre_intrinsic_yield" in ttir
 
     mod = _ktir(ttir, tmp_path)
     ktir = str(mod)
-    assert "tts.spyre_op" not in ktir and "tts.spyreop_yield" not in ktir
-    assert re.search(r'tts\.spyreop_hint = \{arity = 1 : i64, id = 0 : i64, '
+    # The op is gone; the attribute of the same name, `tts.spyre_intrinsic = {`,
+    # is what it left.
+    assert f'tts.spyre_intrinsic "{TARGET}"' not in ktir and "tts.spyre_intrinsic_yield" not in ktir
+    assert re.search(r'tts\.spyre_intrinsic = \{arity = 1 : i64, id = 0 : i64, '
                      r'(operands = array<i64: [-0-9, ]+>, )?target = "' + TARGET + '"', ktir)
     assert "tt.call" not in ktir
 
@@ -115,7 +117,7 @@ def test_call_site_reaches_one_intrinsic(register, fallback, dtype, tmp_path):
     selected = re.findall(r"(spyreop\.\w+) %\S+ : (\w+)", spyrecode)
     assert selected == [(TARGET, elem)], selected
     # The fallback went whole, casts included, and so did every hint.
-    assert "tts.spyreop_hint" not in spyrecode
+    assert "tts.spyre_intrinsic" not in spyrecode
     assert "math." not in spyrecode
     assert "arith.extf" not in spyrecode and "arith.truncf" not in spyrecode
 
@@ -125,7 +127,7 @@ def _request2(x_ptr, y_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
     x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
     y_desc = tl.make_tensor_descriptor(y_ptr, shape=[N], strides=[1], block_shape=[N])
     out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
-    out_desc.store([0], tl.spyre_op(OP, x_desc.load([0]), y_desc.load([0])))
+    out_desc.store([0], tl.spyre_intrinsic(OP, x_desc.load([0]), y_desc.load([0])))
 
 
 @triton.jit
@@ -179,7 +181,7 @@ def test_two_operand_call_site_takes_call_order(register, fallback, tmp_path):
     ttir = compile_to_ttir(_request2, signature, {"N": 128, "OP": target})
     spyrecode = _spyrecode(_ktir(ttir, tmp_path))
     assert spyrecode.count(target) == 1, spyrecode
-    assert "tts.spyreop_hint" not in spyrecode
+    assert "tts.spyre_intrinsic" not in spyrecode
     assert _selected_operands(spyrecode, target) == ["x_desc", "y_desc"], spyrecode
 
 
@@ -195,9 +197,9 @@ def test_operands_of_two_shapes_are_refused(register):
         x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
         out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
         x = x_desc.load([0])
-        out_desc.store([0], tl.spyre_op(OP, x, tl.reshape(x, [N // 2, 2])))
+        out_desc.store([0], tl.spyre_intrinsic(OP, x, tl.reshape(x, [N // 2, 2])))
 
-    _raises(two_shapes, TARGET, "fp32", f"tl.spyre_op('{TARGET}'): operand 1 has shape [64, 2], and every operand "
+    _raises(two_shapes, TARGET, "fp32", f"tl.spyre_intrinsic('{TARGET}'): operand 1 has shape [64, 2], and every operand "
             "must have operand 0's, [128]")
 
 
@@ -211,7 +213,7 @@ def _raises(kernel, op, dtype, match):
 @triton.jit
 def _constant_request(out_ptr, N: tl.constexpr, OP: tl.constexpr):
     out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
-    out_desc.store([0], tl.spyre_op(OP, tl.full([N], 1.0, tl.float32)))
+    out_desc.store([0], tl.spyre_intrinsic(OP, tl.full([N], 1.0, tl.float32)))
 
 
 def test_constant_operand_is_refused(register, tmp_path, capfd):
@@ -220,19 +222,19 @@ def test_constant_operand_is_refused(register, tmp_path, capfd):
                            {"N": 128, "OP": TARGET})
     with pytest.raises(Exception):
         _ktir(ttir, tmp_path)
-    assert f'tl.spyre_op("{TARGET}"): operand 0 is a constant' in capfd.readouterr().err
+    assert f'tl.spyre_intrinsic("{TARGET}"): operand 0 is a constant' in capfd.readouterr().err
 
 
 def test_target_without_a_fallback_is_refused():
     # A real op the backend registers no fallback for.
     assert "spyreop.softplus" not in intrinsics.REGISTRY
     _raises(_request, "spyreop.softplus", "fp16",
-            "tl.spyre_op: no fallback is registered for 'spyreop.softplus'; the Spyre backend registers")
+            "tl.spyre_intrinsic: no fallback is registered for 'spyreop.softplus'; the Spyre backend registers")
 
 
 def test_dtype_the_intrinsic_does_not_take_is_refused(register):
     register()(func1)
-    _raises(_request, TARGET, "bf16", f"tl.spyre_op('{TARGET}'): the intrinsic takes ['fp16', 'fp32'], not bf16")
+    _raises(_request, TARGET, "bf16", f"tl.spyre_intrinsic('{TARGET}'): the intrinsic takes ['fp16', 'fp32'], not bf16")
 
 
 def test_wrong_arity_is_refused(register):
@@ -243,9 +245,9 @@ def test_wrong_arity_is_refused(register):
         x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
         out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
         x = x_desc.load([0])
-        out_desc.store([0], tl.spyre_op(OP, x, x))
+        out_desc.store([0], tl.spyre_intrinsic(OP, x, x))
 
-    _raises(two_operands, TARGET, "fp32", f"tl.spyre_op('{TARGET}'): takes 1 tensor operand(s), got 2")
+    _raises(two_operands, TARGET, "fp32", f"tl.spyre_intrinsic('{TARGET}'): takes 1 tensor operand(s), got 2")
 
 
 def test_fallback_returning_other_types_is_refused(register):
@@ -255,7 +257,7 @@ def test_fallback_returning_other_types_is_refused(register):
     def widens(x):
         return x.to(tl.float32)
 
-    _raises(_request, TARGET, "fp16", f"tl.spyre_op('{TARGET}'): the registered fallback returns")
+    _raises(_request, TARGET, "fp16", f"tl.spyre_intrinsic('{TARGET}'): the registered fallback returns")
 
 
 def test_the_backend_registers_its_targets():
@@ -308,4 +310,4 @@ def test_raises_off_backend(monkeypatch, backend):
     target = None if backend is None else GPUTarget(backend=backend, arch=1, warp_size=1)
     monkeypatch.setattr(target_info, "current_target", lambda: target)
     with pytest.raises(ValueError, match="only supported on the 'spyre' backend"):
-        tl.spyre_op(TARGET, None, _semantic=object())
+        tl.spyre_intrinsic(TARGET, None, _semantic=object())

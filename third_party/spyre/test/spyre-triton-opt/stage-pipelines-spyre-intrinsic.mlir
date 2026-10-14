@@ -1,9 +1,9 @@
 // RUN: spyre-triton-opt %s -split-input-file --spyre-ttir-to-ktir | FileCheck %s --check-prefix=KTIR
 // RUN: spyre-triton-opt %s -split-input-file --spyre-ttir-to-ktir --spyre-prepare-spyrecode | FileCheck %s --check-prefix=PHYS
 
-// A `tl.spyre_op` request across both stages, driven by the two stage flags.
+// A `tl.spyre_intrinsic` request across both stages, driven by the two stage flags.
 //
-// The claim no single pass makes: the request is a tts.spyre_op holding its
+// The claim no single pass makes: the request is a tts.spyre_intrinsic holding its
 // fallback after the `ttir` stage; the `ktir` artifact holds the fallback alone,
 // inlined and tagged, in dialects any KTIR reader loads; and in `spyrecode` the
 // tagged ops -- one generic each after ConvertElementwiseToLinalg -- are fused
@@ -31,7 +31,7 @@ module {
                                  phys_op = array<i64: 1, 0, 2>,
                                  phys_arg = array<i64: 64, 0, 64>} : <64x128xf16>
     %x = tt.descriptor_load %in_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16>
-    %g = tts.spyre_op "spyreop.gelu" (%x) : (tensor<64x128xf16>) -> tensor<64x128xf16> {
+    %g = tts.spyre_intrinsic "spyreop.gelu" (%x) : (tensor<64x128xf16>) -> tensor<64x128xf16> {
     ^bb0(%a: tensor<64x128xf16>):
       %half = arith.constant dense<5.000000e-01> : tensor<64x128xf32>
       %one = arith.constant dense<1.000000e+00> : tensor<64x128xf32>
@@ -43,7 +43,7 @@ module {
       %p = arith.addf %er, %one : tensor<64x128xf32>
       %y = arith.mulf %h, %p : tensor<64x128xf32>
       %t = arith.truncf %y : tensor<64x128xf32> to tensor<64x128xf16>
-      tts.spyreop_yield %t : tensor<64x128xf16>
+      tts.spyre_intrinsic_yield %t : tensor<64x128xf16>
     }
     tt.descriptor_store %out_desc[%c0_i32, %c0_i32], %g : !tt.tensordesc<64x128xf16>, tensor<64x128xf16>
     tt.return
@@ -56,12 +56,12 @@ module {
 //
 // KTIR-LABEL:   func.func @gelu(
 // KTIR:           %[[X:.*]] = ktdp.load
-// KTIR:           arith.extf %[[X]] {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.gelu"}}
-// KTIR:           math.erf {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
-// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           arith.extf %[[X]] {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: 0>, target = "spyreop.gelu"}}
+// KTIR:           math.erf {{.*}} {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
+// KTIR:           %[[G:.*]] = arith.truncf {{.*}} {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.gelu"}}
 // KTIR:           ktdp.store %[[G]]
-// KTIR-NOT:       tts.spyre_op
-// KTIR-NOT:       tts.spyreop_yield
+// KTIR-NOT:       tts.spyre_intrinsic
+// KTIR-NOT:       tts.spyre_intrinsic_yield
 
 // The `spyrecode` stage. The request is ONE body, on the physical 2x64x64
 // layout at both ends, holding only its intrinsic: the fallback is gone, casts
@@ -74,7 +74,7 @@ module {
 // PHYS-NEXT:        %[[R:.*]] = spyreop.gelu %[[A]] : f16
 // PHYS-NEXT:        linalg.yield %[[R]] : f16
 // PHYS:           ktdp.store %[[G]]
-// PHYS-NOT:       tts.spyreop_hint
+// PHYS-NOT:       tts.spyre_intrinsic
 // PHYS-NOT:       math.
 
 // -----
@@ -87,7 +87,7 @@ module {
     %in_desc = tt.make_tensor_descriptor %in_ptr, [%n], [%sn] : <f32>, <128xf32>
     %out_desc = tt.make_tensor_descriptor %out_ptr, [%n], [%sn] : <f32>, <128xf32>
     %x = tt.descriptor_load %in_desc[%c0_i32] : !tt.tensordesc<128xf32> -> tensor<128xf32>
-    %s = tts.spyre_op "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
+    %s = tts.spyre_intrinsic "spyreop.sigmoid" (%x) : (tensor<128xf32>) -> tensor<128xf32> {
     ^bb0(%a: tensor<128xf32>):
       %one = arith.constant dense<1.000000e+00> : tensor<128xf32>
       %zero = arith.constant dense<0.000000e+00> : tensor<128xf32>
@@ -95,9 +95,9 @@ module {
       %e = math.exp %ng : tensor<128xf32>
       %d = arith.addf %e, %one : tensor<128xf32>
       %r = arith.divf %one, %d : tensor<128xf32>
-      tts.spyreop_yield %r : tensor<128xf32>
+      tts.spyre_intrinsic_yield %r : tensor<128xf32>
     }
-    %y = tts.spyre_op "spyreop.silu" (%s) : (tensor<128xf32>) -> tensor<128xf32> {
+    %y = tts.spyre_intrinsic "spyreop.silu" (%s) : (tensor<128xf32>) -> tensor<128xf32> {
     ^bb0(%a: tensor<128xf32>):
       %one = arith.constant dense<1.000000e+00> : tensor<128xf32>
       %zero = arith.constant dense<0.000000e+00> : tensor<128xf32>
@@ -105,7 +105,7 @@ module {
       %e = math.exp %ng : tensor<128xf32>
       %d = arith.addf %e, %one : tensor<128xf32>
       %r = arith.divf %a, %d : tensor<128xf32>
-      tts.spyreop_yield %r : tensor<128xf32>
+      tts.spyre_intrinsic_yield %r : tensor<128xf32>
     }
     tt.descriptor_store %out_desc[%c0_i32], %y : !tt.tensordesc<128xf32>, tensor<128xf32>
     tt.return
@@ -116,8 +116,8 @@ module {
 // their equal constants, which is why a constant carries no hint.
 //
 // KTIR-LABEL:   func.func @sigmoid_silu(
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}}
-// KTIR:           math.exp {{.*}} {tts.spyreop_hint = {arity = 1 : i64, id = 1 : i64, target = "spyreop.silu"}}
+// KTIR:           math.exp {{.*}} {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}}
+// KTIR:           math.exp {{.*}} {tts.spyre_intrinsic = {arity = 1 : i64, id = 1 : i64, target = "spyreop.silu"}}
 
 // Two bodies, one intrinsic each, the second reading the first.
 //
@@ -131,5 +131,5 @@ module {
 // PHYS-NEXT:        %[[Q:.*]] = spyreop.silu %[[B]] : f32
 // PHYS-NEXT:        linalg.yield %[[Q]] : f32
 // PHYS:           ktdp.store %[[Y]]
-// PHYS-NOT:       tts.spyreop_hint
+// PHYS-NOT:       tts.spyre_intrinsic
 // PHYS-NOT:       math.

@@ -2107,39 +2107,39 @@ class TritonSemantic(Generic[TensorTy]):
         spyre.ir_builders.create_pin(self.builder, v.handle, space, off)
         return tl.tensor(None, tl.void)
 
-    def spyre_op(self, target, args, call_fallback):
-        """Emit tts.spyre_op -- a request for the device op ``target``, holding
+    def spyre_intrinsic(self, target, args, call_fallback):
+        """Emit tts.spyre_intrinsic -- a request for the device op ``target``, holding
         the backend's registered fallback for it, traced at the operands' types.
         ``call_fallback(fn, args)`` traces one ``@triton.jit`` call at the
         current insertion point, which is the code generator's to do."""
         # The registry is the backend's, reached through the codegen hook the
         # backend supplies; an unknown target raises there, naming the known ones.
-        lookup = self.builder.codegen_fns.get("spyre_intrinsic")
+        lookup = self.builder.codegen_fns.get("spyre_intrinsic_lookup")
         if lookup is None:
-            raise ValueError("tl.spyre_op: this backend registers no intrinsics")
+            raise ValueError("tl.spyre_intrinsic: this backend registers no intrinsics")
         entry = lookup(target)
         name = entry.target
 
         if len(args) != entry.arity:
-            raise ValueError(f"tl.spyre_op({name!r}): takes {entry.arity} tensor "
+            raise ValueError(f"tl.spyre_intrinsic({name!r}): takes {entry.arity} tensor "
                              f"operand(s), got {len(args)}")
         for i, a in enumerate(args):
             if not isinstance(a, tl.tensor) or not a.type.is_block():
-                raise ValueError(f"tl.spyre_op({name!r}): operand {i} must be a "
+                raise ValueError(f"tl.spyre_intrinsic({name!r}): operand {i} must be a "
                                  f"tensor, got {a!r}")
-            # tts.spyre_op's verifier holds every operand to operand 0's shape,
+            # tts.spyre_intrinsic's verifier holds every operand to operand 0's shape,
             # so the call site fuses into one body; checked here so the refusal
             # is at the kernel line.
             shape = [tl._unwrap_if_constexpr(d) for d in a.type.shape]
             shape0 = [tl._unwrap_if_constexpr(d) for d in args[0].type.shape]
             if shape != shape0:
-                raise ValueError(f"tl.spyre_op({name!r}): operand {i} has shape {shape}, "
+                raise ValueError(f"tl.spyre_intrinsic({name!r}): operand {i} has shape {shape}, "
                                  f"and every operand must have operand 0's, {shape0}")
             # The registration's dtypes. The target op's verifier checks its own
             # operand types again when LowerSpyreOps builds it; checked here so
             # the refusal is at the kernel line.
             if a.type.scalar not in entry.dtypes:
-                raise ValueError(f"tl.spyre_op({name!r}): the intrinsic takes "
+                raise ValueError(f"tl.spyre_intrinsic({name!r}): the intrinsic takes "
                                  f"{[d.name for d in entry.dtypes]}, not {a.type.scalar.name}")
         # The result is operand 0's type, for every target.
         result_types = [args[0].type]
@@ -2148,7 +2148,7 @@ class TritonSemantic(Generic[TensorTy]):
         # to exist first -- and that is why its result type is fixed beforehand
         # rather than read off the fallback.
         from triton._C.libtriton import spyre
-        op = spyre.ir_builders.create_spyre_op(self.builder, name, [a.handle for a in args],
+        op = spyre.ir_builders.create_spyre_intrinsic(self.builder, name, [a.handle for a in args],
                                                [t.to_ir(self.builder) for t in result_types])
         ip = self.builder.get_insertion_point()
         try:
@@ -2159,10 +2159,10 @@ class TritonSemantic(Generic[TensorTy]):
             results = [results] if isinstance(results, tl.tensor) else list(results)
             got = [r.type for r in results]
             if got != list(result_types):
-                raise ValueError(f"tl.spyre_op({name!r}): the registered fallback returns "
+                raise ValueError(f"tl.spyre_intrinsic({name!r}): the registered fallback returns "
                                  f"{got}, but a request returns operand 0's type, "
                                  f"{list(result_types)}")
-            spyre.ir_builders.create_spyre_op_yield(self.builder, [r.handle for r in results])
+            spyre.ir_builders.create_spyre_intrinsic_yield(self.builder, [r.handle for r in results])
         finally:
             self.builder.restore_insertion_point(ip)
 

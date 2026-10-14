@@ -18,10 +18,10 @@
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
-//   a REQUEST       a body whose ops all carry `tts.spyreop_hint`s of one
+//   a REQUEST       a body whose ops all carry `tts.spyre_intrinsic` attributes of one
 //                   `id` -> the op the hint's `target` names, applied to the
 //                   call operands in call order, replacing the whole body. The
-//                   author asked for that op with `tl.spyre_op`, and the body
+//                   author asked for that op with `tl.spyre_intrinsic`, and the body
 //                   is its fallback; see matchCallSite and selectCallSite.
 //
 // Two phases, in this order. Requests first, by a walk over the generics: a
@@ -40,7 +40,7 @@
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
 // for the list and what each one costs. The exceptions are an `i1` left inside
 // a compute body, which rejectSurvivingBooleans reports, and a
-// `tts.spyreop_hint` that survives selection, which rejectSurvivingHints
+// `tts.spyre_intrinsic` attribute that survives selection, which rejectSurvivingHints
 // reports: the author asked for the intrinsic by name, so running the fallback
 // instead would ignore the request without saying so.
 //
@@ -545,7 +545,7 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 };
 
 //===----------------------------------------------------------------------===//
-// A request to one: a body hinted `tts.spyreop_hint` -> the op it targets
+// A request to one: a body hinted `tts.spyre_intrinsic` -> the op it targets
 //===----------------------------------------------------------------------===//
 
 /// What the call-site rule needs from a body it replaces.
@@ -599,13 +599,13 @@ bool readSameInput(linalg::GenericOp generic, BlockArgument a,
 /// target at all, and goes with the members' other unused inputs.
 FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
                                        DictionaryAttr hint) {
-  StringRef target = triton::tts::getSpyreopHintTarget(hint);
-  int64_t arity = triton::tts::getSpyreopHintArity(hint);
+  StringRef target = triton::tts::getSpyreIntrinsicTarget(hint);
+  int64_t arity = triton::tts::getSpyreIntrinsicArity(hint);
   Block *body = generic.getBlock();
   auto yield = cast<linalg::YieldOp>(body->getTerminator());
   auto refuse = [&](Location loc) {
     return mlir::emitError(loc)
-           << "lower-spyre-ops: tl.spyre_op(\"" << target << "\"): ";
+           << "lower-spyre-ops: tl.spyre_intrinsic(\"" << target << "\"): ";
   };
 
   CallSiteMatch match;
@@ -616,9 +616,9 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
       match.members.push_back(&op);
 
   for (Operation *op : match.members) {
-    DictionaryAttr opHint = triton::tts::getSpyreopHint(op);
+    DictionaryAttr opHint = triton::tts::getSpyreIntrinsic(op);
     DenseI64ArrayAttr operands =
-        opHint ? triton::tts::getSpyreopHintOperands(opHint) : nullptr;
+        opHint ? triton::tts::getSpyreIntrinsicOperands(opHint) : nullptr;
     if (!operands)
       continue;
     for (auto [j, k] : llvm::enumerate(operands.asArrayRef())) {
@@ -684,7 +684,7 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
 /// the result is on it.
 void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
                     const CallSiteMatch &match) {
-  StringRef target = triton::tts::getSpyreopHintTarget(match.hint);
+  StringRef target = triton::tts::getSpyreIntrinsicTarget(match.hint);
   traceMatch(generic, "body is call site -> " + llvm::Twine(target));
 
   auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
@@ -701,7 +701,7 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   if (Operation *producer = result.getDefiningOp()) {
     triton::tts::copyTTSAttrs(producer, selected);
     selected->removeDiscardableAttr(
-        triton::tts::TTSDialect::kSpyreopHintAttrName);
+        triton::tts::TTSDialect::kSpyreIntrinsicAttrName);
   }
   rewriter.modifyOpInPlace(
       yield, [&] { yield->setOperand(0, selected->getResult(0)); });
@@ -733,16 +733,16 @@ void selectCallSites(ModuleOp module) {
 /// Reports every call site selection left in place, once per `id`, naming the
 /// intrinsic: the author asked for it by name, so running its fallback instead
 /// would ignore that request without saying so. After the request phase, so it
-/// is the one check that no `tts.spyreop_hint` reaches the rule phase.
+/// is the one check that no `tts.spyre_intrinsic` attribute reaches the rule phase.
 LogicalResult rejectSurvivingHints(ModuleOp module) {
   llvm::SmallDenseSet<int64_t> reported;
   module.walk([&](Operation *op) {
-    DictionaryAttr hint = triton::tts::getSpyreopHint(op);
-    if (!hint || !reported.insert(triton::tts::getSpyreopHintId(hint)).second)
+    DictionaryAttr hint = triton::tts::getSpyreIntrinsic(op);
+    if (!hint || !reported.insert(triton::tts::getSpyreIntrinsicId(hint)).second)
       return;
     mlir::emitError(op->getLoc())
-        << "lower-spyre-ops: tl.spyre_op(\""
-        << triton::tts::getSpyreopHintTarget(hint)
+        << "lower-spyre-ops: tl.spyre_intrinsic(\""
+        << triton::tts::getSpyreIntrinsicTarget(hint)
         << "\") was not selected. The request is explicit, so its fallback is "
            "not used instead";
   });
