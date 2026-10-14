@@ -146,15 +146,21 @@ def TTS_Dialect : Dialect {
     /// k -- because nothing later can recover it: a generic's block arguments
     /// follow its `ins`, which ConvertElementwiseToLinalg orders by the first
     /// op's operands and fusion splices and deduplicates. It is per operand of
-    /// an op, and survives because what happens to the op in between keeps its
-    /// operand order: ConvertElementwiseToLinalg gives operand j of the scalar
-    /// op block argument j, whose `ins` operand is the tensor op's operand j;
-    /// fusion and the layout rewrite clone body ops whole; and a rewrite
-    /// replacing a hinted op keeps lhs and rhs and copies its `tts` attributes.
-    /// The one reordering any folding driver does is a commutative op's trait
-    /// fold, which moves constant operands after the others -- the order the
-    /// `ktir` stage's canonicalize has already put the body in before the hint
-    /// is written.
+    /// an op, and what it says depends on the op:
+    ///
+    ///   - on a NON-COMMUTATIVE op, positions are exact. Every pass between
+    ///     the tagging and selection keeps such an op's operand order:
+    ///     ConvertElementwiseToLinalg gives operand j of the scalar op block
+    ///     argument j, whose `ins` operand is the tensor op's operand j; fusion
+    ///     and the layout rewrite clone body ops whole; and a rewrite replacing
+    ///     a hinted op keeps lhs and rhs and copies its `tts` attributes.
+    ///   - on a COMMUTATIVE op, the binding is a set: which call operands the
+    ///     op reads, not at which positions. The one transformation that
+    ///     permutes operands, the commutative trait fold any folding driver
+    ///     applies, moves constants after the other operands, and fires only
+    ///     on an op where operand order does not matter.
+    ///
+    /// LowerSpyreOps reads it that way; see matchCallSite.
     ///
     /// On the ops and not on what they become: ConvertElementwiseToLinalg
     /// writes a tensor op's attributes onto the scalar op it puts in the body,

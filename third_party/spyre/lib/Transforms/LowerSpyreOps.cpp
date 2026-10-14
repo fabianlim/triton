@@ -580,11 +580,28 @@ bool readSameInput(linalg::GenericOp generic, BlockArgument a,
 /// in -- `b / a` converts to `ins(%b, %a)`, block argument 0 being call operand
 /// 1 -- but from the binding LowerTTSMarkers wrote when it was exact: each
 /// member's `operands`, entry j naming the call operand that member's operand j
-/// is. Gathered over every member, and refused, naming the target and the call
+/// is.
+///
+/// On a non-commutative member the binding is positional: operand j is call
+/// operand `operands[j]`. On a commutative member it is read positionally when
+/// every position it lists holds an `ins` block argument, and otherwise as a
+/// set: the member's operands that are `ins` block arguments, whatever their
+/// positions, are the call operands it lists, one each. A set reading assigns
+/// only when the member lists one call operand, possibly more than once, since
+/// then every assignment is the same one; listing two different ones, it is
+/// refused rather than guessed. So a commutative member either binds by the
+/// positions it was tagged with, or binds every input it reads to the one call
+/// operand it names, and in both cases its bindings are checked against the
+/// other members' like any.
+///
+/// Gathered over every member, and refused, naming the target and the call
 /// operand, when it
 ///
 ///   - binds call operand k to an operand that is not an `ins` block argument
 ///     of this generic, which nothing between the two passes makes it;
+///   - binds, on a commutative member read as a set, a number of call operands
+///     other than the number of `ins` block arguments the member reads, or two
+///     different call operands;
 ///   - binds call operand k to two block arguments reading different values,
 ///     two reading one value through one map being one input (readSameInput);
 ///   - binds no block argument to some call operand k below `arity`, which is
@@ -615,18 +632,62 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
     if (!op.hasTrait<OpTrait::ConstantLike>())
       match.members.push_back(&op);
 
+  auto isInput = [&](Value v) {
+    auto arg = dyn_cast<BlockArgument>(v);
+    return arg && arg.getOwner() == body &&
+           generic.isDpsInput(generic.getMatchingOpOperand(arg));
+  };
+
   for (Operation *op : match.members) {
     DictionaryAttr opHint = triton::tts::getSpyreIntrinsic(op);
     DenseI64ArrayAttr operands =
         opHint ? triton::tts::getSpyreIntrinsicOperands(opHint) : nullptr;
     if (!operands)
       continue;
+
+    // (operand index, call operand) per bound operand of `op`: by position,
+    // or, on a commutative op whose listed positions do not all hold inputs,
+    // by set -- see the function comment.
+    SmallVector<std::pair<unsigned, int64_t>> binding;
+    SmallVector<int64_t> listed;
+    bool positional = true;
     for (auto [j, k] : llvm::enumerate(operands.asArrayRef())) {
       if (k < 0)
         continue;
-      auto arg = dyn_cast<BlockArgument>(op->getOperand(j));
-      if (!arg || arg.getOwner() != body ||
-          !generic.isDpsInput(generic.getMatchingOpOperand(arg))) {
+      binding.emplace_back(j, k);
+      listed.push_back(k);
+      positional &= isInput(op->getOperand(j));
+    }
+    if (!positional && op->hasTrait<OpTrait::IsCommutative>()) {
+      SmallVector<unsigned> inputs;
+      for (auto [j, v] : llvm::enumerate(op->getOperands()))
+        if (isInput(v))
+          inputs.push_back(j);
+      if (inputs.size() != listed.size()) {
+        refuse(op->getLoc())
+            << "call operand " << listed.front() << " is bound on commutative '"
+            << op->getName() << "', which binds " << listed.size()
+            << " call operand(s) and reads " << inputs.size()
+            << " input(s) of its compute body";
+        return failure();
+      }
+      if (!llvm::all_equal(listed)) {
+        refuse(op->getLoc())
+            << "call operand " << listed.front() << " is bound on commutative '"
+            << op->getName()
+            << "', whose operands are not in the order its binding names, and "
+               "which binds more than one call operand, so which input is "
+               "which call operand is not known";
+        return failure();
+      }
+      binding.clear();
+      for (unsigned j : inputs)
+        binding.emplace_back(j, listed.front());
+    }
+
+    for (auto [j, k] : binding) {
+      Value v = op->getOperand(j);
+      if (!isInput(v)) {
         refuse(op->getLoc())
             << "call operand " << k << " is operand " << j << " of '"
             << op->getName()
@@ -635,6 +696,7 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
                "selection makes it one";
         return failure();
       }
+      auto arg = cast<BlockArgument>(v);
       BlockArgument &bound = match.inputs[k];
       if (!bound)
         bound = arg;

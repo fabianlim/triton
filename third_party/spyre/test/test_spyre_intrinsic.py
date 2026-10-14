@@ -185,6 +185,29 @@ def test_two_operand_call_site_takes_call_order(register, fallback, tmp_path):
     assert _selected_operands(spyrecode, target) == ["x_desc", "y_desc"], spyrecode
 
 
+@triton.jit
+def _request_same_twice(x_ptr, out_ptr, N: tl.constexpr, OP: tl.constexpr):
+    x_desc = tl.make_tensor_descriptor(x_ptr, shape=[N], strides=[1], block_shape=[N])
+    out_desc = tl.make_tensor_descriptor(out_ptr, shape=[N], strides=[1], block_shape=[N])
+    x = x_desc.load([0])
+    out_desc.store([0], tl.spyre_intrinsic(OP, x, x))
+
+
+def test_one_value_as_two_call_operands_is_selected(register, tmp_path):
+    # Not one call operand read twice, but one value passed as two: the target
+    # reads that value for both.
+    target = "spyreop.realdiv"
+    register(target, dtypes=(tl.float32, ))(div_in_order)
+    ttir = compile_to_ttir(_request_same_twice, {"x_ptr": "*fp32", "out_ptr": "*fp32", "N": "constexpr",
+                                                 "OP": "constexpr"}, {"N": 128, "OP": target})
+    spyrecode = _spyrecode(_ktir(ttir, tmp_path))
+    assert spyrecode.count(target) == 1, spyrecode
+    assert "tts.spyre_intrinsic" not in spyrecode
+    selected = re.search(re.escape(target) + r" (%\w+), (%\w+) :", spyrecode)
+    assert selected and selected.group(1) == selected.group(2), spyrecode
+    assert _selected_operands(spyrecode, target) == ["x_desc", "x_desc"], spyrecode
+
+
 def test_operands_of_two_shapes_are_refused(register):
 
     @register(dtypes=(tl.float32, ))

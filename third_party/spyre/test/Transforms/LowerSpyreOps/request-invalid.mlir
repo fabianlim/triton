@@ -100,3 +100,43 @@ func.func @target_refuses_type(%x: tensor<64xf32>) -> tensor<64xf32> {
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
 }
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// A NON-COMMUTATIVE MEMBER WHOSE OPERANDS ARE NOT WHERE ITS BINDING SAYS. Its
+// positions are exact, so call operand 0 is its operand 1, a constant.
+func.func @non_commutative_swapped(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %one = arith.constant 1.000000e+00 : f32
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%a: f32, %out: f32):
+    // expected-error @+2 {{tl.spyre_intrinsic("spyreop.sigmoid") was not selected}}
+    // expected-error @+1 {{lower-spyre-ops: tl.spyre_intrinsic("spyreop.sigmoid"): call operand 0 is operand 1 of 'arith.subf', which is not an input of its compute body -- a compiler bug}}
+    %s = arith.subf %a, %one {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: -1, 0>, target = "spyreop.sigmoid"}} : f32
+    linalg.yield %s : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// A COMMUTATIVE MEMBER READ AS A SET, BINDING MORE CALL OPERANDS THAN IT READS
+// INPUTS: two listed, one input, so which it is cannot be told.
+func.func @commutative_count_mismatch(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %one = arith.constant 1.000000e+00 : f32
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%a: f32, %out: f32):
+    // expected-error @+2 {{tl.spyre_intrinsic("spyreop.realdiv") was not selected}}
+    // expected-error @+1 {{lower-spyre-ops: tl.spyre_intrinsic("spyreop.realdiv"): call operand 1 is bound on commutative 'arith.addf', which binds 2 call operand(s) and reads 1 input(s) of its compute body}}
+    %s = arith.addf %one, %a {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 1, 0>, target = "spyreop.realdiv"}} : f32
+    linalg.yield %s : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}

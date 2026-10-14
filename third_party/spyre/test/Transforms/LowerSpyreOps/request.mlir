@@ -211,3 +211,103 @@ func.func @two_operands_reversed(%a: tensor<64xf32>, %b: tensor<64xf32>) -> tens
   } -> tensor<64xf32>
   return %r : tensor<64xf32>
 }
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// A COMMUTATIVE MEMBER WHOSE OPERANDS MOVED. The addf was tagged
+// `operands = array<i64: -1, 0>` with the call operand second; the commutative
+// fold has since put the constant last, so position 1 holds no input. A
+// commutative member's binding is a set, so its one input is call operand 0.
+// CHECK-LABEL: func.func @commutative_operands_moved(
+// CHECK:         linalg.generic
+// CHECK-NEXT:    ^bb0(%[[IN:.*]]: f32, %{{.*}}: f32):
+// CHECK-NEXT:      %[[R:.*]] = spyreop.sigmoid %[[IN]] : f32
+// CHECK-NEXT:      linalg.yield %[[R]] : f32
+func.func @commutative_operands_moved(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %one = arith.constant 1.000000e+00 : f32
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %d = arith.addf %in, %one {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, operands = array<i64: -1, 0>, target = "spyreop.sigmoid"}} : f32
+    %q = arith.divf %one, %d {tts.spyre_intrinsic = {arity = 1 : i64, id = 0 : i64, target = "spyreop.sigmoid"}} : f32
+    linalg.yield %q : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// A COMMUTATIVE MEMBER READING TWO CALL OPERANDS, `b + a`. Every position it
+// lists holds an input, so it binds by position -- call operand 1 to the first,
+// 0 to the second -- and that agrees with the divf, which binds call operand 0
+// to the same block argument. The target takes `a` first.
+// CHECK-LABEL: func.func @commutative_two_call_operands(
+// CHECK-SAME:    %[[A:[^:]*]]: tensor<64xf32>, %[[B:[^:]*]]: tensor<64xf32>
+// CHECK:         linalg.generic {{.*}} ins(%[[B]], %[[A]] : tensor<64xf32>, tensor<64xf32>)
+// CHECK-NEXT:    ^bb0(%[[INB:[^:]*]]: f32, %[[INA:[^:]*]]: f32, %{{.*}}: f32):
+// CHECK-NEXT:      %[[R:.*]] = spyreop.realdiv %[[INA]], %[[INB]] : f32
+// CHECK-NEXT:      linalg.yield %[[R]] : f32
+func.func @commutative_two_call_operands(%a: tensor<64xf32>, %b: tensor<64xf32>) -> tensor<64xf32> {
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
+      ins(%b, %a : tensor<64xf32>, tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%inb: f32, %ina: f32, %out: f32):
+    %s = arith.addf %inb, %ina {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 1, 0>, target = "spyreop.realdiv"}} : f32
+    %q = arith.divf %s, %ina {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: -1, 0>, target = "spyreop.realdiv"}} : f32
+    linalg.yield %q : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// ONE VALUE PASSED AS TWO CALL OPERANDS, `realdiv(x, x)`: LowerTTSMarkers bound
+// two block arguments as call operands 0 and 1, and fusion merged their equal
+// `ins` into one, so both call operands are bound to it. Not a conflict: a
+// conflict is ONE call operand bound to two different inputs. The target reads
+// that argument twice.
+// CHECK-LABEL: func.func @one_value_two_call_operands(
+// CHECK:         linalg.generic
+// CHECK-NEXT:    ^bb0(%[[IN:[^:]*]]: f32, %{{.*}}: f32):
+// CHECK-NEXT:      %[[R:.*]] = spyreop.realdiv %[[IN]], %[[IN]] : f32
+// CHECK-NEXT:      linalg.yield %[[R]] : f32
+func.func @one_value_two_call_operands(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %q = arith.divf %in, %in {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0, 1>, target = "spyreop.realdiv"}} : f32
+    linalg.yield %q : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+// The commutative variant, `addf %x, %x` binding call operands 0 and 1. Both
+// positions it lists hold an input, so it binds by position, both to the one
+// block argument.
+// CHECK-LABEL: func.func @one_value_two_call_operands_commutative(
+// CHECK:         linalg.generic
+// CHECK-NEXT:    ^bb0(%[[IN:[^:]*]]: f32, %{{.*}}: f32):
+// CHECK-NEXT:      %[[R:.*]] = spyreop.realdiv %[[IN]], %[[IN]] : f32
+// CHECK-NEXT:      linalg.yield %[[R]] : f32
+func.func @one_value_two_call_operands_commutative(%x: tensor<64xf32>) -> tensor<64xf32> {
+  %e = tensor.empty() : tensor<64xf32>
+  %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%x : tensor<64xf32>) outs(%e : tensor<64xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %s = arith.addf %in, %in {tts.spyre_intrinsic = {arity = 2 : i64, id = 0 : i64, operands = array<i64: 0, 1>, target = "spyreop.realdiv"}} : f32
+    linalg.yield %s : f32
+  } -> tensor<64xf32>
+  return %r : tensor<64xf32>
+}
