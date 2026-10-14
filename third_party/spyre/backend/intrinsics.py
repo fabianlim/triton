@@ -17,7 +17,7 @@ This module is the one registry. Each entry is registered with
 frontend checks when the call is traced: the operand count (the fallback's) and
 the dtypes every operand may have. The result is operand 0's type, for every
 target. The IR carries only the target's name, so the compiler needs no copy of
-this table: ``LowerSpyreOps`` builds the op by that name, and the op's own
+this table: ``LowerSpyreIntrinsicCalls`` builds the op by that name, and the op's own
 verifier checks the operands. The one thing checked against the compiler here is
 that the name is a registered op, at registration, so a misspelled target is
 refused where it is written rather than at its first trace.
@@ -27,7 +27,7 @@ so kernel authors cannot register targets.
 
 Every fallback widens to fp32 and narrows back. ``tl.exp`` and ``tl.erf`` are
 fp32-only in the frontend, and the casts cost nothing on the device path, since
-``LowerSpyreOps`` replaces the body they are part of, casts included. At fp32
+``LowerSpyreIntrinsicCalls`` replaces the body they are part of, casts included. At fp32
 the casts are no-ops and are not traced.
 
 The frontend reaches this registry through the ``spyre_intrinsic_lookup`` codegen hook

@@ -181,9 +181,10 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // Every coordinate change becomes an `indexing_maps` entry on the generic that
   // consumes it, so nothing whose only effect is to re-index survives.
   //
-  // It also fuses the generics holding one `tl.spyre_intrinsic` request's fallback into
-  // one body, which LowerSpyreOps needs, and which has to happen on this side of
-  // the layout pass: see the clause in that pass's header.
+  // It also fuses the generics holding one `tl.spyre_intrinsic` request's
+  // fallback into one body, which LowerSpyreIntrinsicCalls needs, and which has
+  // to happen on this side of the layout pass: see the clause in that pass's
+  // header.
   //
   // Both neighbours fix the position. It must follow the three passes above,
   // which are what make every compute a linalg.generic: the fusion it drives
@@ -205,10 +206,22 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // is logical.
   pm.addPass(ktdp::createRewriteDescriptorLayoutGeneric());
 
+  // Requested selection: each `tl.spyre_intrinsic` call site's fallback body
+  // becomes the op the call names, and a request not selected is an error. Its
+  // own pass, ahead of the implicit selection below, because the two fail
+  // oppositely -- an explicit request unmatched is refused, an arith op
+  // unmatched flows through -- and because a fallback's ops are arith and math
+  // that the implicit rules would otherwise select one by one.
+  //
+  // Needs FuseComputeAndDataMovement, well above, to have made each call site
+  // one body, and that before the layout rewrite: after it the request's first
+  // generic keeps a linearizing result map that fusion cannot fuse through.
+  pm.addPass(createLowerSpyreIntrinsicCallsPass());
+
   // Instruction selection: the arith and math ops in each compute body become the
-  // spyreop intrinsics that do the same thing. One pass for all of it: the
-  // requests first, as a walk, then the one-op-to-one and group rules, which
-  // share a pattern set, each rooted on a different op.
+  // spyreop intrinsics that do the same thing. One pass for all of it -- the
+  // one-op-to-one rules and the group rules share a pattern set, each rooted on
+  // a different op.
   //
   // Needs every compute to be a linalg.generic, which the passes above make it: a
   // group rule's SCOPE is the generic body, and the 1:1 rules leave a tensor-typed
@@ -219,15 +232,10 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // tensor-level op a body of its own, so a group spanning two tensor ops is two
   // generics until something fuses them -- that pass's `i1` clause is what does,
   // and the compare rule fires only because of it. The reciprocal is the softer
-  // case: it reads its numerator through the body, so it fires either way. A
-  // `tl.spyre_intrinsic` request is the hard case: it is selected only as one whole
-  // body, which that pass's `tts.spyre_intrinsic` attribute clause makes it -- before the layout
-  // rewrite, since after it the request's first generic keeps a linearizing
-  // result map that fusion cannot fuse through.
+  // case: it reads its numerator through the body, so it fires either way.
   //
-  // An op with no device form is not reported here; it flows through to dbo-opt,
-  // which is the component that knows what it can take. What is reported is an
-  // explicit request left unselected, and an `i1` no rule can remove.
+  // Nothing is reported here. An op with no device form flows through to dbo-opt,
+  // which is the component that knows what it can take.
   pm.addPass(createLowerSpyreOpsPass());
 
   // The cleanup belonging to the layout pass, moved across the boundary with it.
@@ -244,11 +252,12 @@ void mlir::triton::spyre::buildSpyrecodePipeline(
   // matching load's are both Pure over the same block, so CSE merges them and
   // dbo-opt's compute-group extraction aborts. See issue #161.
   //
-  // After LowerSpyreOps, not directly after the layout pass. Its arith patterns
-  // replace an op by a new one built without the original's discardable
-  // attributes, so on a `tl.spyre_intrinsic` call site they drop the
-  // `tts.spyre_intrinsic` attribute selection reads. Nothing LowerSpyreOps matches is what
-  // this folds: the index arithmetic is outside every compute body.
+  // After LowerSpyreIntrinsicCalls, not directly after the layout pass. Its
+  // arith patterns replace an op by a new one built without the original's
+  // discardable attributes, so on a `tl.spyre_intrinsic` call site they would
+  // drop the `tts.spyre_intrinsic` attribute that pass reads. Nothing it folds
+  // is selected by either pass: the index arithmetic is outside every compute
+  // body.
   pm.addPass(mlir::createCanonicalizerPass());
 
   if (options.bindBaseAddresses) {

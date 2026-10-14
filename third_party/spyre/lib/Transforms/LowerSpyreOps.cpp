@@ -18,31 +18,22 @@
 //   a GROUP to one  a compare and a cast -> spyreop.compare. The group is what
 //                   is selectable: no member of it could have been selected
 //                   alone.
-//   a REQUEST       a body whose ops all carry `tts.spyre_intrinsic` attributes of one
-//                   `id` -> the op the hint's `target` names, applied to the
-//                   call operands in call order, replacing the whole body. The
-//                   author asked for that op with `tl.spyre_intrinsic`, and the body
-//                   is its fallback; see matchCallSite and selectCallSite.
 //
-// Two phases, in this order. Requests first, by a walk over the generics: a
-// body holding a call site becomes its intrinsic, and a hint left anywhere
-// after that is refused. Then the 1:1 and group rules, which share one greedy
-// pattern set; no two of them are rooted on the same op, so no order is
-// declared between them. No hinted op is left when the second phase starts,
-// so no rule there has to recognize one: a fallback's `math.exp` is gone
-// before SelectUnaryFloat could see it.
+// They share one greedy pattern set, and no two rules are rooted on the same
+// op, so no rule has to win over another and no order is declared anywhere.
+// Splitting these across two passes is what an earlier shape did, and it
+// bought a standing question -- which pass claims this op -- for nothing.
+// LowerSpyreIntrinsicCalls runs first, so no op this pass sees carries a
+// `tts.spyre_intrinsic` attribute.
 //
-// EVERYTHING UNMATCHED FLOWS THROUGH, WITH TWO EXCEPTIONS. There is no
+// EVERYTHING UNMATCHED FLOWS THROUGH, WITH ONE EXCEPTION. There is no
 // conversion target: an op with no device form reaches the backend, which is
 // the component that actually knows what it can take, and it refuses there. So
 // this pass has no notion of an illegal input -- it selects what it can and
 // leaves the rest exactly as it found it. A type or a predicate this file does
 // not handle is a silent pass-through by design; see WHAT IS NOT SELECTED below
-// for the list and what each one costs. The exceptions are an `i1` left inside
-// a compute body, which rejectSurvivingBooleans reports, and a
-// `tts.spyre_intrinsic` attribute that survives selection, which rejectSurvivingHints
-// reports: the author asked for the intrinsic by name, so running the fallback
-// instead would ignore the request without saying so.
+// for the list and what each one costs. The exception is an `i1` left inside a
+// compute body, which rejectSurvivingBooleans reports.
 //
 // WHAT THIS PASS RELIES ON ITS PREDECESSOR FOR. A rule matches ops in ONE body,
 // and ConvertElementwiseToLinalg gives every tensor-level op a body of its own
@@ -112,7 +103,6 @@
 
 #include "Transforms/Passes.h"
 
-#include "Dialect/TTS/IR/Dialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
@@ -124,16 +114,12 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/Verifier.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
-#include <string>
 
 #define DEBUG_TYPE "lower-spyre-ops"
 
@@ -535,281 +521,13 @@ struct SelectArithMulI : public OpRewritePattern<arith::MulIOp> {
 
   LogicalResult matchAndRewrite(arith::MulIOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!isInsideLinalgGeneric(op) ||
-        getScalarIntBitWidth(op.getType()) != 32)
+    if (!isInsideLinalgGeneric(op) || getScalarIntBitWidth(op.getType()) != 32)
       return failure();
     rewriter.replaceOpWithNewOp<spyreop::MulI32ToI32>(op, op.getType(),
                                                       op.getLhs(), op.getRhs());
     return success();
   }
 };
-
-//===----------------------------------------------------------------------===//
-// A request to one: a body hinted `tts.spyre_intrinsic` -> the op it targets
-//===----------------------------------------------------------------------===//
-
-/// What the call-site rule needs from a body it replaces.
-struct CallSiteMatch {
-  DictionaryAttr hint;
-  /// Call operand k -> the `ins` block argument holding it, in call order.
-  SmallVector<BlockArgument> inputs;
-  SmallVector<Operation *> members;
-};
-
-/// Whether block arguments `a` and `b` of `generic` read one element of one
-/// value: the same `ins` operand through the same indexing map. Two ops of a
-/// call site reading one call operand from two generics give the fused body two
-/// such block arguments unless the fusion merges them, which it does for the
-/// `ins` it sees are equal; a body that kept both still has one input there.
-bool readSameInput(linalg::GenericOp generic, BlockArgument a,
-                   BlockArgument b) {
-  OpOperand *operandA = generic.getMatchingOpOperand(a);
-  OpOperand *operandB = generic.getMatchingOpOperand(b);
-  return operandA->get() == operandB->get() &&
-         generic.getMatchingIndexingMap(operandA) ==
-             generic.getMatchingIndexingMap(operandB);
-}
-
-/// What `generic`'s body, the call site `hint` names, reads for each of its
-/// call operands, or failure, reported, when the body does not say.
-///
-/// FuseComputeAndDataMovement has already checked that the body holds one call
-/// site, whole, and nothing else but constants, so what is left to find is the
-/// inputs. Not by the block arguments' order, which after
-/// ConvertElementwiseToLinalg and fusion is whatever order the `ins` ended up
-/// in -- `b / a` converts to `ins(%b, %a)`, block argument 0 being call operand
-/// 1 -- but from the binding LowerTTSMarkers wrote when it was exact: each
-/// member's `operands`, entry j naming the call operand that member's operand j
-/// is.
-///
-/// On a non-commutative member the binding is positional: operand j is call
-/// operand `operands[j]`. On a commutative member it is read positionally when
-/// every position it lists holds an `ins` block argument, and otherwise as a
-/// set: the member's operands that are `ins` block arguments, whatever their
-/// positions, are the call operands it lists, one each. A set reading assigns
-/// only when the member lists one call operand, possibly more than once, since
-/// then every assignment is the same one; listing two different ones, it is
-/// refused rather than guessed. So a commutative member either binds by the
-/// positions it was tagged with, or binds every input it reads to the one call
-/// operand it names, and in both cases its bindings are checked against the
-/// other members' like any.
-///
-/// Gathered over every member, and refused, naming the target and the call
-/// operand, when it
-///
-///   - binds call operand k to an operand that is not an `ins` block argument
-///     of this generic, which nothing between the two passes makes it;
-///   - binds, on a commutative member read as a set, a number of call operands
-///     other than the number of `ins` block arguments the member reads, or two
-///     different call operands;
-///   - binds call operand k to two block arguments reading different values,
-///     two reading one value through one map being one input (readSameInput);
-///   - binds no block argument to some call operand k below `arity`, which is
-///     a fallback that does not read that operand, or whose reading folded
-///     away: the target would have nothing to take it from.
-///
-/// A bound block argument whose `ins` operand is a constant is used like any
-/// other: the binding says it is call operand k, so it is a call operand that
-/// folded to a constant after LowerTTSMarkers refused the ones constant there,
-/// and the target applied to it still computes what was asked. An unbound one
-/// -- a constant the fusion did not fold into the body -- is not read for the
-/// target at all, and goes with the members' other unused inputs.
-FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
-                                       DictionaryAttr hint) {
-  StringRef target = triton::tts::getSpyreIntrinsicTarget(hint);
-  int64_t arity = triton::tts::getSpyreIntrinsicArity(hint);
-  Block *body = generic.getBlock();
-  auto yield = cast<linalg::YieldOp>(body->getTerminator());
-  auto refuse = [&](Location loc) {
-    return mlir::emitError(loc)
-           << "lower-spyre-ops: tl.spyre_intrinsic(\"" << target << "\"): ";
-  };
-
-  CallSiteMatch match;
-  match.hint = hint;
-  match.inputs.assign(arity, BlockArgument());
-  for (Operation &op : body->without_terminator())
-    if (!op.hasTrait<OpTrait::ConstantLike>())
-      match.members.push_back(&op);
-
-  auto isInput = [&](Value v) {
-    auto arg = dyn_cast<BlockArgument>(v);
-    return arg && arg.getOwner() == body &&
-           generic.isDpsInput(generic.getMatchingOpOperand(arg));
-  };
-
-  for (Operation *op : match.members) {
-    DictionaryAttr opHint = triton::tts::getSpyreIntrinsic(op);
-    DenseI64ArrayAttr operands =
-        opHint ? triton::tts::getSpyreIntrinsicOperands(opHint) : nullptr;
-    if (!operands)
-      continue;
-
-    // (operand index, call operand) per bound operand of `op`: by position,
-    // or, on a commutative op whose listed positions do not all hold inputs,
-    // by set -- see the function comment.
-    SmallVector<std::pair<unsigned, int64_t>> binding;
-    SmallVector<int64_t> listed;
-    bool positional = true;
-    for (auto [j, k] : llvm::enumerate(operands.asArrayRef())) {
-      if (k < 0)
-        continue;
-      binding.emplace_back(j, k);
-      listed.push_back(k);
-      positional &= isInput(op->getOperand(j));
-    }
-    if (!positional && op->hasTrait<OpTrait::IsCommutative>()) {
-      SmallVector<unsigned> inputs;
-      for (auto [j, v] : llvm::enumerate(op->getOperands()))
-        if (isInput(v))
-          inputs.push_back(j);
-      if (inputs.size() != listed.size()) {
-        refuse(op->getLoc())
-            << "call operand " << listed.front() << " is bound on commutative '"
-            << op->getName() << "', which binds " << listed.size()
-            << " call operand(s) and reads " << inputs.size()
-            << " input(s) of its compute body";
-        return failure();
-      }
-      if (!llvm::all_equal(listed)) {
-        refuse(op->getLoc())
-            << "call operand " << listed.front() << " is bound on commutative '"
-            << op->getName()
-            << "', whose operands are not in the order its binding names, and "
-               "which binds more than one call operand, so which input is "
-               "which call operand is not known";
-        return failure();
-      }
-      binding.clear();
-      for (unsigned j : inputs)
-        binding.emplace_back(j, listed.front());
-    }
-
-    for (auto [j, k] : binding) {
-      Value v = op->getOperand(j);
-      if (!isInput(v)) {
-        refuse(op->getLoc())
-            << "call operand " << k << " is operand " << j << " of '"
-            << op->getName()
-            << "', which is not an input of its compute body -- a compiler "
-               "bug, since nothing between the call site's inlining and its "
-               "selection makes it one";
-        return failure();
-      }
-      auto arg = cast<BlockArgument>(v);
-      BlockArgument &bound = match.inputs[k];
-      if (!bound)
-        bound = arg;
-      else if (bound != arg && !readSameInput(generic, bound, arg)) {
-        refuse(op->getLoc())
-            << "call operand " << k
-            << " is read from two different inputs of its compute body, block "
-               "arguments "
-            << bound.getArgNumber() << " and " << arg.getArgNumber();
-        return failure();
-      }
-    }
-  }
-
-  for (auto [k, bound] : llvm::enumerate(match.inputs))
-    if (!bound) {
-      refuse(generic.getLoc())
-          << "call operand " << k
-          << " is read by no op left of the fallback, so there is no input to "
-             "pass the target for it";
-      return failure();
-    }
-  if (yield->getNumOperands() != 1) {
-    refuse(generic.getLoc())
-        << "the call site's body yields " << yield->getNumOperands()
-        << " values, and a request has one result";
-    return failure();
-  }
-  return match;
-}
-
-/// Replaces a body that is one call site with the op its hint targets.
-///
-/// Matched on the generic and not on a member, because the call site is the
-/// BODY: which op the fallback happens to end in says nothing. What the members
-/// computed -- the fallback, casts included -- is discarded whole, and the body
-/// becomes the target applied to its inputs, in call order, at the type the
-/// body yields. The inputs' unused siblings, a captured constant among them,
-/// are left to the unused-operand cleanup in the rule phase.
-///
-/// The target is built by name, so nothing here knows what it takes: its own
-/// verifier is asked, and a target that refuses this operand or type is erased
-/// again, its diagnostic emitted, and the body left for rejectSurvivingHints.
-///
-/// The `tts` attributes of the op whose value was yielded move to the target,
-/// the hint aside: that op produced the call site's result, so a `tts.pin` on
-/// the result is on it.
-void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
-                    const CallSiteMatch &match) {
-  StringRef target = triton::tts::getSpyreIntrinsicTarget(match.hint);
-  traceMatch(generic, "body is call site -> " + llvm::Twine(target));
-
-  auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
-  Value result = yield->getOperand(0);
-  rewriter.setInsertionPoint(yield);
-  OperationState state(result.getLoc(), target);
-  state.addOperands(ArrayRef<BlockArgument>(match.inputs));
-  state.addTypes(result.getType());
-  Operation *selected = rewriter.create(state);
-  if (failed(mlir::verify(selected))) {
-    rewriter.eraseOp(selected);
-    return;
-  }
-  if (Operation *producer = result.getDefiningOp()) {
-    triton::tts::copyTTSAttrs(producer, selected);
-    selected->removeDiscardableAttr(
-        triton::tts::TTSDialect::kSpyreIntrinsicAttrName);
-  }
-  rewriter.modifyOpInPlace(
-      yield, [&] { yield->setOperand(0, selected->getResult(0)); });
-  // Reverse program order, so each op's users are gone before it is.
-  for (Operation *op : llvm::reverse(match.members))
-    rewriter.eraseOp(op);
-}
-
-/// The request phase: every body that is one call site becomes its target.
-/// A walk and not a fixpoint, since a body holds at most one call site and
-/// replacing it makes no other. A body matchCallSite refuses is reported there,
-/// with the reason, and left hinted, so rejectSurvivingHints reports the
-/// request as unselected as well.
-void selectCallSites(ModuleOp module) {
-  SmallVector<std::pair<linalg::GenericOp, CallSiteMatch>> matches;
-  module.walk([&](linalg::GenericOp generic) {
-    DictionaryAttr hint = triton::tts::getBodyCallSite(*generic.getBlock());
-    if (!hint)
-      return;
-    FailureOr<CallSiteMatch> match = matchCallSite(generic, hint);
-    if (succeeded(match))
-      matches.emplace_back(generic, std::move(*match));
-  });
-  IRRewriter rewriter(module.getContext());
-  for (auto &[generic, match] : matches)
-    selectCallSite(rewriter, generic, match);
-}
-
-/// Reports every call site selection left in place, once per `id`, naming the
-/// intrinsic: the author asked for it by name, so running its fallback instead
-/// would ignore that request without saying so. After the request phase, so it
-/// is the one check that no `tts.spyre_intrinsic` attribute reaches the rule phase.
-LogicalResult rejectSurvivingHints(ModuleOp module) {
-  llvm::SmallDenseSet<int64_t> reported;
-  module.walk([&](Operation *op) {
-    DictionaryAttr hint = triton::tts::getSpyreIntrinsic(op);
-    if (!hint || !reported.insert(triton::tts::getSpyreIntrinsicId(hint)).second)
-      return;
-    mlir::emitError(op->getLoc())
-        << "lower-spyre-ops: tl.spyre_intrinsic(\""
-        << triton::tts::getSpyreIntrinsicTarget(hint)
-        << "\") was not selected. The request is explicit, so its fallback is "
-           "not used instead";
-  });
-  return success(reported.empty());
-}
 
 //===----------------------------------------------------------------------===//
 // After selection: an i1 left in a compute body
@@ -896,28 +614,19 @@ struct LowerSpyreOpsPass
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
 
-    // The request phase. A hint it leaves is refused here rather than handed
-    // on, since the rule phase would select the fallback's ops one by one.
-    selectCallSites(module);
-    if (failed(rejectSurvivingHints(module))) {
-      signalPassFailure();
-      return;
-    }
-
-    // The rule phase. One line per rule, group and 1:1 rules in one set, each
-    // rooted on a different op. See ONE PASS FOR ALL SELECTION in the header.
     RewritePatternSet patterns(ctx);
+    // One line per rule, group rules and 1:1 rules in one set, each rooted on
+    // a different op. See ONE PASS FOR ALL SELECTION in the header.
     patterns.add<SelectCompare, SelectWhere>(ctx);
     patterns.add<SelectArithDivF, SelectArithAddI, SelectArithMulI>(ctx);
     patterns.add<SelectUnaryFloat<math::SqrtOp, spyreop::Sqrt>,
                  SelectUnaryFloat<math::ExpOp, spyreop::Exp>,
                  SelectUnaryFloat<math::RsqrtOp, spyreop::RSqrt>>(ctx);
 
-    // Upstream's, and load-bearing rather than tidying: a rule that stops
+    // Upstream's, and load-bearing rather than tidying: a group rule that stops
     // reading a block argument leaves an `ins` operand, that argument and its
-    // indexing map behind, and this removes all three -- the request phase's
-    // replacements included. In the same fixpoint, so a rule never has to see
-    // the intermediate state.
+    // indexing map behind, and this removes all three. In the same fixpoint, so
+    // a rule never has to see the intermediate state.
     linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
 
     // The greedy driver, not a dialect conversion. Nothing here is illegal: an
@@ -929,10 +638,9 @@ struct LowerSpyreOpsPass
       return;
     }
 
-    // The other thing this pass reports, besides a surviving hint. An `i1` is
-    // not a selection failure at all -- see rejectSurvivingBooleans on why an
-    // unrepresentable TYPE is a different kind of thing from an op the device
-    // happens not to do.
+    // The one thing this pass does report. Not a selection failure -- see
+    // rejectSurvivingBooleans on why an unrepresentable TYPE is a different
+    // kind of thing from an op the device happens not to do.
     if (failed(rejectSurvivingBooleans(module)))
       signalPassFailure();
   }

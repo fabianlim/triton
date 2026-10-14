@@ -4,7 +4,8 @@
 
 // A target that is not a registered op. Which targets exist, and what each
 // takes, is the frontend's registration; the IR is held only to the target
-// existing, and LowerSpyreOps asks the target's own verifier about the operands.
+// existing, and LowerSpyreIntrinsicCalls asks the target's own verifier about
+// the operands.
 tt.func @unknown_target(%x: tensor<128xf32>) -> tensor<128xf32> {
   // expected-error @+1 {{targets 'spyreop.no_such_op', which is not a registered op}}
   %r = tts.spyre_intrinsic "spyreop.no_such_op" (%x) : (tensor<128xf32>) -> tensor<128xf32> {

@@ -130,7 +130,7 @@ LogicalResult PinOp::verify() {
 
 LogicalResult SpyreIntrinsicOp::verifyRegions() {
   // Only that the target exists. Which operands and types it takes is the op's
-  // own verifier's, which runs when LowerSpyreOps builds it.
+  // own verifier's, which runs when LowerSpyreIntrinsicCalls builds it.
   if (!RegisteredOperationName::lookup(getTarget(), getContext()))
     return emitOpError("targets '")
            << getTarget() << "', which is not a registered op";

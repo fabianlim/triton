@@ -1,5 +1,5 @@
-// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
-// RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | spyre-triton-opt -split-input-file | FileCheck %s --check-prefix=NOHINT
+// RUN: spyre-triton-opt %s --lower-spyre-intrinsic-calls -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --lower-spyre-intrinsic-calls -split-input-file | spyre-triton-opt -split-input-file | FileCheck %s --check-prefix=NOHINT
 
 // NOHINT-NOT: tts.spyre_intrinsic
 
@@ -15,9 +15,10 @@
 // around an f16 request included -- so what survives is the intrinsic at the
 // type the body reads and yields.
 //
-// It also shows requests being selected before the 1:1 rules run: each body
-// holds a `math.exp` or an `arith.divf`, which would otherwise become
-// spyreop.exp or spyreop.realdiv. None is left, unhinted or otherwise.
+// This pass runs no implicit rule: each body holds a `math.exp` or an
+// `arith.divf`, which LowerSpyreOps would select as spyreop.exp or
+// spyreop.realdiv, and none is left here, so none reaches it. The inputs a
+// selected body stops reading are removed by this pass's own cleanup.
 
 #map = affine_map<(d0) -> (d0)>
 

@@ -160,15 +160,15 @@ def TTS_Dialect : Dialect {
     ///     applies, moves constants after the other operands, and fires only
     ///     on an op where operand order does not matter.
     ///
-    /// LowerSpyreOps reads it that way; see matchCallSite.
+    /// LowerSpyreIntrinsicCalls reads it that way; see matchCallSite.
     ///
     /// On the ops and not on what they become: ConvertElementwiseToLinalg
     /// writes a tensor op's attributes onto the scalar op it puts in the body,
     /// and fusion and the layout rewrite clone body ops whole, while every
     /// pass that rebuilds a `linalg.generic` drops the generic's own
     /// attributes. FuseComputeAndDataMovement fuses two generics whose bodies
-    /// carry one call site, and LowerSpyreOps replaces the body the call site
-    /// became with the op `target` names. What is checked about it, and
+    /// carry one call site, and LowerSpyreIntrinsicCalls replaces the body the
+    /// call site became with the op `target` names. What is checked about it, and
     /// where, is stated once, in `tts.spyre_intrinsic`'s description.
     ///
     /// Builtin-valued like the two above, so the `ktir` artifact carrying it

@@ -40,17 +40,18 @@
 //            bodies carry `tts.spyre_intrinsic` attributes of one `id`, i.e. both hold ops
 //            LowerTTSMarkers inlined out of one `tts.spyre_intrinsic`. Each tensor op
 //            of the call site's fallback arrives in a generic of its own, and
-//            LowerSpyreOps replaces a call site only as one whole body. See
+//            LowerSpyreIntrinsicCalls replaces a call site only as one whole
+//            body. See
 //            producerAndConsumerShareCallSite.
 //
-// Here and not in a pass of its own ahead of LowerSpyreOps, because that
-// position is after RewriteDescriptorLayoutGeneric, which physicalizes only the
-// generics one hop off an annotated load or store: the call site's FIRST generic
-// then iterates the physical space while its result stays logical, behind a
-// linearizing result map, and elementwise fusion requires a producer's result
-// map to be a permutation -- so its generics can no longer become one body. Fused
-// here, the call site is one generic before the layout rewrite and is physicalized
-// whole.
+// Here and not in a pass of its own ahead of LowerSpyreIntrinsicCalls, because
+// that position is after RewriteDescriptorLayoutGeneric, which physicalizes
+// only the generics one hop off an annotated load or store: the call site's
+// FIRST generic then iterates the physical space while its result stays
+// logical, behind a linearizing result map, and elementwise fusion requires a
+// producer's result map to be a permutation -- so its generics can no longer
+// become one body. Fused here, the call site is one generic before the layout
+// rewrite and is physicalized whole.
 //
 // The first half is the bulk of this file. Three parts, separable on purpose --
 //
@@ -350,7 +351,8 @@ bool isUnrepresentableIntermediate(OpOperand *fusedOperand) {
 ///
 /// Not gated on hasOneUse, like the other two: a producer of a call site read
 /// by two consumers of the same call site is fused into each, which duplicates
-/// part of the fallback inside the one body LowerSpyreOps then replaces whole.
+/// part of the fallback inside the one body LowerSpyreIntrinsicCalls then
+/// replaces whole.
 bool producerAndConsumerShareCallSite(OpOperand *fusedOperand) {
   auto callSite = [](Operation *op) -> DictionaryAttr {
     auto generic = dyn_cast_or_null<linalg::GenericOp>(op);

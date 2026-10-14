@@ -415,8 +415,8 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
 
   // The `tts.spyre_intrinsic` attribute is written by one pass, LowerTTSMarkers, and READ by two
   // in `spyrecode` -- FuseComputeAndDataMovement groups bodies by the hint's
-  // `id`, and LowerSpyreOps builds the op its `target` names from the call
-  // operands its `operands` bind. So what one op can show is checked here, which
+  // `id`, and LowerSpyreIntrinsicCalls builds the op its `target` names from
+  // the call operands its `operands` bind. So what one op can show is checked here, which
   // is what lets getSpyreIntrinsic hand those readers a dictionary they need not
   // re-check: the three required fields, each of its type, an optional
   // `operands` of the op's own operand count with every entry a call operand
@@ -424,7 +424,7 @@ LogicalResult TTSDialect::verifyOperationAttribute(Operation *op,
   // is not a constant, which LowerTTSMarkers never hints. Nothing about other ops
   // -- an `id` being unique, a call site being whole, its ops agreeing on
   // `target` and `arity`, every call operand being bound -- is checkable from one
-  // op; FuseComputeAndDataMovement and LowerSpyreOps check those.
+  // op; FuseComputeAndDataMovement and LowerSpyreIntrinsicCalls check those.
   if (name == kSpyreIntrinsicAttrName) {
     auto hint = dyn_cast<DictionaryAttr>(attribute.getValue());
     auto target =

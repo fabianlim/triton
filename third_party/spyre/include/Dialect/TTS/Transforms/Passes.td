@@ -112,7 +112,7 @@ def LowerTTSMarkers : Pass<"lower-tts-markers", "mlir::ModuleOp"> {
         a ktdp op, which is the form [RewriteDescriptorLayoutGeneric] reads, and
         the pin on a compute op, for which no consumer is written yet, and the
         hint on each op a request inlined, which [FuseComputeAndDataMovement] and
-        [LowerSpyreOps] read. IR carrying no tts op is returned unchanged.
+        [LowerSpyreIntrinsicCalls] read. IR carrying no tts op is returned unchanged.
     }];
 
     // No dependentDialects: this pass constructs no op and no dialect

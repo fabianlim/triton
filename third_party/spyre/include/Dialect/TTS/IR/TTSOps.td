@@ -164,8 +164,8 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
     gets `operands`, per operand of that op the index of the call operand it is
     or -1: the call's operand order, which nothing after the inlining can
     recover. In `spyrecode`, FuseComputeAndDataMovement fuses the hinted ops of
-    one `id` into one body, and LowerSpyreOps replaces that body with the
-    target, applied to the inputs `operands` binds, in call order.
+    one `id` into one body, and LowerSpyreIntrinsicCalls replaces that body
+    with the target, applied to the inputs `operands` binds, in call order.
 
     WHICH TARGETS EXIST, and what each takes, is the frontend's registration
     (`backend/intrinsics.py`), not this dialect's: it checks that `target` is a
@@ -173,7 +173,7 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
     dtypes and the result type when the call is traced. The IR carries the
     target by name, so the checks below hold for hand-written IR too, and what
     is target-specific is checked once more by the target op's own verifier,
-    when LowerSpyreOps builds it.
+    when LowerSpyreIntrinsicCalls builds it.
 
       V1  this op's region verifier, while the op exists. What no later pass
           can change: `target` is a registered op; the block arguments have
@@ -194,13 +194,14 @@ def TTS_SpyreIntrinsicOp : TTS_Op<"spyre_intrinsic", [
           that body holds no other op but constants, and the ops of one `id`
           agree on `target` and `arity`. V1 is what guarantees the fusion, so a
           failure here is a compiler bug, reported as one.
-      V4  LowerSpyreOps: selection, which reads each call operand's input off
-          the members' `operands` -- refusing, by target and call operand, a
-          call operand bound to two different inputs, to none, or to anything
-          but an `ins` block argument -- builds the target and runs its
-          verifier; then one check, that no op still carries a
-          `tts.spyre_intrinsic` attribute. A request left unselected is an error naming the
-          target, since passing the fallback through would drop it silently.
+      V4  LowerSpyreIntrinsicCalls: selection, which reads each call
+          operand's input off the members' `operands` -- refusing, by target
+          and call operand, a call operand bound to two different inputs, to
+          none, or to anything but an `ins` block argument -- builds the target
+          and runs its verifier; then one check, that no op still carries a
+          `tts.spyre_intrinsic` attribute. A request left unselected is an
+          error naming the target, since passing the fallback through would
+          drop it silently.
 
     Constants carry no hint: passes create, merge and fold them freely, so one
     says nothing about its call site.

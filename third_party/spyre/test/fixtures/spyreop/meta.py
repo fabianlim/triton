@@ -97,7 +97,7 @@ reason is the same two facts read the other way round. ``ktir_cpu`` runs the
 checks that fallback against the mathematical definition -- which is a claim
 worth making, since the fallback is what every KTIR reader computes for the
 call site. They never reach ``spyrecode``, the fusion or the selection; those
-are pinned in lit (``Transforms/LowerSpyreOps/request.mlir``,
+are pinned in lit (``Transforms/LowerSpyreIntrinsicCalls/call-site.mlir``,
 ``spyre-triton-opt/stage-pipelines-spyre-intrinsic.mlir``) and in
 ``test_spyre_intrinsic.py``. By level:
 

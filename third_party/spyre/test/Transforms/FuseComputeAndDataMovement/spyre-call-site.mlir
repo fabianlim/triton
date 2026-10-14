@@ -1,8 +1,8 @@
 // RUN: spyre-triton-opt %s -split-input-file --convert-elementwise-to-linalg --fuse-compute-and-data-movement | FileCheck %s
 
 // The THIRD fusion clause: two generics whose bodies carry `tts.spyre_intrinsic`
-// tags of one `id` are one intrinsic request, and are fused into one body for LowerSpyreOps to
-// replace whole.
+// tags of one `id` are one intrinsic request, and are fused into one body for
+// LowerSpyreIntrinsicCalls to replace whole.
 //
 // The input is tensor-level, as LowerTTSMarkers leaves a request, and the RUN
 // line converts it first. That conversion is what puts each tagged tensor op's
