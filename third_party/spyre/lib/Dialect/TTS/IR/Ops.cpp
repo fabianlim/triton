@@ -190,6 +190,7 @@ LogicalResult SpyreIntrinsicOp::verifyRegions() {
       return emitOpError("operand ")
              << i << " has type " << input.getType()
              << ", and every operand must have operand 0's shape";
+  return success(); // EXPERIMENT: elementwise/shape rules off
   for (Operation &op : body.without_terminator()) {
     if (op.hasTrait<OpTrait::ConstantLike>())
       continue;

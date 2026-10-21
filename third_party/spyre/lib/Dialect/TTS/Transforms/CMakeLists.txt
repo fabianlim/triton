@@ -31,6 +31,8 @@ add_triton_library(TTSTransforms
   TTSIR
   KTDPUtils
   KTIR::KtdpDialect
+  MLIRLinalgDialect
+  MLIRTensorDialect
   MLIRIR
   MLIRPass
 )

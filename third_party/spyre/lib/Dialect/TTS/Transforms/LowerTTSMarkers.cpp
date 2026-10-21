@@ -52,6 +52,9 @@
 #include "Dialect/TTS/IR/Dialect.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -369,6 +372,70 @@ static Attribute buildPinAttr(mlir::triton::tts::PinOp marker) {
 /// outcome: no op would carry the hint, and the request would vanish without
 /// a diagnostic. The canonicalizes before this pass are what reduce a body to
 /// that -- `x * 1.0` folds to `x` -- and they run inside the region.
+/// Whether `op` only initializes the accumulator of a reduction: a tensor.empty,
+/// or a linalg.fill of one, whose every user is a fill or the init of a
+/// linalg.reduce. Such an op is plumbing the reduce needs, not part of what the
+/// request computes, and DropReductionInitFill removes the fill later; like a
+/// constant it carries no tag.
+static bool isReductionInitializer(Operation &op) {
+  if (!isa<tensor::EmptyOp, linalg::FillOp>(op))
+    return false;
+  if (op.use_empty())
+    return false;
+  for (OpOperand &use : op.getResult(0).getUses()) {
+    Operation *user = use.getOwner();
+    if (auto reduce = dyn_cast<linalg::ReduceOp>(user)) {
+      if (reduce.isDpsInit(&use))
+        continue;
+      return false;
+    }
+    if (isa<linalg::FillOp>(user) && isReductionInitializer(*user))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+/// The tag for `op`, whose operand `j` is call operand `callOperand(j)` when that
+/// is non-negative: `common` alone when it reads no call operand, else `common`
+/// and the `operands` binding.
+static DictionaryAttr makeHint(Builder &builder, ArrayRef<NamedAttribute> common,
+                               ArrayRef<int64_t> operands) {
+  SmallVector<NamedAttribute, 4> entries(common);
+  if (llvm::any_of(operands, [](int64_t k) { return k >= 0; }))
+    entries.push_back(
+        builder.getNamedAttr(mlir::triton::tts::TTSDialect::kSpyreIntrinsicOperandsKey,
+                             builder.getDenseI64ArrayAttr(operands)));
+  return builder.getDictionaryAttr(entries);
+}
+
+/// Tags the ops of `reduce`'s combiner. A linalg.reduce is a named op, which
+/// linalg-generalize-named-ops rebuilds as a fresh generic: its body is moved
+/// across but its own attributes are not, so a tag on the reduce is lost there
+/// while a tag on a combiner op rides along, as a body op's does in an
+/// elementwise request. The region's arguments are the reduce's operands in
+/// order -- one element of each `ins`, then one of each `outs` -- so a combiner
+/// operand that is region argument `i` is call operand `callOperand[i]`, the
+/// binding of the reduce's own operand `i`.
+static void tagReduceCombiner(Builder &builder, linalg::ReduceOp reduce,
+                              ArrayRef<NamedAttribute> common,
+                              ArrayRef<int64_t> callOperand) {
+  Block &combiner = reduce.getCombiner().front();
+  for (Operation &inner : combiner.without_terminator()) {
+    if (inner.hasTrait<OpTrait::ConstantLike>())
+      continue;
+    SmallVector<int64_t> operands;
+    for (Value v : inner.getOperands()) {
+      auto arg = dyn_cast<BlockArgument>(v);
+      operands.push_back(arg && arg.getOwner() == &combiner
+                             ? callOperand[arg.getArgNumber()]
+                             : -1);
+    }
+    inner.setAttr(mlir::triton::tts::TTSDialect::kSpyreIntrinsicAttrName,
+                  makeHint(builder, common, operands));
+  }
+}
+
 static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
   using mlir::triton::tts::SpyreIntrinsicOp;
   using mlir::triton::tts::TTSDialect;
@@ -420,7 +487,7 @@ static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
     Block &body = callSite.getBody().front();
     Operation *yield = body.getTerminator();
     for (Operation &op : body.without_terminator()) {
-      if (op.hasTrait<OpTrait::ConstantLike>())
+      if (op.hasTrait<OpTrait::ConstantLike>() || isReductionInitializer(op))
         continue;
       SmallVector<int64_t> operands;
       bool readsCallOperand = false;
@@ -433,16 +500,10 @@ static LogicalResult inlineSpyreIntrinsicCallSites(ModuleOp module) {
           operands.push_back(-1);
         }
       }
-      if (!readsCallOperand) {
-        op.setAttr(TTSDialect::kSpyreIntrinsicAttrName, hint);
-        continue;
-      }
-      SmallVector<NamedAttribute, 4> entries(common);
-      entries.push_back(
-          builder.getNamedAttr(TTSDialect::kSpyreIntrinsicOperandsKey,
-                               builder.getDenseI64ArrayAttr(operands)));
       op.setAttr(TTSDialect::kSpyreIntrinsicAttrName,
-                 builder.getDictionaryAttr(entries));
+                 readsCallOperand ? makeHint(builder, common, operands) : hint);
+      if (auto reduce = dyn_cast<linalg::ReduceOp>(op))
+        tagReduceCombiner(builder, reduce, common, operands);
     }
 
     for (auto [arg, operand] :

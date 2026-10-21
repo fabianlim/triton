@@ -47,6 +47,8 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
@@ -262,6 +264,52 @@ FailureOr<CallSiteMatch> matchCallSite(linalg::GenericOp generic,
 /// The `tts` attributes of the op whose value was yielded move to the target,
 /// the hint aside: that op produced the call site's result, so a `tts.pin` on
 /// the result is on it.
+/// The result type `target` gives operands of `operands`' types, when the op
+/// infers its own -- the fused spyreop ops do, from the element type of their
+/// operand -- and `fallback` otherwise.
+Type inferResultType(MLIRContext *ctx, Location loc, StringRef target,
+                     ArrayRef<BlockArgument> operands, Type fallback) {
+  std::optional<RegisteredOperationName> info =
+      RegisteredOperationName::lookup(target, ctx);
+  if (!info)
+    return fallback;
+  auto *infer = info->getInterface<InferTypeOpInterface>();
+  if (!infer)
+    return fallback;
+  SmallVector<Value> values(operands.begin(), operands.end());
+  SmallVector<Type> inferred;
+  if (failed(infer->inferReturnTypes(ctx, loc, values, DictionaryAttr(),
+                                     OpaqueProperties(nullptr), RegionRange(),
+                                     inferred)) ||
+      inferred.size() != 1)
+    return fallback;
+  return inferred.front();
+}
+
+/// Rebuilds `generic` with its one `outs` tensor holding elements of
+/// `elementType`, moving the body across. The yielded value must already have
+/// that type; the `outs` block argument takes it.
+linalg::GenericOp retypeOuts(RewriterBase &rewriter, linalg::GenericOp generic,
+                             Type elementType) {
+  OpOperand *init = generic.getDpsInitOperand(0);
+  auto oldType = cast<RankedTensorType>(init->get().getType());
+  auto newType = RankedTensorType::get(oldType.getShape(), elementType);
+  rewriter.setInsertionPoint(generic);
+  Value newInit =
+      tensor::EmptyOp::create(rewriter, generic.getLoc(), newType.getShape(),
+                              elementType);
+  auto rebuilt = linalg::GenericOp::create(
+      rewriter, generic.getLoc(), TypeRange{newType}, generic.getInputs(),
+      ValueRange{newInit}, generic.getIndexingMapsArray(),
+      generic.getIteratorTypesArray());
+  rebuilt->setDiscardableAttrs(generic->getDiscardableAttrDictionary());
+  rewriter.inlineRegionBefore(generic.getRegion(), rebuilt.getRegion(),
+                              rebuilt.getRegion().begin());
+  rebuilt.getBlock()->getArgument(generic.getNumDpsInputs()).setType(elementType);
+  rewriter.replaceOp(generic, rebuilt.getResults());
+  return rebuilt;
+}
+
 void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
                     const CallSiteMatch &match) {
   StringRef target = triton::tts::getSpyreIntrinsicTarget(match.hint);
@@ -272,9 +320,11 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
   Value result = yield->getOperand(0);
   rewriter.setInsertionPoint(yield);
+  Type resultType = inferResultType(generic.getContext(), result.getLoc(),
+                                    target, match.inputs, result.getType());
   OperationState state(result.getLoc(), target);
   state.addOperands(ArrayRef<BlockArgument>(match.inputs));
-  state.addTypes(result.getType());
+  state.addTypes(resultType);
   Operation *selected = rewriter.create(state);
   if (failed(mlir::verify(selected))) {
     rewriter.eraseOp(selected);
@@ -290,6 +340,8 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   // Reverse program order, so each op's users are gone before it is.
   for (Operation *op : llvm::reverse(match.members))
     rewriter.eraseOp(op);
+  if (resultType != result.getType())
+    retypeOuts(rewriter, generic, resultType);
 }
 
 /// Selection: every body that is one call site becomes its target.

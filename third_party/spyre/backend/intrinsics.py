@@ -44,6 +44,14 @@ import triton
 import triton.language as tl
 
 
+def _as_tuple(value):
+    """``value`` as a tuple: a single item becomes a one-element tuple, a sequence
+    is taken as it is."""
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    return (value, )
+
+
 def target_name(target):
     """``target`` as an op name: a string as given, or the ``OPERATION_NAME`` of
     an MLIR Python op class such as ``mlir_ktdp.dialects.spyreop.Sigmoid``."""
@@ -89,13 +97,14 @@ class Intrinsic:
     fallback: Callable
     arity: int
     dtypes: Tuple[tl.dtype, ...]
+    reduce_axes: Tuple[int, ...] = ()  # EXPERIMENT
 
 
 #: Target name -> Intrinsic, filled by ``register_intrinsic``.
 REGISTRY = {}
 
 
-def register_intrinsic(target, *, dtypes):
+def register_intrinsic(target, *, dtypes, reduce_axes=()):
     """Register the decorated ``@triton.jit`` function as the fallback for the op
     ``target``, taking operands of ``dtypes`` and returning operand 0's type.
     Raises on a target that is not a registered op, and on one that already has
@@ -120,6 +129,7 @@ def register_intrinsic(target, *, dtypes):
             fallback=fallback,
             arity=len(fallback.arg_names),
             dtypes=dtypes,
+            reduce_axes=_as_tuple(reduce_axes),
         )
         return fallback
 

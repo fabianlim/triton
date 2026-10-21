@@ -2143,6 +2143,10 @@ class TritonSemantic(Generic[TensorTy]):
                                  f"{[d.name for d in entry.dtypes]}, not {a.type.scalar.name}")
         # The result is operand 0's type, for every target.
         result_types = [args[0].type]
+        if getattr(entry, "reduce_axes", ()):  # EXPERIMENT
+            a0 = args[0].type
+            shp = [d for i, d in enumerate(a0.shape) if i not in entry.reduce_axes]
+            result_types = [tl.block_type(a0.scalar, shp)]
 
         # Built empty, then traced into: a region belongs to an op, so the op has
         # to exist first -- and that is why its result type is fixed beforehand
