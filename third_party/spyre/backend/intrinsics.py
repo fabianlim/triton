@@ -157,3 +157,12 @@ def silu(x):
 def sigmoid(x):
     xf = x.to(tl.float32)
     return (1.0 / (1.0 + tl.exp(-xf))).to(x.dtype)
+
+
+@register_intrinsic("spyreop.layernormnorm", dtypes=(tl.float16, tl.float32))
+@triton.jit
+def layernormnorm(x, mean, scale, weight, bias):
+    # The value less its mean, scaled, then weighted and shifted.
+    xf = x.to(tl.float32)
+    out = (xf - mean.to(tl.float32)) * scale.to(tl.float32) * weight.to(tl.float32) + bias.to(tl.float32)
+    return out.to(x.dtype)
