@@ -40,6 +40,8 @@
 #include "Transforms/Passes.h"
 
 #include "Dialect/TTS/IR/Dialect.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -310,6 +312,93 @@ linalg::GenericOp retypeOuts(RewriterBase &rewriter, linalg::GenericOp generic,
   return rebuilt;
 }
 
+/// The fused pair of \p scalar: fp16_fused for f16, fp32_fused for f32,
+/// df16_fused for df16, or null. The one relation under which a memory view's
+/// element is retyped: each element's bytes hold the pair a fused op writes or
+/// reads.
+Type fusedPairOf(Type scalar) {
+  MLIRContext *ctx = scalar.getContext();
+  if (isa<Float16Type>(scalar))
+    return spyreop::FP16FusedType::get(ctx);
+  if (isa<Float32Type>(scalar))
+    return spyreop::FP32FusedType::get(ctx);
+  if (isa<spyreop::DF16Type>(scalar))
+    return spyreop::DF16FusedType::get(ctx);
+  return nullptr;
+}
+
+/// Retypes the memory view under \p accessTile so its element is \p fused.
+/// Only when the tile is a ktdp.construct_access_tile of a
+/// ktdp.construct_memory_view, the tile has one use, and the view's element is
+/// the scalar \p fused is the pair of. A view with other users is cloned for
+/// this tile and the clone retyped, so the others read it as they did: two
+/// identical descriptors of one buffer come to one view, and their reads may
+/// want the bytes as different types. A view already holding \p fused succeeds
+/// unchanged. The access tile's own type carries no element, so it is not
+/// retyped.
+LogicalResult retypeViewUnder(OpBuilder &builder, Value accessTile,
+                              Type fused) {
+  auto tile = accessTile.getDefiningOp<ktdp::ConstructAccessTilesOp>();
+  if (!tile || !tile->hasOneUse())
+    return failure();
+  auto view = tile.getBase().getDefiningOp<ktdp::ConstructMemoryViewOp>();
+  if (!view)
+    return failure();
+  MemRefType viewType = view.getResult().getType();
+  if (viewType.getElementType() == fused)
+    return success();
+  if (fusedPairOf(viewType.getElementType()) != fused)
+    return failure();
+  if (!view.getResult().hasOneUse()) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(view);
+    view = cast<ktdp::ConstructMemoryViewOp>(builder.clone(*view));
+    tile.getBaseMutable().set(view.getResult());
+  }
+  view.getResult().setType(MemRefType::get(viewType.getShape(), fused,
+                                           viewType.getLayout(),
+                                           viewType.getMemorySpace()));
+  return success();
+}
+
+/// Retypes the views \p result is stored into so their element is \p fused,
+/// the element type selection gave \p result. Each ktdp.store of \p result
+/// goes through retypeViewUnder; one it refuses is reported.
+LogicalResult retypeStoredViews(OpBuilder &builder, Value result, Type fused) {
+  for (Operation *user : result.getUsers()) {
+    auto store = dyn_cast<ktdp::StoreOp>(user);
+    if (!store)
+      continue;
+    if (failed(retypeViewUnder(builder, store.getAccessTile(), fused)))
+      return store.emitError()
+             << "lower-spyre-intrinsic-calls: a " << fused
+             << " result is stored through a view that cannot be retyped to "
+                "it: not one access tile of one memory view, or not of the "
+                "scalar " << fused << " is the pair of";
+  }
+  return success();
+}
+
+/// Retypes the chain block argument \p arg of \p generic is read through so its
+/// element is the fused pair of the one it has: the memory view, through
+/// retypeViewUnder, then the ktdp.load and the block argument. Only when the
+/// operand's defining op is a ktdp.load with this one use; anything else is
+/// left alone and fails.
+LogicalResult retypeLoadedView(OpBuilder &builder, linalg::GenericOp generic,
+                               BlockArgument arg) {
+  auto load =
+      generic.getMatchingOpOperand(arg)->get().getDefiningOp<ktdp::LoadOp>();
+  if (!load || !load.getResult().hasOneUse())
+    return failure();
+  auto loaded = cast<RankedTensorType>(load.getResult().getType());
+  Type fused = fusedPairOf(loaded.getElementType());
+  if (!fused || failed(retypeViewUnder(builder, load.getAccessTile(), fused)))
+    return failure();
+  load.getResult().setType(RankedTensorType::get(loaded.getShape(), fused));
+  arg.setType(fused);
+  return success();
+}
+
 void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
                     const CallSiteMatch &match) {
   StringRef target = triton::tts::getSpyreIntrinsicTarget(match.hint);
@@ -321,7 +410,20 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   Value result = yield->getOperand(0);
   rewriter.setInsertionPoint(yield);
   Type resultType = inferResultType(generic.getContext(), result.getLoc(),
-                                    target, match.inputs, result.getType());
+                                    target, match.inputs, Type());
+  // A target that infers no result from these operands but does from their
+  // fused pairs reads a fused value: the operands loaded from memory are
+  // retyped along their load chain, and the result inferred again.
+  if (!resultType) {
+    bool retyped = false;
+    for (BlockArgument arg : match.inputs)
+      retyped |= succeeded(retypeLoadedView(rewriter, generic, arg));
+    if (retyped)
+      resultType = inferResultType(generic.getContext(), result.getLoc(),
+                                   target, match.inputs, Type());
+  }
+  if (!resultType)
+    resultType = result.getType();
   OperationState state(result.getLoc(), target);
   state.addOperands(ArrayRef<BlockArgument>(match.inputs));
   state.addTypes(resultType);
@@ -340,8 +442,10 @@ void selectCallSite(RewriterBase &rewriter, linalg::GenericOp generic,
   // Reverse program order, so each op's users are gone before it is.
   for (Operation *op : llvm::reverse(match.members))
     rewriter.eraseOp(op);
-  if (resultType != result.getType())
-    retypeOuts(rewriter, generic, resultType);
+  if (resultType != result.getType()) {
+    linalg::GenericOp rebuilt = retypeOuts(rewriter, generic, resultType);
+    (void)retypeStoredViews(rewriter, rebuilt.getResult(0), resultType);
+  }
 }
 
 /// Selection: every body that is one call site becomes its target.

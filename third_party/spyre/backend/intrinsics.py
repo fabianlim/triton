@@ -176,3 +176,19 @@ def layernormnorm(x, mean, scale, weight, bias):
     xf = x.to(tl.float32)
     out = (xf - mean.to(tl.float32)) * scale.to(tl.float32) * weight.to(tl.float32) + bias.to(tl.float32)
     return out.to(x.dtype)
+
+
+@register_intrinsic("spyreop.exx2_fused", dtypes=(tl.float16, ), reduce_axes=1)
+@triton.jit
+def exx2_fused(x):
+    # The sum over the reduced axis, standing in for the fused pair -- the mean
+    # and the mean of the squares -- which has no tl type.
+    return tl.sum(x, axis=1)
+
+
+@register_intrinsic("spyreop.layernormscale_fused", dtypes=(tl.float16, ))
+@triton.jit
+def layernormscale_fused(pair):
+    # The fused pair, the mean and the mean of the squares, has no tl type: the
+    # operand stands in for it. One op, so the request has a body to carry it.
+    return tl.sqrt(pair)

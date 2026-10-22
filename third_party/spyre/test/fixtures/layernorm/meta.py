@@ -134,6 +134,22 @@ def run_norm(inputs: dict) -> np.ndarray:
     return ((x - mean) / np.sqrt(var + np.float32(DEVICE_EPS)) * w + b).astype(np.float16)
 
 
+def make_inputs_intrinsics(M, N, S, **_unused) -> dict:
+    """``[M, N]`` in, a ``[1, N]`` weight and bias, a zeroed ``[M, N]`` output, and
+    the two stick-wide buffers the groups chain through: the fused pair and the
+    scale, each ``[M, S]``."""
+    rng = np.random.default_rng(seed=0)
+    w_rng = np.random.default_rng(seed=1)
+    return {
+        "x_ptr":      rng.standard_normal((M, N)).astype(np.float16),
+        "weight_ptr": (1.0 + 0.25 * w_rng.standard_normal((1, N))).astype(np.float16),
+        "bias_ptr":   (0.5 * w_rng.standard_normal((1, N))).astype(np.float16),
+        "out_ptr":    np.zeros((M, N), dtype=np.float16),
+        "pair_ptr":   np.zeros((M, S), dtype=np.float16),
+        "scale_ptr":  np.zeros((M, S), dtype=np.float16),
+    }
+
+
 VARIANTS = {
     "default": {
         "tags": ["descriptor-load-static", "descriptor-store-static", "reduce", "broadcast"],
@@ -222,6 +238,34 @@ VARIANTS = {
         "output_key":  "out_ptr",
         # The output is O(1); the bound carries the scale's fp16 error through
         # the normalisation.
+        "rtol":        5e-2,
+        "atol":        5e-2,
+    },
+    "intrinsics": {
+        "base": None,
+        "tags": ["descriptor-load-static", "descriptor-store-static", "reduce",
+                 "broadcast", "spyre-tensor-layout", "hbm-round-trip",
+                 "spyre-intrinsic"],
+        "summary": (
+            "A whole LayerNorm per row in three compute groups, each the device's "
+            "own op: exx2_fused, layernormscale_fused and layernormnorm."
+        ),
+        "kernel_fn":  kernel.layernorm_intrinsics,
+        "SIGNATURE":  {"x_ptr": "*fp16", "weight_ptr": "*fp16", "bias_ptr": "*fp16",
+                       "out_ptr": "*fp16", "pair_ptr": "*fp16", "scale_ptr": "*fp16",
+                       "M": "constexpr", "N": "constexpr", "S": "constexpr",
+                       "TILE_LAYOUT": "constexpr", "STAT_LAYOUT": "constexpr"},
+        "constexpr":  ["M", "N", "S", "TILE_LAYOUT", "STAT_LAYOUT"],
+        "params": {
+            ("DTYPE", "S", "TILE_LAYOUT", "STAT_LAYOUT"): [_row_mean("fp16")],
+            "M": [48],
+            "N": [2048],
+        },
+        "grid":        [1],
+        "compiles_to_binary": True,
+        "reference":   run_norm,
+        "inputs":      make_inputs_intrinsics,
+        "output_key":  "out_ptr",
         "rtol":        5e-2,
         "atol":        5e-2,
     },

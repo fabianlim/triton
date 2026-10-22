@@ -212,3 +212,64 @@ def layernorm_norm(
     w9 = tl.broadcast_to(w_d.load([0, 0]), [M, N])
     b9 = tl.broadcast_to(b_d.load([0, 0]), [M, N])
     out_d.store([0, 0], tl.spyre_intrinsic("spyreop.layernormnorm", x9, m9, s9, w9, b9))
+
+
+@triton.jit
+def layernorm_intrinsics(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    pair_ptr,
+    scale_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    S: tl.constexpr,
+    TILE_LAYOUT: tl.constexpr,
+    STAT_LAYOUT: tl.constexpr,
+):
+    """A whole LayerNorm per row of an ``[M, N]`` input in three compute groups,
+    each requested as the device's own op:
+
+        1  exx2_fused             the mean and the mean of the squares, fused
+                                  into one value per row, stored across a stick
+        2  layernormscale_fused   one over the root of the variance, from the
+                                  pair read back as lane 0 of its stick, stored
+                                  stick-wide
+        3  layernormnorm          (x - mean) * scale * weight + bias
+
+    ``x`` is logical ``[M, N]``; the stick layout on N makes it physical
+    ``[N / S, M, S]``. Group 3 reads the mean through a third view of the pair
+    buffer, as ``f16``: the mean is the first element of each stick. The weight
+    and the bias are ``[1, N]`` rows read through the tile's stick layout and
+    spread down the rows.
+    """
+    x_d = tl.make_tensor_descriptor(x_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+    w_d = tl.make_tensor_descriptor(weight_ptr, shape=[1, N], strides=[N, 1], block_shape=[1, N])
+    b_d = tl.make_tensor_descriptor(bias_ptr, shape=[1, N], strides=[N, 1], block_shape=[1, N])
+    out_d = tl.make_tensor_descriptor(out_ptr, shape=[M, N], strides=[N, 1], block_shape=[M, N])
+    pair_w = tl.make_tensor_descriptor(pair_ptr, shape=[M], strides=[1], block_shape=[M])
+    pair_r = tl.make_tensor_descriptor(pair_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1])
+    mean_r = tl.make_tensor_descriptor(pair_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1])
+    scale_w = tl.make_tensor_descriptor(scale_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, S])
+    scale_r = tl.make_tensor_descriptor(scale_ptr, shape=[M, S], strides=[S, 1], block_shape=[M, 1])
+    tl.spyre_tensor_layout(x_d, TILE_LAYOUT)
+    tl.spyre_tensor_layout(w_d, TILE_LAYOUT)
+    tl.spyre_tensor_layout(b_d, TILE_LAYOUT)
+    tl.spyre_tensor_layout(out_d, TILE_LAYOUT)
+    tl.spyre_tensor_layout(pair_w, STAT_LAYOUT)
+
+    # G1: the fused statistics, a request.
+    pair_w.store([0], tl.spyre_intrinsic("spyreop.exx2_fused", x_d.load([0, 0])))
+
+    # G2: the scale, a request on the pair read back.
+    pair = tl.broadcast_to(pair_r.load([0, 0]), [M, S])
+    scale_w.store([0, 0], tl.spyre_intrinsic("spyreop.layernormscale_fused", pair))
+
+    # G3: the normalisation, a request.
+    x3 = x_d.load([0, 0])
+    m3 = tl.broadcast_to(mean_r.load([0, 0]), [M, N])
+    s3 = tl.broadcast_to(scale_r.load([0, 0]), [M, N])
+    w3 = tl.broadcast_to(w_d.load([0, 0]), [M, N])
+    b3 = tl.broadcast_to(b_d.load([0, 0]), [M, N])
+    out_d.store([0, 0], tl.spyre_intrinsic("spyreop.layernormnorm", x3, m3, s3, w3, b3))
