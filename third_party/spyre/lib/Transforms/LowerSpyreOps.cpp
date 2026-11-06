@@ -103,11 +103,10 @@
 //   body, so each is the exception above rather than a pass-through --
 //   rejectSurvivingBooleans reports it here, naming the predicate.
 //
-// `--debug-only=lower-spyre-ops` traces the decisions of the rules with a
-// reader rather than the control flow: one line per candidate looked at and
-// what came of it, with each rule's reason when none matched. The rules
-// without readers say nothing, save the reciprocal when it fires -- the output
-// IR shows whether one did.
+// `--debug-only=lower-spyre-ops` traces the decisions rather than the control
+// flow: one line per rule that fires, and for the rules with a reader, one
+// line per candidate none of them lowers, with each rule's reason. A rule
+// without readers that declines says nothing -- the output IR shows it.
 //
 //===----------------------------------------------------------------------===//
 
@@ -168,8 +167,8 @@ namespace {
 /// A candidate in a body that no rule with a reader lowers is traced once, by
 /// the last such rule on its anchor in the table, with every rule's reason
 /// (matchLowerableGroup). The driver tries every pattern on an op before giving
-/// up on it, so that rule runs whenever all of them decline. A rule without
-/// readers says nothing -- the output IR shows whether it fired.
+/// up on it, so that rule runs whenever all of them decline. Every rule traces
+/// when it fires; a rule without readers that declines says nothing.
 ///
 /// A declined compare read in the body is then reported by
 /// rejectSurvivingBooleans.
@@ -203,9 +202,10 @@ struct LowerByRule : public RewritePattern {
     }
 
     Operation *last = rule.readers.empty() ? root : candidate.readers.front();
-    SmallVector<Value> operands(root->getOperands());
-    if (!rule.readers.empty())
-      llvm::append_range(operands, last->getOperands());
+    SmallVector<Value> operands = triton::spyre::ruleOperands(rule, candidate);
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
+                            << root->getLoc() << ": lowered by the "
+                            << rule.name << " rule\n");
     rewriter.setInsertionPoint(last);
     Value replacement = rule.build(rewriter, candidate, operands);
     rewriter.replaceOp(last, replacement);
@@ -298,14 +298,21 @@ LogicalResult rejectSurvivingBooleans(ModuleOp mod) {
               << readers.size()
               << " ops, and a compare is lowered only together with exactly "
                  "one reader";
-        else if (spyrePredicateFor(cmp.getPredicate()))
+        else if (spyrePredicateFor(cmp.getPredicate())) {
+          // The rules' own reasons, the type probe's among them, say what
+          // about the reader they refused.
+          std::string why;
+          (void)triton::spyre::matchLowerableGroup(
+              GroupCandidate{cmp, generic, readers.takeVector()}, &why);
           diag.attachNote(cmp.getLoc())
               << "the predicate '" << pred
               << "' does have a spyreop.compare counterpart, so this compare "
                  "was selectable and something about its READER was not: the "
                  "reader must be an arith.uitofp to, or an arith.select of, "
-                 "the width compared, and that width must be f16 or f32";
-        else
+                 "the width compared, at a type the spyreop op takes; the "
+                 "rules with a reader declined because "
+              << why;
+        } else
           diag.attachNote(cmp.getLoc())
               << "the predicate '" << pred
               << "' has no spyreop.compare counterpart: `ord` and `uno` "

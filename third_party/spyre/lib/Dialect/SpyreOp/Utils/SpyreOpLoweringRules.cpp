@@ -4,8 +4,9 @@
 // fuses for, and the guards and builds its entries name. See
 // SpyreOpLoweringRules.h.
 //
-// A new rule is one guard, one build function and one entry in
-// kSpyreOpLoweringRules, with no new pattern in either pass.
+// A new rule is one build function and one entry in kSpyreOpLoweringRules,
+// plus a guard when it has a condition no verifier sees, with no new pattern
+// in either pass.
 //
 // NO NaN REACHES A COMPUTE BODY. Every rule assumes it, which lets a group:
 //
@@ -14,22 +15,26 @@
 //   - drop a zero test in front of a select, e.g. `select(m != 0, p, q)` ->
 //     `spyreop.select %m, %p, %q`.
 //
-// The builds trace under `--debug-only=lower-spyre-ops`, the pass that runs
-// them.
+// NO RULE CHECKS A TYPE. Which types a rule lowers is what the spyreop ops it
+// builds accept: ruleMatches runs the rule's build into a scratch block whose
+// arguments have the operands' types (probeBuild), verifies every op it made
+// against that op's own definition, and erases them. A rule whose ops do not
+// verify does not match, so two rules on one anchor that build ops of
+// different types, such as addi32 and addi64, need no guard to tell them
+// apart. A guard is left for what no verifier sees: a constant operand, or a
+// predicate's meaning.
 //
 //===----------------------------------------------------------------------===//
 
 #include "Dialect/SpyreOp/Utils/SpyreOpLoweringRules.h"
 
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-
-#define DEBUG_TYPE "lower-spyre-ops"
 
 using namespace mlir;
 
@@ -38,10 +43,6 @@ namespace mlir::triton::spyre {
 //===----------------------------------------------------------------------===//
 // Shared questions
 //===----------------------------------------------------------------------===//
-
-bool isSpyreOpScalarType(Type type) {
-  return isa<Float16Type, Float32Type>(type);
-}
 
 std::optional<spyreop::ComparePredicate>
 spyrePredicateFor(arith::CmpFPredicate p) {
@@ -75,70 +76,17 @@ template <typename OpT> constexpr StringLiteral opName() {
   return OpT::getOperationName();
 }
 
-void traceMatch(Operation *root, const llvm::Twine &what) {
-  LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] " << root->getName() << " at "
-                          << root->getLoc() << ": " << what << "\n");
-}
-
 //===----------------------------------------------------------------------===//
 // Guards
 //===----------------------------------------------------------------------===//
 
-/// The bit width of `type` if it is a scalar integer, or 0 otherwise -- e.g.
-/// for a not-yet-scalarized tensor of integers.
-unsigned getScalarIntBitWidth(Type type) {
-  auto intTy = dyn_cast<IntegerType>(type);
-  return intTy ? intTy.getWidth() : 0;
-}
-
-/// The unary float rules and realdiv: the result type has a spyreop float
-/// intrinsic.
-bool guardFloatResult(const GroupCandidate &candidate, std::string &why) {
-  if (isSpyreOpScalarType(candidate.anchor->getResult(0).getType()))
-    return true;
-  why = "no spyreop intrinsic for this result type";
-  return false;
-}
-
-/// The reciprocal: guardFloatResult, and the numerator is a scalar constant
-/// 1.0.
+/// The reciprocal: the numerator is a scalar constant 1.0.
 bool guardReciprocal(const GroupCandidate &candidate, std::string &why) {
-  if (!guardFloatResult(candidate, why))
-    return false;
   if (matchPattern(cast<arith::DivFOp>(candidate.anchor).getLhs(),
                    m_OneFloat()))
     return true;
   why = "the numerator is not 1.0";
   return false;
-}
-
-/// The integer rules: the result is an integer of `Width` bits.
-template <unsigned Width>
-bool guardIntegerWidth(const GroupCandidate &candidate, std::string &why) {
-  if (getScalarIntBitWidth(candidate.anchor->getResult(0).getType()) != Width) {
-    why = "the result is not an i" + std::to_string(Width);
-    return false;
-  }
-  return true;
-}
-
-/// The checks every compare rule makes: the reader's result type has a spyreop
-/// intrinsic, and the compared type is that same type. Records the first that
-/// fails in `why`.
-bool readsAtComparedWidth(const GroupCandidate &candidate, std::string &why) {
-  auto cmp = cast<arith::CmpFOp>(candidate.anchor);
-  Type resultType = candidate.readers.front()->getResult(0).getType();
-  if (!isSpyreOpScalarType(resultType)) {
-    why = "no spyreop intrinsic for this result type";
-    return false;
-  }
-  // Device comparison and selection require identical input and result types.
-  if (cmp.getLhs().getType() != resultType) {
-    why = "the compared type and the consumer's result type differ, which one "
-          "spyreop intrinsic cannot express";
-    return false;
-  }
-  return true;
 }
 
 std::string noCounterpart(arith::CmpFOp cmp) {
@@ -147,11 +95,9 @@ std::string noCounterpart(arith::CmpFOp cmp) {
       .str();
 }
 
-/// compare-cast and compare-select: readsAtComparedWidth, and the predicate
-/// has a spyreop.compare counterpart.
+/// compare-cast and compare-select: the predicate has a spyreop.compare
+/// counterpart.
 bool guardCompare(const GroupCandidate &candidate, std::string &why) {
-  if (!readsAtComparedWidth(candidate, why))
-    return false;
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   if (spyrePredicateFor(cmp.getPredicate()))
     return true;
@@ -200,11 +146,9 @@ std::optional<ZeroTestSelect> selectFromZeroTest(arith::CmpFOp cmp) {
   return std::nullopt;
 }
 
-/// compare-select-zero-test: readsAtComparedWidth, and the compare is a zero
-/// test spyreop.select performs itself (selectFromZeroTest).
+/// compare-select-zero-test: the compare is a zero test spyreop.select
+/// performs itself (selectFromZeroTest).
 bool guardZeroTest(const GroupCandidate &candidate, std::string &why) {
-  if (!readsAtComparedWidth(candidate, why))
-    return false;
   if (selectFromZeroTest(cast<arith::CmpFOp>(candidate.anchor)))
     return true;
   why = "the compare is not a zero test spyreop.select performs itself";
@@ -237,7 +181,6 @@ Value buildBinary(OpBuilder &b, const GroupCandidate &candidate,
 Value buildReciprocal(OpBuilder &b, const GroupCandidate &candidate,
                       ValueRange operands) {
   Operation *op = candidate.anchor;
-  traceMatch(op, "numerator is 1.0 -> spyreop.reciprocal");
   return spyreop::Reciprocal::create(b, op->getLoc(),
                                      op->getResult(0).getType(), operands[1]);
 }
@@ -254,9 +197,6 @@ Value buildCompareCast(OpBuilder &b, const GroupCandidate &candidate,
                        ValueRange operands) {
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   Operation *reader = candidate.readers.front();
-  traceMatch(cmp, llvm::Twine("arith.cmpf '") +
-                      arith::stringifyCmpFPredicate(cmp.getPredicate()) +
-                      "' + arith.uitofp -> spyreop.compare");
   return spyreop::Compare::create(b, reader->getLoc(),
                                   reader->getResult(0).getType(), operands[0],
                                   operands[1], comparePredicate(cmp));
@@ -271,10 +211,6 @@ Value buildZeroTestSelect(OpBuilder &b, const GroupCandidate &candidate,
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   Operation *select = candidate.readers.front();
   ZeroTestSelect zeroTest = *selectFromZeroTest(cmp);
-  traceMatch(cmp, llvm::Twine("arith.cmpf '") +
-                      arith::stringifyCmpFPredicate(cmp.getPredicate()) +
-                      "' tests against zero, which spyreop.select does to "
-                      "its own condition -> spyreop.select alone");
   // An opposite zero test reaches the same condition value, so the exchange
   // is what keeps it meaning the same thing.
   Value trueValue = operands[3], falseValue = operands[4];
@@ -294,10 +230,6 @@ Value buildCompareSelect(OpBuilder &b, const GroupCandidate &candidate,
   auto cmp = cast<arith::CmpFOp>(candidate.anchor);
   Operation *select = candidate.readers.front();
   Type selected = select->getResult(0).getType();
-  traceMatch(cmp, llvm::Twine("arith.cmpf '") +
-                      arith::stringifyCmpFPredicate(cmp.getPredicate()) +
-                      "' + arith.select -> spyreop.compare feeding "
-                      "spyreop.select");
   Value condition =
       spyreop::Compare::create(b, select->getLoc(), selected, operands[0],
                                operands[1], comparePredicate(cmp));
@@ -323,24 +255,24 @@ constexpr StringLiteral kSelectReader[] = {opName<arith::SelectOp>()};
 /// benefit orders only patterns rooted on the same op, so such an overlap
 /// would be decided by the order the driver visits ops.
 const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
-    {"sqrt", opName<math::SqrtOp>(), {}, 1, guardFloatResult,
+    {"sqrt", opName<math::SqrtOp>(), {}, 1, nullptr,
      buildUnary<spyreop::Sqrt>},
-    {"exp", opName<math::ExpOp>(), {}, 1, guardFloatResult,
+    {"exp", opName<math::ExpOp>(), {}, 1, nullptr,
      buildUnary<spyreop::Exp>},
-    {"rsqrt", opName<math::RsqrtOp>(), {}, 1, guardFloatResult,
+    {"rsqrt", opName<math::RsqrtOp>(), {}, 1, nullptr,
      buildUnary<spyreop::RSqrt>},
     {"reciprocal", opName<arith::DivFOp>(), {}, 2, guardReciprocal,
      buildReciprocal},
-    {"realdiv", opName<arith::DivFOp>(), {}, 1, guardFloatResult,
+    {"realdiv", opName<arith::DivFOp>(), {}, 1, nullptr,
      buildBinary<spyreop::RealDiv>},
     // The integer rules over-claim: an integer add or multiply in a body is
     // taken for compute, which `tl.arange(0, N) * stride` scalarized into a
     // body would not be.
-    {"addi32", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<32>,
+    {"addi32", opName<arith::AddIOp>(), {}, 1, nullptr,
      buildBinary<spyreop::AddI32ToI32>},
-    {"addi64", opName<arith::AddIOp>(), {}, 1, guardIntegerWidth<64>,
+    {"addi64", opName<arith::AddIOp>(), {}, 1, nullptr,
      buildBinary<spyreop::AddI64ToI64>},
-    {"muli32", opName<arith::MulIOp>(), {}, 1, guardIntegerWidth<32>,
+    {"muli32", opName<arith::MulIOp>(), {}, 1, nullptr,
      buildBinary<spyreop::MulI32ToI32>},
     {"compare-cast", opName<arith::CmpFOp>(), kUIToFPReader, 1, guardCompare,
      buildCompareCast},
@@ -350,7 +282,47 @@ const SpyreOpLoweringRule kSpyreOpLoweringRules[] = {
      buildCompareSelect},
 };
 
+/// Whether every op `rule.build` makes for `candidate` passes its own
+/// verifier, on operands of the types `operands` has. The build runs into a
+/// detached block whose arguments stand for `operands`, with a builder that
+/// notifies no rewriter, so no real IR is touched, and the block and every op
+/// in it are destroyed on return. The verifier's diagnostics are caught by a
+/// handler scoped to the check, and the first becomes `why`.
+bool probeBuild(const SpyreOpLoweringRule &rule,
+                const GroupCandidate &candidate, ValueRange operands,
+                std::string &why) {
+  MLIRContext *ctx = candidate.anchor->getContext();
+  Block scratch;
+  for (Value operand : operands)
+    scratch.addArgument(operand.getType(), operand.getLoc());
+  OpBuilder builder(ctx);
+  builder.setInsertionPointToEnd(&scratch);
+  rule.build(builder, candidate, scratch.getArguments());
+
+  std::string diagnostic;
+  ScopedDiagnosticHandler handler(ctx, [&](Diagnostic &diag) {
+    if (diagnostic.empty())
+      diagnostic = diag.str();
+    return success();
+  });
+  for (Operation &op : scratch)
+    if (failed(verify(&op, /*verifyRecursively=*/false))) {
+      why = "'" + op.getName().getStringRef().str() +
+            "' does not take these types: " + diagnostic;
+      return false;
+    }
+  return true;
+}
+
 } // namespace
+
+SmallVector<Value> ruleOperands(const SpyreOpLoweringRule &rule,
+                                const GroupCandidate &candidate) {
+  SmallVector<Value> operands(candidate.anchor->getOperands());
+  if (!rule.readers.empty())
+    llvm::append_range(operands, candidate.readers.front()->getOperands());
+  return operands;
+}
 
 ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules() {
   return kSpyreOpLoweringRules;
@@ -381,7 +353,9 @@ bool ruleMatches(const SpyreOpLoweringRule &rule,
             "', is not an " + name.str();
       return false;
     }
-  return !rule.guard || rule.guard(candidate, why);
+  if (rule.guard && !rule.guard(candidate, why))
+    return false;
+  return probeBuild(rule, candidate, ruleOperands(rule, candidate), why);
 }
 
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,

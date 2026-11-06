@@ -19,9 +19,12 @@
 // does not lower it, and the `i1` left behind is reported by whichever pass
 // holds it.
 //
-// The remaining exports are the questions the rules share with LowerSpyreOps'
-// diagnostics: which scalar types the float intrinsics take, and which spyreop
-// predicate a cmpf predicate maps to.
+// No rule states which types it lowers. A rule matches only when every spyreop
+// op its build makes verifies on the candidate's operand types (ruleMatches),
+// so the types are the ones each spyreop op's own definition accepts.
+//
+// The remaining export is the question the rules share with LowerSpyreOps'
+// diagnostics: which spyreop predicate a cmpf predicate maps to.
 //
 //===----------------------------------------------------------------------===//
 
@@ -61,7 +64,8 @@ struct GroupCandidate {
 ///
 /// A rule matches a candidate (ruleMatches) when the anchor is the `anchor`
 /// op, the candidate's readers match `readers` one for one -- any readers at
-/// all when `readers` is empty -- and `guard` holds.
+/// all when `readers` is empty -- `guard` holds, and every op `build` makes
+/// passes its own verifier.
 struct SpyreOpLoweringRule {
   /// The rule's name, e.g. "reciprocal" or "compare-select-zero-test": the
   /// pattern's debug name, and what a trace reports.
@@ -73,13 +77,17 @@ struct SpyreOpLoweringRule {
   ArrayRef<StringLiteral> readers;
   /// The order among the rules on one anchor: a higher benefit is tried first.
   PatternBenefit benefit;
-  /// The rule's own conditions on a candidate whose ops already match. Sets
-  /// `why` when it returns false.
+  /// The rule's own conditions on a candidate whose ops already match, about
+  /// what no verifier sees, such as a constant operand; null when there are
+  /// none. Never about types. Sets `why` when it returns false.
   bool (*guard)(const GroupCandidate &, std::string &why);
   /// Builds the spyreop ops at the builder's insertion point from `operands`,
   /// the anchor's operands followed by its readers', and returns the value
   /// that replaces the rule's last op: its reader, or the anchor when it lists
-  /// none.
+  /// none. Runs twice when a rule fires: once into a scratch block whose
+  /// arguments stand for `operands`, to verify what it makes, then at the
+  /// real position, and only after `guard` holds. So it reads the candidate
+  /// only for types and attributes, and its operands only from `operands`.
   Value (*build)(OpBuilder &, const GroupCandidate &, ValueRange operands);
 };
 
@@ -87,10 +95,17 @@ struct SpyreOpLoweringRule {
 ArrayRef<SpyreOpLoweringRule> spyreOpLoweringRules();
 
 /// Whether `rule` lowers `candidate`: its anchor is the rule's anchor op, its
-/// readers match the rule's one for one, and the guard holds. Sets `why` when
-/// it does not.
+/// readers match the rule's one for one, the guard holds, and every op
+/// `rule.build` makes from ruleOperands passes its own verifier. The build is
+/// tried in a detached block and destroyed, and the verifier's diagnostics are
+/// caught rather than reported. Sets `why` when it does not match.
 bool ruleMatches(const SpyreOpLoweringRule &rule,
                  const GroupCandidate &candidate, std::string &why);
+
+/// The values `rule.build` takes for `candidate`: the anchor's operands, then
+/// its reader's when the rule lists one.
+SmallVector<Value> ruleOperands(const SpyreOpLoweringRule &rule,
+                                const GroupCandidate &candidate);
 
 /// What matchLowerableGroup found: the rule, and which ops of the anchor's
 /// body the group consumes.
@@ -106,9 +121,6 @@ struct GroupMatch {
 /// when non-null, set to each such rule's reason.
 FailureOr<GroupMatch> matchLowerableGroup(const GroupCandidate &candidate,
                                           std::string *why = nullptr);
-
-/// Whether spyreop's scalar float intrinsics accept this operand type.
-bool isSpyreOpScalarType(Type type);
 
 /// The spyreop predicate computing the same thing as `p`, or nothing:
 ///
