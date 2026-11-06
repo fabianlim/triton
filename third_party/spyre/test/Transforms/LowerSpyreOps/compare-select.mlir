@@ -1,4 +1,5 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --canonicalize-generic-operands --lower-spyre-ops -split-input-file | FileCheck %s --check-prefix=CANON
 
 // Tests for the rule that turns `arith.cmpf` + `arith.select` into spyreop ops.
 //
@@ -375,13 +376,16 @@ func.func @oeq_left_zero_f16_scalar(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 
 // -----
 
-// Uniform zero is recognized on either side; the selected condition remains
-// the input element and equality exchanges the values. Negative zero is zero.
+// A splat zero passed as an `ins` operand, on either side: it reaches the rule
+// as a scalar in the body through CanonicalizeGenericOperands, so these cases
+// are checked on the CANON RUN line, which runs that pass first. The selected
+// condition remains the input element and equality exchanges the values.
+// Negative zero is zero.
 #map = affine_map<(d0) -> (d0)>
-// CHECK-LABEL: func.func @one_right_zero_f16_input(
-// CHECK: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[P]], %[[Q]] : f16
-// CHECK-NEXT: linalg.yield %[[S]] : f16
+// CANON-LABEL: func.func @one_right_zero_f16_input(
+// CANON: ^bb0(%[[M:.*]]: f16, %[[P:.*]]: f16, %[[Q:.*]]: f16, %{{.*}}: f16):
+// CANON-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[P]], %[[Q]] : f16
+// CANON-NEXT: linalg.yield %[[S]] : f16
 func.func @one_right_zero_f16_input(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: tensor<4xf16>) -> tensor<4xf16> {
     %zero = arith.constant dense<0.0> : tensor<4xf16>
     %init = tensor.empty() : tensor<4xf16>
@@ -397,13 +401,16 @@ func.func @one_right_zero_f16_input(%m: tensor<4xf16>, %p: tensor<4xf16>, %q: te
 
 // -----
 
-// Uniform zero is recognized on either side; the selected condition remains
-// the input element and equality exchanges the values. Negative zero is zero.
+// A splat zero passed as an `ins` operand, on either side: it reaches the rule
+// as a scalar in the body through CanonicalizeGenericOperands, so these cases
+// are checked on the CANON RUN line, which runs that pass first. The selected
+// condition remains the input element and equality exchanges the values.
+// Negative zero is zero.
 #map = affine_map<(d0) -> (d0)>
-// CHECK-LABEL: func.func @ueq_left_zero_f32_input(
-// CHECK: ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
-// CHECK-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[Q]], %[[P]] : f32
-// CHECK-NEXT: linalg.yield %[[S]] : f32
+// CANON-LABEL: func.func @ueq_left_zero_f32_input(
+// CANON: ^bb0(%[[M:.*]]: f32, %[[P:.*]]: f32, %[[Q:.*]]: f32, %{{.*}}: f32):
+// CANON-NEXT: %[[S:.*]] = spyreop.select %[[M]], %[[Q]], %[[P]] : f32
+// CANON-NEXT: linalg.yield %[[S]] : f32
 func.func @ueq_left_zero_f32_input(%m: tensor<4xf32>, %p: tensor<4xf32>, %q: tensor<4xf32>) -> tensor<4xf32> {
     %zero = arith.constant dense<-0.0> : tensor<4xf32>
     %init = tensor.empty() : tensor<4xf32>

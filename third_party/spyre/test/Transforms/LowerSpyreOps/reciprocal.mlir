@@ -1,30 +1,33 @@
 // RUN: spyre-triton-opt %s --lower-spyre-ops -split-input-file | FileCheck %s
+// RUN: spyre-triton-opt %s --canonicalize-generic-operands --lower-spyre-ops -split-input-file | FileCheck %s --check-prefix=CANON
 
 // `arith.divf` with a constant 1.0 numerator -> `spyreop.reciprocal`; any other
-// numerator -> `spyreop.realdiv`. One rule, SelectArithDivF, chooses between them.
+// numerator -> `spyreop.realdiv`. Two rules on `arith.divf`, the reciprocal
+// tried first.
 //
-// The case this file exists for is the FIRST one: the `1.0` is a splat `ins`
-// operand and the numerator in the body is a BLOCK ARGUMENT. Reading the operand
-// through the body is what sees it, and upstream's unused-operand erasure is what
-// takes the operand, its block argument and its indexing map away afterwards. So
-// this rule needs nothing to have folded the constant in first -- unlike the
-// compare rule, which does need its group brought into one body. This whole file
-// therefore runs --lower-spyre-ops alone.
+// The rule reads the numerator as the body holds it: a scalar 1.0 constant. A
+// splat `ins` operand reaches the body as a block argument, which the rule does
+// not look through; CanonicalizeGenericOperands' SplatOperandToScalar is what
+// turns it into a scalar in the body, so the splat 1.0 cases are checked on a
+// RUN line of their own that runs that pass first. Every other case is checked
+// with --lower-spyre-ops alone.
 //
 // `func.func`, not `tt.func`, because that is what this pass sees: it runs in the
 // `spyrecode` stage, long after ConvertFunctions.
 
 // THE SPLAT `ins` FORM -- `tl.full([M, S], 1.0)` as it actually arrives. Two `ins`
-// go in and one comes out, the constant gone entirely.
-// CHECK-LABEL:   func.func @recip_splat_ins(
-// CHECK-SAME:  %[[T:.*]]: tensor<4x1xf16>) -> tensor<4x1xf16> {
-// CHECK-NOT:       arith.constant
-// CHECK-NOT:       arith.divf
-// CHECK:           %[[E:.*]] = tensor.empty() : tensor<4x1xf16>
-// CHECK:           linalg.generic {{.*}} ins(%[[T]] : tensor<4x1xf16>) outs(%[[E]] : tensor<4x1xf16>)
-// CHECK:           ^bb0(%[[IN:.*]]: f16, %[[OUT:.*]]: f16):
-// CHECK:             %[[R:.*]] = spyreop.reciprocal %[[IN]] : f16
-// CHECK:             linalg.yield %[[R]] : f16
+// go in and one comes out, the constant gone entirely: CanonicalizeGenericOperands
+// puts the 1.0 into the body as a scalar, the rule reads it there, and the scalar
+// is then dead.
+// CANON-LABEL:   func.func @recip_splat_ins(
+// CANON-SAME:  %[[T:.*]]: tensor<4x1xf16>) -> tensor<4x1xf16> {
+// CANON-NOT:       arith.constant
+// CANON-NOT:       arith.divf
+// CANON:           %[[E:.*]] = tensor.empty() : tensor<4x1xf16>
+// CANON:           linalg.generic {{.*}} ins(%[[T]] : tensor<4x1xf16>) outs(%[[E]] : tensor<4x1xf16>)
+// CANON:           ^bb0(%[[IN:.*]]: f16, %[[OUT:.*]]: f16):
+// CANON:             %[[R:.*]] = spyreop.reciprocal %[[IN]] : f16
+// CANON:             linalg.yield %[[R]] : f16
 func.func @recip_splat_ins(%t: tensor<4x1xf16>) -> tensor<4x1xf16> {
   %splat = arith.constant dense<1.0> : tensor<4x1xf16>
   %init = tensor.empty() : tensor<4x1xf16>
@@ -44,9 +47,8 @@ func.func @recip_splat_ins(%t: tensor<4x1xf16>) -> tensor<4x1xf16> {
 // -----
 
 // THE HOISTED-SCALAR FORM -- the same kernel once something has folded the splat
-// into the body. Both forms reach the same result, which is what "reads the
-// operand through the body" buys: there is no operand to erase here, and the rule
-// does not care which case it is in.
+// into the body, which is the form the rule reads. There is no operand to erase
+// here.
 // CHECK-LABEL:   func.func @recip_hoisted_scalar(
 // CHECK-SAME:  %[[T:.*]]: tensor<4x1xf16>) -> tensor<4x1xf16> {
 // CHECK-NOT:       arith.constant
@@ -71,8 +73,8 @@ func.func @recip_hoisted_scalar(%t: tensor<4x1xf16>) -> tensor<4x1xf16> {
 // -----
 
 // f32 as well as f16: the rule does not branch on the float width.
-// CHECK-LABEL:   func.func @recip_f32(
-// CHECK:             spyreop.reciprocal
+// CANON-LABEL:   func.func @recip_f32(
+// CANON:             spyreop.reciprocal
 func.func @recip_f32(%t: tensor<4xf32>) -> tensor<4xf32> {
   %splat = arith.constant dense<1.0> : tensor<4xf32>
   %init = tensor.empty() : tensor<4xf32>
@@ -115,12 +117,12 @@ func.func @recip_shared_numerator(%t: tensor<4xf16>) -> tensor<4xf16> {
 
 // -----
 
-// The same divide outside any generic body is a reciprocal too: the numerator is
-// read directly when there is no body to read it through.
+// The same divide outside any generic body is left as it is: the rule applies
+// only to an op whose immediate parent is a linalg.generic.
 // CHECK-LABEL:   func.func @recip_outside_a_body(
-// CHECK-NOT:       arith.constant
-// CHECK-NOT:       spyreop.realdiv
-// CHECK:           %[[R:.*]] = spyreop.reciprocal %{{.*}} : f16
+// CHECK-NOT:       spyreop
+// CHECK:           %[[ONE:.*]] = arith.constant 1.000000e+00 : f16
+// CHECK:           %[[R:.*]] = arith.divf %[[ONE]], %{{.*}} : f16
 func.func @recip_outside_a_body(%x: f16) -> f16 {
   %one = arith.constant 1.0 : f16
   %0 = arith.divf %one, %x : f16
@@ -177,10 +179,9 @@ func.func @divf_x_over_two(%t: tensor<4xf16>) -> tensor<4xf16> {
 
 // -----
 
-// A NON-SPLAT constant tensor resolves through the body too, and correctly
-// matches nothing: reading an operand through the body is sound only for a value
-// uniform across it, and `m_OneFloat` asking about a splat is what keeps it so.
-// Without that, element 0 being 1.0 would have been taken for the whole tensor.
+// A NON-SPLAT constant tensor whose element 0 is 1.0 is not a one: it reaches the
+// body as a block argument, which the rule does not read through, so element 0
+// is never taken for the whole tensor.
 // CHECK-LABEL:   func.func @divf_nonsplat_numerator(
 // CHECK-NOT:       spyreop.reciprocal
 // CHECK:           spyreop.realdiv
